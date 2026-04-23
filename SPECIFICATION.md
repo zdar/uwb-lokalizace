@@ -1,469 +1,296 @@
- # Complete RTLS System Specification v4.0
- *Multi-Node Real-Time Location System - Unified Final Specification*
-  
- ## Executive Summary
- This document consolidates all solutions from the complete design discussion into a single, implementable specification for a homogeneous, battery-powered RTLS network using MAUWBS3CA1 modules.
+ # MAUWBS3CA1 RTLS System Specification v5.0
+ *Complete Unified Real-Time Location System Specification*
+
+ ---
  
- ## 1. Core Design Principles (Final)
+ ## 1. Overview
  
- 1. **Unified Hardware:** All devices use identical MAUWBS3CA1 modules
- 2. **Mandatory OLED:** SSD1306 display on all devices for local UI
- 3. **Battery-Only:** All devices battery-powered (2000mAh LiPo)
- 4. **Runtime Role Selection:** Role chosen at boot (Anchor/Tag/ANL/Hot Standby)
- 5. **Any-Device ANL:** Any node can be network coordinator
- 6. **Manual ANL Forcing:** Specific device can be forced as ANL
- 7. **Optional IMU:** 9DOF sensor on Tags only (for position offset)
- 8. **Unified Firmware:** Single image with role-based feature enablement
- 9. **Multi-Provisioning:** WiFi AP, BLE, and OLED for configuration
- 10. **Self-Healing:** Automatic failover with Hot Standby
+ ### 1.1 System Design Principles
+ 1. **Unified Hardware:** All devices are identical MAUWBS3CA1 modules.
+ 2. **Mandatory OLED:** SSD1306 display on all devices for local UI.
+ 3. **Battery-Only Operation:** All devices powered by 2000mAh LiPo.
+ 4. **Runtime Role Selection:** Device role (Anchor/Tag/ANL/Hot Standby) selected at boot via persistent configuration.
+ 5. **Any-Device ANL:** Any node can become the Active Network Leader.
+ 6. **Manual ANL Forcing:** Specific device can be forced to become ANL.
+ 7. **Optional IMU:** 9DOF sensor present on Tags only, for orientation-aware position offset.
+ 8. **Anchor Self-Verification:** Anchors periodically switch to TAG mode to measure distances to peers for health and auto-calibration.
+ 9. **Multi-Provisioning:** Configuration via WiFi AP, BLE, and OLED menu.
+ 10. **Self-Healing Network:** Automatic leader election and failover with Hot Standby.
  
- ## 2. Complete Hardware Specification
+ ### 1.2 Key Performance Metrics
+ - **Positioning Technology:** UWB Time-of-Flight (TWR) [1].
+ - **Accuracy:** &lt;10 cm under optimal conditions [1].
+ - **RF Band:** CH5 (6489.6 MHz) [1].
+ - **Data Rates:** 850 kbps and 6.8 Mbps [1].
+ - **Maximum Packet Length:** 1023 bytes [1].
+ - **Anchor Capacity:** Unlimited (from firmware v1.1.3) [1].
+ - **Tag Capacity:** Maximum 64 tags [1].
+ - **Refresh Rate:** Configurable up to 100 Hz [1].
+ - **Sleep Current:** 35 µA (Tag deep hibernation) [1].
+ - **Working Current:** 34 mA [1].
  
- ### 2.1 MAUWBS3CA1 Module Configuration
- - **MCU:** ESP32-S3 (handles WiFi, BLE, OLED, system logic)
- - **UWB:** DW3000 via AT commands [1]
- - **OLED:** SSD1306 128×64 via I²C (pins 3-4) [1]
- - **IMU:** MPU-9250 9DOF (Tags only, optional for Anchors)
- - **Battery:** 2000mAh LiPo with charging circuit
- - **Power:** 3.3V ±5% (strict requirement) [1]
+ ---
  
- ### 2.2 Pin Usage Allocation
- | Pin | Function | Usage in Our System |
- |-----|----------|---------------------|
- | 1-2 | 3V3 Power | Battery via regulator |
- | 3-4 | I2C SDA/SCL | OLED display |
- | 9 | RUN LED | System status indicator [1] |
- | 11 | UART2 RX/RESET | Role selection button + reset |
- | 14-15 | UART1 TX/RX | UWB AT commands [1] |
- | 12-13 | TX/RX LEDs | Debug indicators |
+ ## 2. Hardware Specification
  
- ### 2.3 OLED Display Requirements
- - **Library:** Adafruit_SSD1306
- - **Content:**
-   - Device role and ID
-   - Battery percentage
-   - Network status
-   - For Tags: position/distance
-   - For ANL: connected devices count
-   - Configuration menu for role selection
+ ### 2.1 Module Pin Definition &amp; Usage [1]
  
- ## 3. Unified Firmware Architecture
+ | Pin | Name | Function in Our System |
+ |-----|------|------------------------|
+ | 1, 2 | 3V3 | **Power 3.3V.** Critical: Must be 3.3V ±5%. Exceeding damages module [1]. |
+ | 3 | I2CSDA | **OLED Data (I²C).** Connected to SSD1306 display. |
+ | 4 | I2CSCL | **OLED Clock (I²C).** Connected to SSD1306 display. |
+ | 5 | SWCLK | Module download port. For firmware updates. |
+ | 6 | SWDIO | Module download port. For firmware updates. |
+ | 7, 8, 16 | GND | Ground. |
+ | 9 | RUN LED | **System Status Indicator.** Universal for Anchor/Tag [1]. Blinking slowly (1s) = configuring. Blinking fast (0.1s) = working. |
+ | 10 | UART2 TX | Reserved. Not used. |
+ | 11 | UART2 RX/RESET/WAKEUP | **Multi-function: Role Selection Button &amp; Reset.** Pull down 3 seconds = reset. In Tag sleep, pull down = wake-up [1]. Used for navigating OLED menu. |
+ | 12 | TX LED | **UWB Transmit Indicator.** Valid for Anchor only [1]. |
+ | 13 | RX LED | **UWB Receive Indicator.** Valid for Anchor only [1]. |
+ | 14 | UART1 TX | **Main UART TX.** For sending AT commands to UWB module [1]. |
+ | 15 | UART1 RX | **Main UART RX.** For receiving responses from UWB module [1]. |
  
- ### 3.1 Boot Sequence
+ ### 2.2 Power Requirements
+ - **Voltage:** 3.3V ±5% supplied via onboard LDO from battery [1].
+ - **Current:** 34 mA (working), 35 µA (Tag deep sleep) [1].
+ - **Battery:** 2000mAh LiPo with USB-C charging circuit.
+ 
+ ### 2.3 OLED Display (SSD1306 128x64)
+ - **Interface:** I²C using pins 3 (SDA) and 4 (SCL).
+ - **Library:** Adafruit_SSD1306.
+ - **Content:** Role-specific status, battery level, network info, configuration menu.
+ 
+ ---
+ 
+ ## 3. AT Command System Integration [1]
+ 
+ The UWB module is controlled exclusively via AT commands over UART1 at 115200 bps [1].
+
+  - Essential commands (`AT+SETCFG`, `AT+RANGE`, `AT+SETPAN`, `AT+SLEEP`) from the manual [1].
+  - Critical initialization sequence using AT commands.
+  - Explanation that system roles map to UWB module roles via `AT+SETCFG=(id),(0:Tag/1:Anchor),...` [1].
+
+ 
+ ### 3.1 Essential Command Reference [1]
+ 
+ | Command | Parameters | Purpose | Our Usage |
+ |---------|------------|---------|-----------|
+ | **AT?** | None | Verify serial communication [1] | Initialization test. |
+ | **AT+SETCFG** | `(id),(role),(rate),(filter)` | Set device ID, role, rate, filter [1] | **Core:** Set device as Anchor (1) or Tag (0). Enable role switching. |
+ | **AT+SETCAP** | `(tag_capacity),(slot_time),(extMode)` | Set system capacity and refresh rate [1] | Control network timing. `rate_hz = 1 / (capacity × slot_time)` [1]. |
+ | **AT+SETPAN** | `(network_id)` | Set Network ID for segregation [1] | Isolate multiple RTLS networks. Default: 1111 [1]. |
+ | **AT+SAVE** | None | Save configuration to flash [1] | **Required** after any configuration change [1]. |
+ | **AT+SETRPT=1** | `(1)` | Enable auto-reporting of ranges [1] | Always enabled. |
+ | **AT+RANGE** | Auto-reported | Distance measurement data [1] | Primary data source. Format: `AT+RANGE=tid:x1,mask:x2,seq:x3,range:(x4-x11),ancid:(x20-x27)` [1]. |
+ | **AT+SLEEP** | `(ms)` | Set Tag sleep time [1] | Power management for battery-powered Tags. |
+ | **AT+SETPOW** | `(gain)` | Configure transmission power [1] | Optimize for range vs. battery. |
+ 
+ ### 3.2 Critical Initialization Sequence
+ ```shell
+ # For any device (role determined by system, not AT command)
+ AT+SETCFG=&lt;ID,&lt;0=Tag/1=Anchor,1,0    # 1 = 6.8Mbps, 0 = filter closed [1]
+ AT+SETCAP=10,10,0                      # 10Hz default refresh [1]
+ AT+SETPAN=&lt;NETWORK_ID                 # e.g., 1234 [1]
+ AT+SAVE                                # Must save [1]
+ AT+SETRPT=1                            # Enable auto-reports [1]
  ```
- Power On
-     ↓
- Read NVS for: role, WiFi creds, force_flag
-     ↓
- If force_flag == ANL_FORCED → Become ANL immediately
-     ↓
- Else if role == UNCONFIGURED → Start provisioning mode
-     ↓
- Else → Initialize in configured role
-     ↓
- Start OLED with role-specific UI
-     ↓
- Join/Create network based on role
+
+
+ 
+ ---
+ 
+ ## 4. System Architecture &amp; Roles
+ 
+ ### 4.1 Device Roles
+ All roles run on identical hardware. Role is stored in NVS and applied at boot.
+ 
+ | Role | Key Responsibilities | UWB Role via AT+SETCFG [1] | OLED Display |
+ |------|----------------------|-----------------------------|--------------|
+ | **ANCHOR** | Provides UWB ranges. No position computation. | `role=1` (Anchor) [1] | Status, ID, battery. |
+ | **TAG** | Mobile device. Runs EKF for its own position using IMU offset. | `role=0` (Tag) [1] | Position, battery, nearest anchor. |
+ | **ANL (Active Network Leader)** | Network coordinator. Hosts WiFi AP, registry, central services. | `role` based on physical function (1 if stationary, 0 if mobile). | Network topology, device count. |
+ | **HOT_STANDBY** | Failover node. Mirrors ANL state, ready for promotion. | `role=0` (Tag, if mobile). | ANL heartbeat status, readiness. |
+
+ **ANL** and **HOT_STANDBY** are now **system-level functionalities** layered on top of the two core UWB roles defined by `AT+SETCFG` [1]:
+   - ANL: A device (configured as Anchor `role=1` [1] or Tag `role=0` [1]) that additionally runs network coordination services (WiFi AP, registry).
+   - Hot Standby: A device (typically configured as Tag `role=0` [1]) that mirrors the ANL's state and is ready for failover promotion.
+ 
+ ### 4.2 Anchor Self-Verification &amp; Auto-Calibration
+ A **critical feature** for network health and setup.
+ 
+ 1.  **Periodic Self-Check:**
+     *   ANL schedules each Anchor to temporarily switch to **TAG mode**.
+     *   Switch: `AT+SETCFG=&lt;id,0,1,0` [1] (Role=0 for Tag).
+     *   The Anchor-as-Tag measures distances to neighboring Anchors via `AT+RANGE` [1].
+     *   Switch back: `AT+SETCFG=&lt;id,1,1,0` [1] (Role=1 for Anchor).
+     *   Reports distance matrix and health score to ANL.
+ 
+ 2.  **Network Auto-Calibration:**
+     *   **Phase 1:** ANL builds a complete anchor-to-anchor distance matrix using the above process.
+     *   **Phase 2:** User places a **TAG at known global coordinates** (min 3 points).
+     *   At each point, the TAG&#x27;s ranges to all Anchors are recorded.
+     *   **Phase 3:** ANL performs a **multilateration back-calculation** to solve for the precise 3D positions of all Anchors in the global coordinate system.
+     *   This establishes the network coordinate frame **once**, without manual surveying.
+
+
+ 
+ ### 4.3 Network Formation &amp; ANL Election
+ - **First Boot:** Device starts in provisioning mode (WiFi AP + BLE).
+ - **ANL Election:** Uses a scoring algorithm: `Score = (Battery × 0.4) + (Uptime × 0.2) + (Connectivity × 0.4)`.
+ - **Manual Forcing:** Any device can be forced to be ANL via OLED menu, Web UI, or BLE. Setting persists in NVS.
+ - **Hot Standby Failover:** Designated standby promotes in &lt;10s if ANL fails.
+ 
+ ---
+ 
+ ## 5. Firmware Architecture (Unified)
+ 
+ ### 5.1 High-Level Structure
  ```
- 
- ### 3.2 Role Management
- ```cpp
- typedef enum {
-     ROLE_UNCONFIGURED = 0,
-     ROLE_ANCHOR,      // UWB only, no IMU
-     ROLE_TAG,         // UWB + IMU + position
-     ROLE_ANL,         // Network coordinator
-     ROLE_HOT_STANDBY  // Failover ready
- } device_role_t;
- 
- // Stored in NVS, changeable via OLED menu/BLE/WiFi
- ```
- 
- ### 3.3 Module Structure
- ```
- firmware/
- ├── main/                    # Boot and role dispatch
- ├── drivers/
- │   ├── uwb_at.c           # AT command interface [1]
- │   ├── ssd1306_ui.c       # OLED display manager
- │   ├── imu_9dof.c         # TAG-only IMU fusion
- │   └── power_mgr.c        # Battery management
- ├── roles/
- │   ├── anchor.c           # Anchor behavior
- │   ├── tag.c              # TAG behavior (with EKF)
- │   ├── anl.c              # ANL behavior (WiFi AP + registry)
- │   └── hot_standby.c      # Hot Standby behavior
- ├── network/
- │   ├── provisioning.c     # WiFi AP + BLE for setup
- │   ├── registry.c         # Device registry (ANL only)
- │   └── election.c         # ANL election algorithm
- └── services/
-     ├── web_ui.c           # Configuration web server
-     ├── ble_config.c       # BLE provisioning service
-     └── cloud_sync.c       # Optional cloud upload
- ```
- 
- ## 4. Provisioning System (WiFi + BLE + OLED)
- 
- ### 4.1 Multi-Method Provisioning
- ```
- Unconfigured Device Boot:
- 1. OLED shows: &quot;Select provisioning method:&quot;
- 2. Options:
-    a. OLED Menu (button navigation)
-    b. WiFi AP: &quot;RTLS-Config-XXXX&quot;
-    c. BLE: &quot;RTLS-Config&quot; service
- 3. User chooses method → enters configuration
- ```
- 
- ### 4.2 WiFi Provisioning AP
- - **SSID:** `RTLS-Config-&lt;LAST4_MAC`
- - **IP:** 192.168.4.1
- - **Web UI:** Full configuration portal
- - **Timeout:** 30 minutes, then reboots
- - **Security:** WPA2 with generated password
- 
- ### 4.3 BLE Provisioning Service
- ```
- Service UUID: 6E40xxxx-B5A3-F393-E0A9-E50E24DCCA9E
- Characteristics:
-   - Device Info (read)
-   - Network Config (write)
-   - Role Selection (write)
-   - Status (notify)
- ```
- 
- ### 4.4 OLED Configuration Menu
- ```
- Navigate with button (pin 11):
- Short press: Next item
- Long press: Select/Confirm
- 
- Menu Structure:
- Main Menu → Role → Anchor/Tag/ANL → Confirm
-             → WiFi Config → SSID → Password
-             → Network ID → [PAN ID from AT+SETPAN] [1]
-             → Force ANL → Enable/Disable
-             → Save &amp; Reboot
- ```
- 
- ## 5. UWB System Integration [1]
- 
- ### 5.1 AT Command Initialization
- ```cpp
- // Common initialization for all devices
- void uwb_init(uint8_t id, bool is_anchor) {
-     send_command(&quot;AT+SETCFG=%d,%d,1,0&quot;, id, is_anchor ? 1 : 0); // [1]
-     send_command(&quot;AT+SETCAP=10,10,0&quot;);  // 10Hz default [1]
-     send_command(&quot;AT+SETPAN=%d&quot;, network_id); // [1]
-     send_command(&quot;AT+SAVE&quot;); // [1]
-     send_command(&quot;AT+SETRPT=1&quot;); // Enable auto-report [1]
- }
- 
- // TAG-specific sleep
- void tag_sleep(uint32_t ms) {
-     if (ms  0) send_command(&quot;AT+SLEEP=%lu&quot;, ms); // [1]
- }
+ firmware/ (ESP-IDF Project)
+ ├── main/
+ │   └── app_main.c              # Entry point, role dispatcher
+ ├── components/
+ │   ├── uwb_at_interface/       # Wrapper for AT commands [1]
+ │   ├── oled_ui_manager/        # SSD1306 menu &amp; status
+ │   ├── imu_fusion/             # 9DOF processing (Tag only)
+ │   ├── ekf_positioning/        # EKF engine (Tag only)
+ │   ├── role_manager/           # Role state machine, NVS storage
+ │   ├── network_provisioning/   # WiFi AP &amp; BLE config services
+ │   ├── anl_orchestrator/       # ANL logic, registry, election
+ │   └── power_manager/          # Battery monitoring, sleep states
+ └── partitions.csv              # Dual OTA partitions
  ```
  
- ### 5.2 Range Data Processing
- ```cpp
- // Parse: AT+RANGE=tid:x1,mask:x2,seq:x3,range:(x4-x11),ancid:(x20-x27) [1]
- typedef struct {
-     uint8_t tag_id;
-     uint8_t mask;
-     uint16_t sequence;
-     float ranges[8];  // in meters
-     int8_t anchor_ids[8];  // -1 if not used
- } range_data_t;
+ ### 5.2 UWB Interface Wrapper (Abstracting AT Commands [1])
+ ```c
+ // uwb_at_interface.h
+ typedef enum { UWB_ROLE_ANCHOR = 1, UWB_ROLE_TAG = 0 } uwb_role_t;
+ 
+ void uwb_init_device(uint8_t id, uwb_role_t role);
+ bool uwb_switch_role_temporarily(uint8_t id, uwb_role_t temp_role);
+ range_data_t uwb_get_range_report(void); // Parses AT+RANGE [1]
+ void uwb_enter_sleep(uint32_t duration_ms); // AT+SLEEP [1]
  ```
  
- ### 5.3 Refresh Rate Management
- - **Formula:** `rate_hz = 1 / (tag_capacity × slot_time)` [1]
- - **Dynamic Adjustment:** Based on battery level and network size
- - **ANL Coordinates:** Broadcasts optimal settings to all devices
- 
- ## 6. Network Architecture
- 
- ### 6.1 ANL (Active Network Leader) Responsibilities
- - Creates WiFi network: `RTLS-Net-&lt;ANL_ID`
- - Maintains device registry
- - Coordinates UWB ranging schedules
- - Handles failover to Hot Standby
- - Optional cloud uplink
- 
- ### 6.2 Hot Standby System
- - Mirrors ANL&#x27;s registry
- - Monitors ANL heartbeat (UDP + BLE)
- - Promotes in &lt;10s on failure
- - Maintains dormant external connection
- 
- ### 6.3 Battery-Aware Election
- ```
- Election Score = 
-   (battery_level × 0.4) +
-   (has_imu × 0.1) +      // Prefer TAGs as ANL
-   (uptime × 0.2) +
-   (signal_strength × 0.3)
- 
- Rules:
- 1. Battery &lt;15% → cannot be ANL
- 2. Manual force overrides all scores
- 3. ANL-Anchor must designate EKF-TAG
- ```
- 
- ### 6.4 Manual ANL Forcing
- **Methods:**
- 1. **OLED Menu:** Device settings → &quot;Force as ANL&quot;
- 2. **Web UI:** Admin interface on ANL
- 3. **BLE Command:** Mobile app
- 4. **Physical Button:** 5-second hold + pattern
- 
- **Persistence:** Saved in NVS, survives reboot
- **Safety:** 72-hour auto-expiry, low-battery override
- 
- ## 7. Power Management
- 
- ### 7.1 Battery Profiles (2000mAh LiPo)
- | Role | Performance | Balanced | Power Saver |
- |------|-------------|----------|-------------|
- | **ANL** | 3 hours | 8 hours | 24 hours |
- | **Tag** | 5 hours | 12 hours | 48 hours |
- | **Anchor** | 8 hours | 24 hours | 7 days |
- 
- ### 7.2 Dynamic Power Adjustment
- ```cpp
- void update_power_state() {
-     float battery = read_battery();
+ ### 5.3 Role Manager Pseudocode
+ ```c
+ void role_manager_task(void *pvParameters) {
+     device_role_t role = nvs_read_role();
      
-     if (role == ROLE_ANL) {
-         if (battery &lt; 0.2) initiate_demotion();
-         if (battery &lt; 0.5) set_ap_duty_cycle(0.05); // 5%
-         if (battery &lt; 0.8) set_uwb_rate(5); // 5Hz
+     if (role == ROLE_UNCONFIGURED) {
+         start_provisioning_mode(); // OLED menu, WiFi AP, BLE
+         return;
      }
      
-     if (battery &lt; 0.1) {
-         deep_sleep(3600); // 1 hour sleep
+     switch (role) {
+         case ROLE_ANCHOR:
+             uwb_init_device(my_id, UWB_ROLE_ANCHOR); // AT+SETCFG [1]
+             start_anchor_service(); // Listen for ranges
+             oled_show_anchor_status(my_id, battery_level);
+             break;
+         case ROLE_TAG:
+             uwb_init_device(my_id, UWB_ROLE_TAG); // AT+SETCFG [1]
+             imu_init();
+             start_ekf_thread();
+             oled_show_tag_position(last_position, battery);
+             break;
+         case ROLE_ANL:
+             wifi_start_softap();
+             start_registry_service();
+             start_election_heartbeat();
+             oled_show_anl_dashboard(device_count);
+             break;
      }
  }
  ```
  
- ### 7.3 OLED Power Saving
- - Dim after 30 seconds
- - Off after 2 minutes (except for alerts)
- - Wake on button press or alert
- - Minimum refresh rate: 1Hz in low power
+ ---
  
- ## 8. Position Computation (TAGs Only)
+ ## 6. Provisioning System
  
- ### 8.1 EKF with IMU Fusion
+ ### 6.1 Multi-Method Flow
+ An unconfigured device offers three entry points:
+ 1.  **OLED Menu:** Navigate with button (Pin 11) to set Role, WiFi SSID/Password, Network ID.
+ 2.  **WiFi AP:** Connects to &quot;RTLS-Config-XXXX&quot;, accesses web portal at 192.168.4.1.
+ 3.  **BLE Service:** Advertises &quot;RTLS-Config&quot;. Mobile app writes configuration.
+ 
+ All methods ultimately write to the same NVS keys: `device_role`, `wifi_ssid`, `wifi_pass`, `network_id`.
+ 
+ ### 6.2 Configuration Parameters
+ - **Device Role:** Anchor, Tag, ANL, Hot Standby.
+ - **WiFi Credentials:** For joining the ANL&#x27;s network (if not ANL).
+ - **Network ID (PAN ID):** Must match AT+SETPAN value for UWB communication [1].
+ - **Manual ANL Force Flag:** Boolean to override election.
+ 
+ ---
+ 
+ ## 7. OLED User Interface Specification
+ 
+ ### 7.1 Standard Views
+ - **Boot/Provisioning:** &quot;RTLS System. Press button to configure.&quot;
+ - **Anchor View:** `[ANCHOR 05] Batt: 92% Tags: 3`
+ - **Tag View:** `[TAG 12] Pos: 1.2, 3.4, 0.5 Bat: 85%`
+ - **ANL View:** `[ANL]* Net:RTLS-NET-A1C3 Dev:8/16 Bat:78%`
+ - **Hot Standby View:** `[STANDBY] ANL:OK Sync:100%`
+ 
+ ### 7.2 Configuration Menu Tree
  ```
- State Vector (TAG):
- [x, y, z, vx, vy, vz, q0, q1, q2, q3, bgx, bgy, bgz]
- 
- Offset Correction:
- P_reference = P_antenna + R(quaternion) × offset_vector
- 
- Sensor Fusion:
- - UWB ranges: Position updates
- - IMU gyro: Orientation prediction
- - IMU accel: Velocity/position (with drift)
- - Magnetometer: Yaw correction (disturbance-aware)
- ```
- 
- ### 8.2 Anchor Processing
- - No position computation
- - UWB ranging only
- - Forward ranges to ANL (or EKF-TAG if ANL is Anchor)
- 
- ## 9. Deployment Workflow
- 
- ### 9.1 Initial Device Setup
- ```
- 1. Power on device
- 2. OLED shows: &quot;Unconfigured - Choose method&quot;
- 3. User selects WiFi/BLE/OLED provisioning
- 4. Configure: Role, Network ID, WiFi credentials
- 5. Device saves to NVS, reboots
- 6. Joins network based on role
- ```
- 
- ### 9.2 Network Formation
- ```
- 1. First device becomes ANL (or forced ANL)
- 2. Creates WiFi network
- 3. Other devices join as configured
- 4. ANL builds registry, coordinates ranging
- 5. Hot Standby elected automatically
- ```
- 
- ### 9.3 Field Maintenance
- - **Role Rotation:** Periodic ANL changes for battery balance
- - **Reconfiguration:** Via OLED menu or web UI
- - **Firmware Updates:** Staggered OTA via ANL
- - **Battery Replacement:** Hot-swappable with graceful shutdown
- 
- ## 10. Complete AT Command Integration [1]
- 
- ### 10.1 Essential Commands Used
- | Command | Purpose | Our Usage |
- |---------|---------|-----------|
- | `AT+SETCFG` | Device configuration | Set ID and role [1] |
- | `AT+SETCAP` | System capacity | Control refresh rate [1] |
- | `AT+SETPAN` | Network ID | Network segregation [1] |
- | `AT+RANGE` | Distance data | Position computation [1] |
- | `AT+SLEEP` | Power saving | TAG sleep management [1] |
- | `AT+SETPOW` | Transmit power | Optimize battery use [1] |
- 
- ### 10.2 Default Configuration
- ```cpp
- // Applied to all devices
- #define DEFAULT_NETWORK_ID  1234
- #define DEFAULT_TAG_CAPACITY 10
- #define DEFAULT_SLOT_TIME   10  // ms
- #define DEFAULT_RATE        1   // 6.8Mbps [1]
- ```
- 
- ## 11. Performance Specifications
- 
- ### 11.1 System Performance
- - **Position Update:** 1-100Hz (configurable) [1]
- - **Accuracy:** &lt;30cm typical, &lt;10cm optimal [1]
- - **Network Size:** 64 Tags, unlimited Anchors [1]
- - **ANL Failover:** &lt;10 seconds
- - **Join Time:** &lt;30 seconds
- - **Position Latency:** &lt;100ms
- 
- ### 11.2 Power Performance
- - **Active Current:** 34mA (UWB) + ESP32-S3 [1]
- - **Sleep Current:** 35µA (UWB sleep) [1]
- - **OLED Current:** 20mA active, &lt;1mA sleep
- - **Battery Life:** 3-48 hours (role/mode dependent)
- 
- ### 11.3 Radio Performance
- - **UWB Range:** Up to 100m LOS
- - **WiFi Range:** Typical indoor 30m
- - **BLE Range:** 10m for provisioning
- - **Interference Mitigation:** PAN ID segregation [1]
- 
- ## 12. Manufacturing &amp; Testing
- 
- ### 12.1 Production Flashing
- 1. Base firmware with all capabilities
- 2. Test: OLED, UWB, WiFi, BLE, IMU (if present)
- 3. Set default PAN ID [1]
- 4. Package with battery
- 
- ### 12.2 Quality Assurance
- - **UWB Test:** Range accuracy verification
- - **OLED Test:** Full display test pattern
- - **Battery Test:** Charge/discharge cycle
- - **Role Test:** Each role functionality
- - **Provisioning Test:** All methods working
- 
- ## 13. Complete Filespec
- 
- ### 13.1 Repository Structure
- ```
- rtls-unified-firmware/
- ├── README.md           # This specification
- ├── platformio.ini      # Build configuration
- ├── include/
- │   ├── config.h        # System configuration
- │   ├── roles.h         # Role definitions
- │   └── uwb_at_cmds.h   # AT command wrapper [1]
- ├── src/
- │   ├── main.cpp        # Entry point
- │   ├── drivers/        # Hardware drivers
- │   ├── roles/          # Role implementations
- │   ├── network/        # Networking code
- │   └── services/       # Web/BLE services
- ├── webui/              # Web interface files
- └── tools/
-     ├── flasher/        # Production flashing
-     └── tester/         # QA testing tools
- ```
- 
- ### 13.2 Key Implementation Files
- - `src/roles/anl.cpp` - ANL behavior with registry
- - `src/drivers/ssd1306_ui.cpp` - OLED menu system
- - `src/network/provisioning.cpp` - WiFi+BLE config
- - `src/services/election.cpp` - Leader election
- - `src/drivers/uwb_at.cpp` - AT command interface [1]
- 
- ## 14. Appendices
- 
- ### 14.1 OLED Display Content by Role
- 
- **Anchor:**
- ```
- [ANCHOR 03]
- BATT: 85%
- TAGS: 5/10
- PAN: 1234 [1]
- ```
- 
- **Tag:**
- ```
- [TAG 12] &lt;ACTIVE
- POS: 1.2, 3.4, 0.5
- BATT: 72%
- NEAR: A03 (2.1m)
- ```
- 
- **ANL:**
- ```
- [ANL] *FORCED*
- NET: RTLS-NET-A3B2
- DEVICES: 8/24
- BATT: 64% (18h)
- ```
- 
- ### 14.2 Provisioning State Machine
- ```
- UNCONFIGURED
-     ↓ (User action)
- PROVISIONING (WiFi AP/BLE/OLED)
-     ↓ (Config complete)
- CONFIGURED
-     ↓ (Boot)
- ROLE_EXECUTION
-     ↓ (Failure)
- RECOVERY (Diagnostic AP)
- ```
- 
- ### 14.3 NVS Storage Layout
- ```
- key                    type    description
- device_role           uint8   ROLE_ANCHOR/TAG/ANL/etc
- wifi_ssid             string  WiFi credentials
- wifi_pass             string
- network_id            uint16  PAN ID [1]
- anl_forced            bool    Manual ANL force
- force_expiry          uint64  Timestamp
- battery_calibration   float   Capacity calibration
- oled_brightness       uint8   Display setting
+ Main Menu
+ ├── Set Role → [Anchor, Tag, ANL, Hot Standby]
+ ├── WiFi Settings → [SSID, Password]
+ ├── Network ID → [Enter PAN ID] // Links to AT+SETPAN [1]
+ ├── Force ANL Mode → [Enable/Disable]
+ └── Save &amp; Reboot
  ```
  
  ---
  
- ## 15. Summary of All Solutions Implemented
+ ## 8. Deployment &amp; Calibration Procedure
  
- | Requirement | Solution | Status |
- |-------------|----------|--------|
- | Unified hardware | Single MAUWBS3CA1 module | ✅ |
- | Battery operation | 2000mAh LiPo, power management | ✅ |
- | OLED on all devices | SSD1306 with role-specific UI | ✅ |
- | Role selection at boot | NVS storage, provisioning system | ✅ |
- | Any-device ANL | Election algorithm with manual override | ✅ |
- | TAG position offset | IMU fusion with EKF | ✅ |
- | WiFi/BLE provisioning | Multi-method config system | ✅ |
- | UWB integration | AT command wrapper [1] | ✅ |
- | Hot Standby failover | State mirroring, fast promotion | ✅ |
- | Network segregation | PAN ID system [1] | ✅ |
- | Power management | Dynamic scaling, sleep modes | ✅ |
- | Manual ANL forcing | Multiple methods with safety | ✅ |
- | Unified firmware | Single image with role dispatch | ✅ |
+ ### 8.1 Step-by-Step Setup
+ 1.  **Flash Devices:** Upload unified firmware to all MAUWBS3CA1 modules.
+ 2.  **Configure First Device (ANL):** Use OLED menu to set Role=ANL, set WiFi SSID/Password, set Network ID (e.g., 1234). Device reboots as ANL, creates network &quot;RTLS-NET-XXXX&quot;.
+ 3.  **Configure Anchors &amp; Tags:** Power each device, use OLED menu to set respective Role and the **same Network ID**. They will join the ANL&#x27;s WiFi network.
+ 4.  **Anchor Auto-Calibration:**
+     *   In ANL&#x27;s web UI, initiate &quot;Network Calibration&quot;.
+     *   System automatically performs Anchor self-verification to build distance matrix.
+     *   Place a Tag at 3+ known physical locations, press button at each.
+     *   ANL computes and broadcasts precise Anchor positions.
+ 5.  **Operational:** System is now live. Tags display positions. ANL monitors health.
+ 
+ ### 8.2 Anchor Self-Verification Schedule
+ - **Frequency:** Every 15 minutes (configurable by ANL).
+ - **Process:** ANL sequentially commands each Anchor to switch to Tag mode, measure, and switch back.
+ - **Outcome:** ANL maintains a health score for each Anchor and detects if any have moved.
  
  ---
+ 
+ ## 9. API Summary
+ 
+ ### 9.1 Internal APIs (Module-to-Module)
+ - **UWB Ranging Data:** `AT+RANGE` format over UWB radio [1].
+ - **WiFi Registry Protocol:** UDP broadcasts for device discovery and heartbeat.
+ - **BLE Provisioning Service:** GATT characteristics for writing configuration.
+ 
+ ### 9.2 External APIs (System-to-User/Cloud)
+ - **ANL Web UI:** HTTP server for network monitoring, calibration triggers, configuration.
+ - **Data Export:** JSON stream of Tag positions (WebSocket or REST) from ANL.
+ - **Cloud Uplink:** Optional MQTT/HTTPS from ANL to external server.
+ 
+ ---
+ 
+ ## 10. Revision History
+ 
+ | Version | Date | Changes |
+ |---------|------|---------|
+ | v5.0 | 2024-05-15 | **Consolidated Final Specification.** Integrates AT command details [1] with complete system architecture, OLED UI, provisioning, and the new Anchor self-verification/auto-calibration feature. |
+ | v4.0 | 2024-05-15 | Included unified firmware, role selection, manual ANL forcing. |
+ | v3.0 | 2024-05-15 | Added multi-provisioning (WiFi/BLE/OLED). |
+ 
+ ---
+ 
+ **Document Status:** Implementation Ready.
+ **Hardware Basis:** Makerfabs MAUWBS3CA1 UWB AT Module [1].
+ **Core Innovation:** Anchor self-verification via temporary role switching and network auto-calibration via TAG placement.
  
