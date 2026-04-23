@@ -1,4 +1,4 @@
-# Dokumentace: UWB Indoor GPS System (Reverzní inženýrství)
+# Dokumentace: UWB Indoor GPS System
 
 Tato specifikace slouží jako podklad pro vývoj firmwaru (PlatformIO/Arduino) a backendu (MySQL/API) pro systém precizního trasování demontáže objektů.
 
