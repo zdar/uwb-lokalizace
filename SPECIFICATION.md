@@ -1,5 +1,5 @@
- # MAUWBS3CA1 RTLS System Specification v6.0
- *Complete Unified Real-Time Location System with Enhanced Accuracy Features*
+ # MAUWBS3CA1 RTLS System Specification v6.2
+ *Adaptive Real-Time Location System with IMU-Driven Power Management & Dynamic Scheduling*
  
  ---
  ## 1. Overview
@@ -10,12 +10,16 @@
  4. **Runtime Role Selection:** Device role (Anchor/Tag/ANL/Hot Standby) selected at boot via persistent configuration.
  5. **Any-Device ANL:** Any node can become the Active Network Leader.
  6. **Manual ANL Forcing:** Specific device can be forced to become ANL.
- 7. **Optional IMU:** 9DOF sensor present on Tags only, for orientation-aware position offset.
- 8. **Anchor Self-Verification:** Anchors periodically switch to TAG mode to measure distances to peers for health and auto-calibration.
+ 7. **Mandatory IMU:** 9DOF sensor present on Tags only, **critical for motion detection and power management**.
+ 8. **Anchor Self-Verification:** Anchors periodically switch to TAG mode (**Sequentially**) to measure distances to peers for health and auto-calibration.
  9. **Multi-Provisioning:** Configuration via WiFi AP, BLE, and OLED menu.
  10. **Self-Healing Network:** Automatic leader election and failover with Hot Standby.
  11. **System-Level Oversampling:** Software-based oversampling for noise mitigation, heavily used for anchor-to-anchor distance estimation.
- 
+ 12. **Dynamic Refresh Rate:** Position update frequency adapts based on motion status detected by the onboard 9DOF IMU.
+ 13. **Motion-Triggered Wakeup:** Full precision mode (5 Hz) activates immediately upon detection of movement.
+ 14. **Idle State Management:** System degrades to 1 Hz after 10s of inactivity; enters "Deep Idle" reporting mode after 60s.
+ 15. **ANL Scheduling Coordination:** ANL dynamically delays anchor verification cycles if active Tag movement is detected.
+     
  ### 1.2 Key Performance Metrics
  - **Positioning Technology:** UWB Time-of-Flight (TWR) two-sided distance measurement [1].
  - **Accuracy:** &lt;10 cm under optimal conditions [1], enhanced by oversampling.
@@ -26,7 +30,12 @@
  - **Tag Capacity:** Maximum 64 tags [1].
  - **Refresh Rate:** Configurable up to 100 Hz [1].
  - **Sleep Current:** 35 µA (Tag deep hibernation) [1].
- - **Working Current:** 34 mA [1].
+ - **Refresh Rate:** **Base 5 Hz**, Idle 1 Hz, Deep Idle 0 Hz (Heartbeat only).
+ - **Wake-up Latency:** < 50ms from IMU interrupt to UWB ranging start.
+ - **Anchor Verification Cycle:** **5 minutes per anchor** (Sequential rotation managed by ANL).
+ - **Anchor Verification Delay:** Up to **+5 minutes** extension if >30% of tags are in "Active" state.
+ - **Battery Impact:** Significant reduction in idle power consumption via 1 Hz/Deep Idle modes.
+ - **Sleep Current:** 35 µA (Tag deep hibernation) [1].
  
  ---
  ## 2. Hardware Specification
@@ -98,37 +107,66 @@
  
  **ANL** and **HOT_STANDBY** are **system-level functionalities** layered on top of the two core UWB roles defined by `AT+SETCFG` [1].
  
- ### 4.2 Priority 1: Anchor Self-Verification &amp; Auto-Calibration
- A **critical feature** for network health and accuracy, enabled by the role-switching capability of `AT+SETCFG` [1].
+ ### 4.2 Anchor Self-Verification Protocol (Sequential) & Auto-Calibratio
+ A **critical feature** for network health and accuracy. **Changed from Parallel/Batch to Sequential.**
  
- 1.  **Periodic Self-Check:**
-      *   ANL schedules each Anchor to temporarily switch to **TAG mode**.
-      *   Switch: `AT+SETCFG=&lt;id,0,1,0` [1] (Role=0 for Tag).
-      *   The Anchor-as-Tag measures distances to neighboring Anchors via `AT+RANGE` [1]. The `ancid` fields in the response identify which anchors were measured [1].
-      *   Switch back: `AT+SETCFG=&lt;id,1,1,0` [1] (Role=1 for Anchor).
-      *   Reports distance matrix and health score to ANL.
+ 1.  **Scheduler (ANL):**
+     -   Maintains a queue of all Anchors in the network.
+     -   **Interval:** Every **5 minutes**, the ANL selects the next Anchor in the sequence.
+     -   **Command Flow:**
+         1.  ANL sends command to Target Anchor: `Switch to TAG mode`.
+         2.  Target Anchor performs **Oversampled Ranging** against all other Anchors.
+         3.  Target Anchor switches back to `Anchor mode`.
+     -   **Conflict Avoidance:** Since only one anchor is in "Tag mode" at any given time, there are no RF collisions during the calibration window.
  
- 2.  **Network Auto-Calibration:**
+ 2.  **Out-of-Sequence Verification (On-Demand):**
+     -   **Trigger:** A Tag detects that the calculated position deviates significantly from the expected path or that one specific anchor's range is an outlier compared to others.
+     -   **Action:** The Tag sends a `REQ_RECALIB_ANCHOR_X` message to the ANL via WiFi/BLE.
+     -   **ANL Response:** The ANL immediately interrupts the 5-minute cycle or schedules the specific anchor as the *next* priority item.
+ 
+ 3.  **Network Auto-Calibration:**
       *   **Phase 1:** ANL builds a complete anchor-to-anchor distance matrix using the above process.
       *   **Phase 2:** User places a **TAG at known global coordinates** (min 3 points).
       *   At each point, the TAG&#x27;s ranges to all Anchors are recorded.
       *   **Phase 3:** ANL performs a **multilateration back-calculation** to solve for the precise 3D positions of all Anchors in the global coordinate system.
       *   This establishes the network coordinate frame **once**, without manual surveying.
  
- ### 4.3 Priority 2: System-Level Oversampling for Noise Mitigation
+ ### 4.3 Dynamic State Machine (Tag Side)
+ The Tag firmware manages three distinct operational states based on IMU data:
+ 
+ | State | Condition | Refresh Rate | Action | OLED Indicator |
+ | :--- | :--- | :--- | :--- | :--- |
+ | **ACTIVE** | Movement detected (Accel > Threshold) | **5 Hz** | Full oversampling, EKF calculation, standard reporting. | `ACT` / `5Hz` |
+ | **IDLE** | No movement for **10s** | **1 Hz** | Reduced sampling count, simplified EKF update. | `SLEEP` / `1Hz` |
+ | **DEEP_IDLE**| No movement for **60s** | **0 Hz (Calc)** | Stop position calculation. Send only "Heartbeat + Status" packet to ANL. | `STBY` / `60s` |
+ 
+ ### 4.4 ANL Scheduler Logic (Network Side)
+ The ANL now acts as a **Traffic Controller** for anchor validation.
+ 
+ 1.  **Standard Cycle:** Every 5 minutes, select next anchor for verification.
+ 2.  **Movement Detection Logic:**
+     -   ANL monitors incoming reports. It counts the number of Tags in `ACTIVE` state vs. `DEEP_IDLE`.
+     -   **Threshold:** If **>20%** of connected Tags are in `ACTIVE` state (moving):
+         -   **Action:** Postpone the next scheduled anchor verification by **5 minutes**.
+         -   **Reasoning:** Moving Tags require maximum RF bandwidth and minimal interference. Delaying calibration ensures highest positioning accuracy during dynamic operations.
+     -   **Low Activity:** If **<5%** of Tags are moving:
+         -   **Action:** Proceed with normal schedule or even accelerate (e.g., every 3 mins) if network is quiet.
+ 
+ ### 4.5 System-Level Oversampling for Noise Mitigation (Updated)
  Implemented in ESP32-S3 firmware to improve measurement accuracy.
  
- 1.  **Purpose:** Reduce random noise in UWB range measurements by taking multiple samples and applying digital filtering.
- 2.  **Heavy Use Case - Anchor-to-Anchor Estimation:**
-     *   During anchor self-verification, multiple consecutive `AT+RANGE` reports [1] are collected (e.g., 5-10 samples).
-     *   A **median filter** is applied to reject outliers (e.g., from brief NLOS).
-     *   The filtered distance is used for the anchor distance matrix, significantly improving calibration accuracy.
- 3.  **On-Demand Use Case - TAG Position Recording:**
-     *   When a user requests a high-precision position fix (e.g., via button press), the TAG enters an **oversampling mode**.
-     *   It collects multiple `AT+RANGE` samples [1] at maximum rate (up to 100 Hz [1]).
-     *   Filtered ranges are fed into the EKF, yielding a more stable and accurate position output.
+ 1.  **Purpose:** Reduce random noise in UWB range measurements.
+ 2.  **Integration:** Oversampling count adapts based on State Machine (High in ACTIVE, Low in IDLE).
+ 3.  **Heavy Use Case - Anchor-to-Anchor Estimation:**
+      *   During anchor self-verification, multiple consecutive `AT+RANGE` reports [1] are collected (e.g., 5-10 samples).
+      *   A **median filter** is applied to reject outliers.
+      *   The filtered distance is used for the anchor distance matrix.
+ 4.  **Continuous Use Case - TAG Position Recording:**
+      *   In `ACTIVE` state, collects multiple `AT+RANGE` samples [1] within the 100ms window.
+      *   Filtered ranges are fed into the EKF, yielding a more stable and accurate position output.
+
  4.  **Implementation (ESP32 Firmware):**
- ```c
+ ```
  // Pseudocode for anchor-to-anchor oversampling
  float get_oversampled_anchor_distance(uint8_t target_anchor_id) {
      #define OVERSAMPLE_COUNT 8
@@ -147,7 +185,7 @@
  }
  ```
  
- ### 4.4 Network Formation &amp; ANL Election
+ ### 4.6 Network Formation &amp; ANL Election
  - **First Boot:** Device starts in provisioning mode (WiFi AP + BLE).
  - **ANL Election:** Uses a scoring algorithm: `Score = (Battery × 0.4) + (Uptime × 0.2) + (Connectivity × 0.4)`.
  - **Manual Forcing:** Any device can be forced to be ANL via OLED menu, Web UI, or BLE. Setting persists in NVS.
@@ -164,12 +202,13 @@
  │   ├── uwb_at_interface/       # Wrapper for AT commands [1]
  │   ├── oled_ui_manager/        # SSD1306 menu &amp; status
  │   ├── imu_fusion/             # 9DOF processing (Tag only)
+ │   ├── imu_motion_detector/    # **NEW:** Accelerometer threshold & state machine
  │   ├── ekf_positioning/        # EKF engine (Tag only) with oversampling input
  │   ├── role_manager/           # Role state machine, NVS storage
  │   ├── network_provisioning/   # WiFi AP &amp; BLE config services
- │   ├── anl_orchestrator/       # ANL logic, registry, election
+ │   ├── anl_orchestrator/       # ANL logic, registry, election, **Scheduler**
  │   ├── power_manager/          # Battery monitoring, sleep states
- │   └── signal_processing/      # **NEW:** Oversampling &amp; filtering routines
+ │   └── signal_processing/      # Oversampling &amp; filtering routines
  └── partitions.csv              # Dual OTA partitions
  ```
  
@@ -208,19 +247,23 @@
  ### 7.1 Standard Views
  - **Boot/Provisioning:** &quot;RTLS System. Press button to configure.&quot;
  - **Anchor View:** `[ANCHOR 05] Batt: 92% Tags: 3`
- - **Tag View:** `[TAG 12] Pos: 1.2, 3.4, 0.5 Bat: 85%`
+ - **Tag View (Active):** `[TAG 12] Pos: 1.2, 3.4, 0.5 Bat: 85% ACT`
+ - **Tag View (Idle):** `[TAG 12] Pos: 1.2, 3.4, 0.5 Bat: 85% IDLE 1Hz`
+ - **Tag View (Deep Idle):** `[TAG 12] STBY Bat: 85%`
  - **ANL View:** `[ANL]* Net:RTLS-NET-A1C3 Dev:8/16 Bat:78%`
  - **Hot Standby View:** `[STANDBY] ANL:OK Sync:100%`
- - **Accuracy Mode (New):** When Tag is in oversampling mode: `[TAG 12] *HIGH-PREC*`
- 
+ - **Calib Delayed:** `[TAG 12] NET BUSY Calib Delayed`
+ - **Calib Running:** `[TAG 12] CHECKING Anchor 03 OK`
+   
  ### 7.2 Configuration Menu Tree
  ```
  Main Menu
  ├── Set Role → [Anchor, Tag, ANL, Hot Standby]
  ├── WiFi Settings → [SSID, Password]
  ├── Network ID → [Enter PAN ID] // Links to AT+SETPAN [1]
- ├── Accuracy Settings → [Oversample Count: 5, Filter: Median]
+ ├── Accuracy Settings → [Oversample Count: 5, Filter: Median, Motion Threshold]
  ├── Force ANL Mode → [Enable/Disable]
+ ├── Power Management → [Idle Timeout: 10s, Deep Idle Timeout: 60s]
  └── Save &amp; Reboot
  ```
  
@@ -238,17 +281,25 @@
  5.  **Operational:** System is live. Tags display positions. ANL monitors health and coordinates periodic anchor verification.
  
  ### 8.2 Anchor Self-Verification Schedule (Enhanced)
- - **Frequency:** Every 15 minutes (configurable by ANL).
+ + **Frequency:** Every 5 minutes per anchor (Sequential).
+ + **Delay Logic:** Up to +5 minutes extension if >30% of tags are active.
  - **Process:** ANL commands each Anchor to switch to Tag mode, perform **oversampled ranging** (multiple `AT+RANGE` [1] samples), and switch back.
  - **Outcome:** ANL maintains a high-confidence distance matrix and health score for each Anchor.
- 
+  
+ ### 8.3 Operational Scenarios
+ 1.  **Busy Warehouse (High Movement):** ANL delays calibration to prioritize Tag accuracy.
+ 2.  **Night Shift (Low Movement):** ANL accelerates calibration schedule as network traffic drops.
+ 3.  **Emergency Recalibration:** Tag requests immediate check of specific anchor upon anomaly detection.
+
  ---
  ## 9. API Summary
  ### 9.1 Internal APIs (Module-to-Module)
  - **UWB Ranging Data:** `AT+RANGE` format over UWB radio [1].
  - **WiFi Registry Protocol:** UDP broadcasts for device discovery and heartbeat.
  - **BLE Provisioning Service:** GATT characteristics for writing configuration.
- - **Oversampling Service (New):** Function calls to `get_oversampled_range()` for high-precision needs.
+ - **Oversampling Service:** Function calls to `get_oversampled_range()`.
+ - **State Reporting:** `POS_FULL`, `POS_REDUCED`, `HEARTBEAT` packet types.
+ - **ANL Broadcast:** `NET_CONFIG` packet containing calibration delay status.
  
  ### 9.2 External APIs (System-to-User/Cloud)
  - **ANL Web UI:** HTTP server for network monitoring, calibration triggers, configuration.
@@ -259,6 +310,8 @@
  ## 10. Revision History
  | Version | Date | Changes |
  |---------|------|---------|
+ | v6.2 | 2024-05-17 | **Dynamic Power Management.** Base rate 5Hz, IMU-driven state machine (Active/Idle/Deep Idle). ANL scheduling coordination based on network load. |
+ | v6.1 | 2024-05-16 | Updated to Sequential Verification (1 anchor/5min) and 10Hz base rate. Added Anomaly Trigger. |
  | v6.0 | 2024-05-15 | **Final with Accuracy Improvements.** Integrated Priority 1 (Anchor Self-Verification) and Priority 2 (System-Level Oversampling) features. Full AT command integration [1]. |
  | v5.0 | 2024-05-15 | Consolidated specification with AT command details. |
  | v4.0 | 2024-05-15 | Included unified firmware, role selection, manual ANL forcing. |
