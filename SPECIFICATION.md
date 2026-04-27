@@ -218,6 +218,7 @@ This procedure determines $\vec{V}_{local}$ without requiring known global coord
     - User selects `Calibrate Offset` in the OLED menu.
     - System enters `CALIB_MODE`.
     - Display: `Hold Reference Point Still. Rotate Tag.`
+    - Minimum 5 samples to be collected
 
 2.  **Data Collection (Rotation Around Fixed Point):**
     - **Sample 1:** User positions the Tag so the Reference Point is stable (e.g., holding a handle steady).
@@ -229,6 +230,9 @@ This procedure determines $\vec{V}_{local}$ without requiring known global coord
         - *Note:* The antenna has moved to $P_2$ due to rotation.
     - **Sample 3:** User rotates to a third angle.
         - Press button. Record: Raw UWB $P_3$, IMU Rotation $R_3$.
+    ...
+    - **Sample N:** User rotates to a third angle.
+        - Press button. Record: Raw UWB $P_N$, IMU Rotation $R_N$.
 
 3.  **Stability Check (Reference Point Verification):**
     - The system checks if the calculated Reference Points for each sample converge to a single location.
