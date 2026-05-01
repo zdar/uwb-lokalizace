@@ -30,6 +30,13 @@ Use 2.5.7   Adafruit_SSD1306
 #define SERIAL_LOG Serial
 #define SERIAL_AT mySerial2
 
+// --- Add these "Function Prototypes" here ---
+void logoshow();
+String sendData(String command, const int timeout, boolean debug);
+String config_cmd();
+String cap_cmd();
+// --------------------------------------------
+
 HardwareSerial SERIAL_AT(2);
 
 // ESP32S3
