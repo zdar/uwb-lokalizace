@@ -40,6 +40,13 @@ HardwareSerial SERIAL_AT(2);
 
 Adafruit_SSD1306 display(128, 64, &Wire, -1);
 
+// --- Add these "Function Prototypes" here ---
+void logoshow();
+String sendData(String command, const int timeout, boolean debug);
+String config_cmd();
+String cap_cmd();
+// --------------------------------------------
+
 void setup()
 {
     pinMode(RESET, OUTPUT);
@@ -208,4 +215,4 @@ String cap_cmd()
     temp = temp + ",1";
     
     return temp;
-}                             
+}

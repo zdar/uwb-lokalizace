@@ -30,12 +30,6 @@ Use 2.5.7   Adafruit_SSD1306
 #define SERIAL_LOG Serial
 #define SERIAL_AT mySerial2
 
-// --- Add these "Function Prototypes" here ---
-void logoshow();
-String sendData(String command, const int timeout, boolean debug);
-String config_cmd();
-String cap_cmd();
-// --------------------------------------------
 
 HardwareSerial SERIAL_AT(2);
 
@@ -50,6 +44,12 @@ HardwareSerial SERIAL_AT(2);
 
 Adafruit_SSD1306 display(128, 64, &Wire, -1);
 
+// --- Add these "Function Prototypes" here ---
+void logoshow();
+String sendData(String command, const int timeout, boolean debug);
+String config_cmd();
+String cap_cmd();
+// --------------------------------------------
 void setup()
 {
     pinMode(RESET, OUTPUT);
