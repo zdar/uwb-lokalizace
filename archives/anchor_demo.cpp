@@ -18,7 +18,7 @@ Use 2.5.7   Adafruit_SSD1306
 
 #define ANCHOR
 
-#define UWB_TAG_COUNT 64
+#define UWB_TAG_COUNT 5
 
 // User config end       ------------------------------------------
 
