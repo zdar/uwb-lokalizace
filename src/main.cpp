@@ -10,11 +10,13 @@ Use 2.5.7   Adafruit_SSD1306
 
 */
 
+//去掉DTR脚串口， 否则一直拉低复位脚
+
 // User config          ------------------------------------------
 
 #define UWB_INDEX 0
 
-#define TAG
+#define ANCHOR
 
 #define UWB_TAG_COUNT 64
 
@@ -28,8 +30,10 @@ Use 2.5.7   Adafruit_SSD1306
 #define SERIAL_LOG Serial
 #define SERIAL_AT mySerial2
 
+
 HardwareSerial SERIAL_AT(2);
 
+// ESP32S3
 #define RESET 16
 
 #define IO_RXD2 18
@@ -46,20 +50,19 @@ String sendData(String command, const int timeout, boolean debug);
 String config_cmd();
 String cap_cmd();
 // --------------------------------------------
-
 void setup()
 {
     pinMode(RESET, OUTPUT);
     digitalWrite(RESET, HIGH);
 
     SERIAL_LOG.begin(115200);
-
-    SERIAL_LOG.print(F("Hello! ESP32-S3 AT command V1.0 Test"));
     SERIAL_AT.begin(115200, SERIAL_8N1, IO_RXD2, IO_TXD2);
 
-    SERIAL_AT.println("AT");
+    SERIAL_LOG.println(F("Hello! ESP32-S3 AT command V1.0 Test"));
+    
     Wire.begin(I2C_SDA, I2C_SCL);
     delay(1000);
+    
     // SSD1306_SWITCHCAPVCC = generate display voltage from 3.3V internally
     if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C))
     { // Address 0x3C for 128x32
@@ -67,51 +70,40 @@ void setup()
         for (;;)
             ; // Don't proceed, loop forever
     }
+// ... display code ...
     display.clearDisplay();
-
     logoshow();
 
-    sendData("AT?", 2000, 1);
-    sendData("AT+RESTORE", 5000, 1);
-
-    sendData(config_cmd(), 2000, 1);
-    sendData(cap_cmd(), 2000, 1);
-
-    sendData("AT+SETRPT=1", 2000, 1);
-    sendData("AT+SAVE", 2000, 1);
-    sendData("AT+RESTART", 2000, 1);
-//    sendData("AT+SLEEP=65535", 2000, 1);
-//    esp_deep_sleep_start();
+    // =========================================================
+    // THE ANTIDOTE: Tell the DW3000 to shut up, and save it!
+    // =========================================================
+    SERIAL_LOG.println(F("Applying the silence antidote..."));
+    sendData("AT+SETRPT=0", 2000, 1); // 0 = Turn OFF auto-reporting
+    sendData("AT+SAVE", 2000, 1);     // Save this quiet state!
+    
+    SERIAL_LOG.println(F("===================================="));
+    SERIAL_LOG.println(F("   INTERACTIVE PASSTHROUGH READY    "));
+    SERIAL_LOG.println(F("   Type your AT commands below!     "));
+    SERIAL_LOG.println(F("===================================="));
 }
 
-long int runtime = 0;
-
-String response = "";
-String rec_head = "AT+RANGE";
 
 void loop()
 {
-
-    // put your main code here, to run repeatedly:
+    // 1. If you type in VS Code, send it straight to the DW3000
     while (SERIAL_LOG.available() > 0)
     {
         SERIAL_AT.write(SERIAL_LOG.read());
         yield();
     }
+    
+    // 2. If the DW3000 responds, send it straight to VS Code
     while (SERIAL_AT.available() > 0)
     {
-        char c = SERIAL_AT.read();
-
-        if (c == '\r')
-            continue;
-        else if (c == '\n' || c == '\r')
-        {
-            SERIAL_LOG.println(response);
-
-            response = "";
-        }
-        else
-            response += c;
+        // Using Serial.write instead of building a string prevents
+        // line-ending bugs and shows you exactly what the module outputs
+        SERIAL_LOG.write(SERIAL_AT.read());
+        yield();
     }
 }
 
@@ -133,10 +125,10 @@ void logoshow(void)
 
     String temp = "";
 
-    temp = temp + "T" + UWB_INDEX;
+    temp = temp + "A" + UWB_INDEX;
 
     temp = temp + "   6.8M";
-
+    
     display.println(temp);
 
     display.setCursor(0, 40);
@@ -176,7 +168,7 @@ String sendData(String command, const int timeout, boolean debug)
         SERIAL_LOG.println(response);
     }
 
-    return response;
+    return response;                
 }
 
 String config_cmd()
@@ -185,10 +177,11 @@ String config_cmd()
 
     // Set device id
     temp = temp + UWB_INDEX;
-
+    
     // Set device role
     //x2:Device Role(0:Tag / 1:Anchor)
-    temp = temp + ",0";
+    temp = temp + ",1";
+
 
     // Set frequence 850k or 6.8M
 
@@ -213,6 +206,6 @@ String cap_cmd()
     //X3:extMode, whether to increase the passthrough command when transmitting
     //(0: normal packet when communicating, 1: extended packet when communicating)
     temp = temp + ",1";
-    
+
     return temp;
 }
