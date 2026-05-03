@@ -1,22 +1,22 @@
 /*
 For ESP32S3 UWB AT Demo
 
-
-Use 2.0.0   Wire
+Use 2.0.0    Wire
 Use 1.11.7   Adafruit_GFX_Library
 Use 1.14.4   Adafruit_BusIO
-Use 2.0.0   SPI
-Use 2.5.7   Adafruit_SSD1306
-
+Use 2.0.0    SPI
+Use 2.5.7    Adafruit_SSD1306
 */
 
-// User config          ------------------------------------------
+// User config  ------------------------------------------
 
 #define UWB_INDEX 0
 
-#define TAG
+#define ANCHOR
 
 #define UWB_TAG_COUNT 5
+// Define the built-in BOOT button pin
+#define BUTTON_PIN 0
 
 // User config end       ------------------------------------------
 
@@ -30,6 +30,7 @@ Use 2.5.7   Adafruit_SSD1306
 
 HardwareSerial SERIAL_AT(2);
 
+// ESP32S3
 #define RESET 16
 
 #define IO_RXD2 18
@@ -40,12 +41,18 @@ HardwareSerial SERIAL_AT(2);
 
 Adafruit_SSD1306 display(128, 64, &Wire, -1);
 
-// --- Add these "Function Prototypes" here ---
+// --- Function Prototypes ---
 void logoshow();
 String sendData(String command, const int timeout, boolean debug);
 String config_cmd();
 String cap_cmd();
 // --------------------------------------------
+
+// Variables for debounce (so one press doesn't count as 50)
+unsigned long lastDebounceTime = 0;  
+unsigned long debounceDelay = 200;    
+bool reportingState = true; // Keep track of whether the firehose is ON or OFF
+
 
 void setup()
 {
@@ -54,15 +61,18 @@ void setup()
 
     SERIAL_LOG.begin(115200);
 
-    SERIAL_LOG.print(F("Hello! ESP32-S3 AT command V1.0 Test"));
+    SERIAL_LOG.println(F("Hello! ESP32-S3 AT command V1.0 Test"));
     SERIAL_AT.begin(115200, SERIAL_8N1, IO_RXD2, IO_TXD2);
 
-    SERIAL_AT.println("AT");
+    // EXPLICIT \r\n added here, changed to .print()
+    SERIAL_AT.print("AT\r\n"); 
+    
     Wire.begin(I2C_SDA, I2C_SCL);
     delay(1000);
+    
     // SSD1306_SWITCHCAPVCC = generate display voltage from 3.3V internally
     if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C))
-    { // Address 0x3C for 128x32
+    { 
         SERIAL_LOG.println(F("SSD1306 allocation failed"));
         for (;;)
             ; // Don't proceed, loop forever
@@ -72,91 +82,102 @@ void setup()
     logoshow();
 
     sendData("AT?", 2000, 1);
-    sendData("AT+RESTORE", 5000, 1);
+    // sendData("AT+RESTORE", 5000, 1); // Commented out to preserve settings
 
     sendData(config_cmd(), 2000, 1);
     sendData(cap_cmd(), 2000, 1);
-
+    
     sendData("AT+SETRPT=1", 2000, 1);
     sendData("AT+SAVE", 2000, 1);
     sendData("AT+RESTART", 2000, 1);
-//    sendData("AT+SLEEP=65535", 2000, 1);
-//    esp_deep_sleep_start();
+
+    // Set up the BOOT button with the internal pull-up resistor
+    pinMode(BUTTON_PIN, INPUT_PULLUP); 
+
+    SERIAL_LOG.println(F("===================================="));
+    SERIAL_LOG.println(F(" PRESS THE 'BOOT' BUTTON TO TOGGLE! "));
+    SERIAL_LOG.println(F("===================================="));
 }
 
 long int runtime = 0;
 
 String response = "";
-String rec_head = "AT+RANGE";
 
 void loop()
 {
+    // 1. Check the physical BOOT button
+    if (digitalRead(BUTTON_PIN) == LOW) {
+        
+        // Debounce: Only trigger if enough time has passed
+        if ((millis() - lastDebounceTime) > debounceDelay) {
+            
+            // Toggle the state
+            reportingState = !reportingState; 
+            
+            if (reportingState == false) {
+                SERIAL_LOG.println(F("\n--- BUTTON PRESSED: TURNING OFF ---"));
+                // EXPLICIT \r\n added here, changed to .print()
+                SERIAL_AT.print("AT+SETRPT=0\r\n");
+            } else {
+                SERIAL_LOG.println(F("\n--- BUTTON PRESSED: TURNING ON ---"));
+                // EXPLICIT \r\n added here, changed to .print()
+                SERIAL_AT.print("AT+SETRPT=1\r\n");
+            }
+            
+            lastDebounceTime = millis(); // Reset the debounce timer
+        }
+    }
 
-    // put your main code here, to run repeatedly:
+    // 2. Normal Keyboard Passthrough
     while (SERIAL_LOG.available() > 0)
     {
         SERIAL_AT.write(SERIAL_LOG.read());
         yield();
     }
+    
+    // 3. Print the UWB data to the screen
     while (SERIAL_AT.available() > 0)
     {
-        char c = SERIAL_AT.read();
-
-        if (c == '\r')
-            continue;
-        else if (c == '\n' || c == '\r')
-        {
-            SERIAL_LOG.println(response);
-
-            response = "";
-        }
-        else
-            response += c;
+        SERIAL_LOG.write(SERIAL_AT.read());
+        yield();
     }
 }
 
 // SSD1306
-
 void logoshow(void)
 {
     display.clearDisplay();
-
     display.setTextSize(1);              // Normal 1:1 pixel scale
     display.setTextColor(SSD1306_WHITE); // Draw white text
     display.setCursor(0, 0);             // Start at top-left corner
     display.println(F("MaUWB DW3000"));
 
-    display.setCursor(0, 20); // Start at top-left corner
-    // display.println(F("with STM32 AT Command"));
+    display.setCursor(0, 20); 
 
     display.setTextSize(2);
-
     String temp = "";
-
-    temp = temp + "T" + UWB_INDEX;
-
+    temp = temp + "A" + UWB_INDEX;
     temp = temp + "   6.8M";
-
     display.println(temp);
 
     display.setCursor(0, 40);
-
     temp = "Total: ";
     temp = temp + UWB_TAG_COUNT;
     display.println(temp);
 
     display.display();
-
     delay(2000);
 }
 
 String sendData(String command, const int timeout, boolean debug)
 {
     String response = "";
-    // command = command + "\r\n";
+    
+    // FIXED: Appends the proper backslash carriage return + line feed
+    command = command + "\r\n"; 
 
-    SERIAL_LOG.println(command);
-    SERIAL_AT.println(command); // send the read character to the SERIAL_LOG
+    SERIAL_LOG.print(command);
+    SERIAL_AT.print(command); // Changed from println to print so it doesn't double up
 
     long int time = millis();
 
@@ -164,7 +185,6 @@ String sendData(String command, const int timeout, boolean debug)
     {
         while (SERIAL_AT.available())
         {
-
             // The esp has data so display its output to the serial window
             char c = SERIAL_AT.read(); // read the next character.
             response += c;
@@ -173,46 +193,27 @@ String sendData(String command, const int timeout, boolean debug)
 
     if (debug)
     {
-        SERIAL_LOG.println(response);
+        SERIAL_LOG.print(response);
     }
 
-    return response;
+    return response;                
 }
 
 String config_cmd()
 {
     String temp = "AT+SETCFG=";
-
-    // Set device id
     temp = temp + UWB_INDEX;
-
-    // Set device role
-    //x2:Device Role(0:Tag / 1:Anchor)
-    temp = temp + ",0";
-
-    // Set frequence 850k or 6.8M
-
     temp = temp + ",1";
-
-    // Set range filter
     temp = temp + ",1";
-
+    temp = temp + ",1";
     return temp;
 }
 
 String cap_cmd()
 {
     String temp = "AT+SETCAP=";
-
-    // Set Tag capacity
     temp = temp + UWB_TAG_COUNT;
-
-    //  Time of a single time slot  6.5M : 10MS  850K ： 15MS
     temp = temp + ",10";
-    
-    //X3:extMode, whether to increase the passthrough command when transmitting
-    //(0: normal packet when communicating, 1: extended packet when communicating)
     temp = temp + ",1";
-    
     return temp;
 }
