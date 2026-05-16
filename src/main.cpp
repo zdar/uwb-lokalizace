@@ -34,6 +34,7 @@ AT+ROLE?    -> Query current role
 #define AP_CHANNEL 6
 #define WIFI_PASSWORD "rtlsnet12"
 #define MAX_REGISTRY_ENTRIES 16
+#define NODE_TIMEOUT_MS 10000  // Consider a node stale if no heartbeat for 10 seconds
 
 // User config end  ------------------------------------------
 
@@ -89,6 +90,8 @@ int waitForButtonEvent(unsigned long timeout);
 void showProvisioningScreen(uint8_t stage);
 void monitorWifiHealth();
 void updateWifiStatusDisplay();
+void drawAnlDashboard();
+void printRegistryTable();
 // --------------------------------------------
 
 // Global variables
@@ -256,7 +259,14 @@ void loop()
 
     udpLoop();
     monitorWifiHealth();
-    updateWifiStatusDisplay();
+    printRegistryTable();
+
+    // NEW: Show live ANL dashboard instead of just a static line
+    if (systemRole == 1) {
+        drawAnlDashboard();
+    } else {
+        updateWifiStatusDisplay();  // nodes keep the old bottom-line WiFi status
+    }
 }
 
 // SSD1306
@@ -279,9 +289,45 @@ void logoshow(void)
     display.println(temp);
 
     display.setCursor(0, 24);
-    temp = "Total: ";
-    temp = temp + UWB_TAG_COUNT;
-    display.println(temp);
+    display.setTextSize(1);
+
+    display.print(F("FW: "));
+
+    String dateStr = __DATE__;  // "MMM DD YYYY"
+    String mon = dateStr.substring(0, 3);
+    int m = 0;
+    if (mon == "Jan") m = 1;
+    else if (mon == "Feb") m = 2;
+    else if (mon == "Mar") m = 3;
+    else if (mon == "Apr") m = 4;
+    else if (mon == "May") m = 5;
+    else if (mon == "Jun") m = 6;
+    else if (mon == "Jul") m = 7;
+    else if (mon == "Aug") m = 8;
+    else if (mon == "Sep") m = 9;
+    else if (mon == "Oct") m = 10;
+    else if (mon == "Nov") m = 11;
+    else if (mon == "Dec") m = 12;
+
+    String day = dateStr.substring(4, 6);
+    day.trim();
+
+    String year = dateStr.substring(dateStr.length() - 2);
+
+    display.print(day);
+    display.print("/");
+    if (m < 10) display.print("0");
+    display.print(m);
+    display.print("/");
+    display.print(year);
+
+    String timeStr = __TIME__;
+    if (timeStr.length() >= 5) {
+        display.print(" ");
+        display.println(timeStr.substring(0, 5));
+    } else {
+        display.println(timeStr);
+    }
 
     display.display();
     delay(2000);
@@ -924,4 +970,68 @@ void updateWifiStatusDisplay()
         SERIAL_LOG.print(F("[Display] WiFi Status: "));
         SERIAL_LOG.println(isConnected ? F("OK") : F("LOST"));
     }
+}
+
+void drawAnlDashboard()
+{
+    static unsigned long lastDashboardUpdate = 0;
+    static int lastDisplayedCount = -1;
+
+    // Only update display every 2 seconds to avoid flicker
+    if (millis() - lastDashboardUpdate < 2000) {
+        return;
+    }
+    lastDashboardUpdate = millis();
+
+    // Count active nodes (not stale)
+    int activeNodes = 0;
+    unsigned long now = millis();
+    for (int i = 0; i < registryCount; i++) {
+        unsigned long age = now - registry[i].lastSeen;
+        if (age < NODE_TIMEOUT_MS) {
+            activeNodes++;
+        }
+    }
+
+    // Don't redraw if count hasn't changed
+    if (activeNodes == lastDisplayedCount) {
+        return;
+    }
+    lastDisplayedCount = activeNodes;
+
+    // Draw ANL dashboard at bottom
+    display.fillRect(0, 48, 128, 16, SSD1306_BLACK);  // Clear status area
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 50);
+
+    display.print(F("ANL | Connected: "));
+    display.println(activeNodes);
+
+    display.display();
+    SERIAL_LOG.print(F("[ANL Dashboard] Active nodes: "));
+    SERIAL_LOG.println(activeNodes);
+}
+
+void printRegistryTable()
+{
+    static unsigned long lastPrint = 0;
+    if (millis() - lastPrint < 5000) return;
+    lastPrint = millis();
+
+    if (systemRole != 1) return;  // Only ANL prints registry
+
+    SERIAL_LOG.println(F("\n========== ANL REGISTRY =========="));
+    unsigned long now = millis();
+    for (int i = 0; i < registryCount; i++) {
+        unsigned long age = now - registry[i].lastSeen;
+        SERIAL_LOG.print(F("Node "));
+        SERIAL_LOG.print(i);
+        SERIAL_LOG.print(F(" | IP: "));
+        SERIAL_LOG.print(registry[i].ip);
+        SERIAL_LOG.print(F(" | Age(ms): "));
+        SERIAL_LOG.print(age);
+        SERIAL_LOG.println(age < NODE_TIMEOUT_MS ? F(" [OK]") : F(" [STALE]"));
+    }
+    SERIAL_LOG.println(F("=================================="));
 }
