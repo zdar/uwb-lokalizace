@@ -1,270 +1,221 @@
 import pygame
 import serial
 import serial.tools.list_ports
-import json
-import csv
-import os
 import time
 import math
 
+RED    = [255, 0, 0]
+BLACK  = [0, 0, 0]
+WHITE  = [255, 255, 255]
+GREY   = [180, 180, 180]
 
-# import site  
-# print(site.getsitepackages())
-
-
-RED = [255, 0, 0]
-BLACK = [0, 0, 0]
-WHITE = [255, 255, 255]
+ANCHORS = {
+    0: (0.0,   0.0),
+    1: (90.0,  0.0),
+    2: (19.09, 93.06),
+}
+MAX_ANCHORS = 8
+MAX_TAGS    = 8
 
 
 class UWB:
-    def __init__(self, name, type):
-        self.name = name
-        self.type = type
-        self.x = 0
-        self.y = 0
+    def __init__(self, name, typ):
+        self.name   = name
+        self.typ    = typ
+        self.x = self.y = 0
         self.status = False
-        self.list = []
+        self.list   = [0.0] * MAX_ANCHORS
 
-        if self.type == 1:
-            self.color = RED
-        else:
-            self.color = BLACK
+        self.color = RED if typ == 1 else BLACK
 
-    def set_location(self, x, y):
-        self.x = x
-        self.y = y
+    def set_loc(self, x, y):
+        self.x = int(x)
+        self.y = int(y)
         self.status = True
 
     def cal(self):
-        count = 0
-        anc_id_list = []
-        for range in self.list:
-            if range != 0:
-                anc_id_list.append(count)
-                count = count + 1
+        anc_ids = [i for i, r in enumerate(self.list) if r > 0.0]
 
-        # print(anc_id_list)
+        print(f"[{self.name}] got ranges at anchors: {anc_ids}  values: {[self.list[i] for i in anc_ids]}")
 
-        if count >= 3:
-            x = 0.0
-            y = 0.0
+        if len(anc_ids) < 3:
+            print(f"  -> need 3 anchors to solve, only have {len(anc_ids)}")
+            return False
 
-            temp_x, temp_y = self.three_point_uwb(
-                anc_id_list[0], anc_id_list[1])
+        a0, a1, a2 = anc_ids[0], anc_ids[1], anc_ids[2]
+        r0, r1, r2 = self.list[a0], self.list[a1], self.list[a2]
 
-            x += temp_x
-            y += temp_y
+        for a in (a0, a1, a2):
+            if a not in ANCHORS:
+                print(f"  -> ERROR: anchor ID {a} has no hardcoded coordinate!")
+                return False
 
-            temp_x, temp_y = self.three_point_uwb(
-                anc_id_list[0], anc_id_list[2])
+        pts = circle_intersections(
+            ANCHORS[a0][0], ANCHORS[a0][1], r0,
+            ANCHORS[a1][0], ANCHORS[a1][1], r1
+        )
+        if pts is None:
+            print("  -> circle intersection failed (noisy/bad ranges)")
+            return False
 
-            x += temp_x
-            y += temp_y
+        (xa, ya), (xb, yb) = pts
+        da = math.hypot(xa - ANCHORS[a2][0], ya - ANCHORS[a2][1])
+        db = math.hypot(xb - ANCHORS[a2][0], yb - ANCHORS[a2][1])
 
-            temp_x, temp_y = self.three_point_uwb(
-                anc_id_list[2], anc_id_list[1])
-
-            x += temp_x
-            y += temp_y
-
-            x = int(x / 3)
-            y = int(y / 3)
-
-            self.set_location(x, y)
-            self.status = True
-
-    def three_point_uwb(self, a_id, b_id):
-        x, y = self.three_point(anc[a_id].x, anc[a_id].y, anc[b_id].x,
-                                anc[b_id].y, self.list[a_id], self.list[b_id])
-
-        return x, y
-
-    def three_point(self, x1, y1, x2, y2, r1, r2):
-
-        temp_x = 0.0
-        temp_y = 0.0
-        # 圆心距离
-        p2p = (x1 - x2)*(x1 - x2) + (y1 - y2)*(y1 - y2)
-        p2p = math.sqrt(p2p)
-
-        # 判断是否相交
-        if r1 + r2 <= p2p:
-            temp_x = x1 + (x2 - x1) * r1 / (r1 + r2)
-            temp_y = y1 + (y2 - y1) * r1 / (r1 + r2)
+        if abs(da - r2) < abs(db - r2):
+            self.set_loc(xa, ya)
         else:
-            dr = p2p / 2 + (r1 * r1 - r2 * r2) / (2 * p2p)
-            temp_x = x1 + (x2 - x1) * dr / p2p
-            temp_y = y1 + (y2 - y1) * dr / p2p
+            self.set_loc(xb, yb)
 
-        return temp_x, temp_y
-
-
-def get_frist_com():
-    port_list = serial.tools.list_ports.comports()
-
-    if len(port_list) <= 0:
-        print("No COM")
-        return ""
-    else:
-        print("First COM")
-        for com in port_list:
-            print(com)
-            return com.device
+        print(f"  -> SOLVED {self.name} at ({self.x}, {self.y})")
+        return True
 
 
-def draw_uwb(uwb):
-
-    # pixel_x = int(uwb.x * cm2p + x_offset)
-    # pixel_y = int(uwb.y * cm2p + y_offset)
-
-    # x轴镜像
-    pixel_x = int(uwb.x * cm2p + x_offset)
-    pixel_y = SCREEN_Y - int(uwb.y * cm2p + y_offset)
-
-    if uwb.status:
-        r = 10
-
-        temp_str = uwb.name + " (" + str(uwb.x) + "," + str(uwb.y)+")"
-
-        font = pygame.font.SysFont("Consola", 24)
-        surf = font.render(temp_str, True, uwb.color)
-        screen.blit(surf, [pixel_x, pixel_y])
-
-        pygame.draw.circle(screen, uwb.color, [
-            pixel_x + 20, pixel_y + 50], r, 0)
-
-# {'id': 1, 'range': [0, 53, 423, 0, 0, 0, 0, 0]}
+def get_first_com():
+    for p in serial.tools.list_ports.comports():
+        print(f"Using: {p.device}")
+        return p.device
+    return ""
 
 
-def read_data():
-    line = ser.readline().decode('UTF-8', errors='ignore').replace('\r', '').replace('\n', '')
-    
-    if "AT+RANGE" in line:
-        try:
-            # 1. Extract the Tag ID (tid)
-            tid_part = line.split("tid:")[1].split(",")[0]
-            tag_id = int(tid_part)
-            
-            # 2. Extract the numbers inside the parentheses (range)
-            range_content = line.split("range:(")[1].split(")")[0]
-            ranges = [int(r) for r in range_content.split(",")]
-            
-            # 3. Update the Tag and run the math
-            if tag_id < len(tag):
-                tag[tag_id].list = ranges
-                tag[tag_id].cal()
-                print(f"Success! Tag {tag_id} Ranges: {ranges}")
-        except Exception as e:
-            print(f"Parse Error: {e} | Line: {line}")
-    else:
-        # Show system messages like "OK" or "RESTART"
-        print("[LOG] " + line)
+def circle_intersections(x0, y0, r0, x1, y1, r1):
+    d = math.hypot(x1 - x0, y1 - y0)
+    if d == 0 or d > r0 + r1 or d < abs(r0 - r1):
+        return None
+    a = (r0*r0 - r1*r1 + d*d) / (2.0*d)
+    h = math.sqrt(max(r0*r0 - a*a, 0))
+    xm = x0 + a*(x1-x0)/d
+    ym = y0 + a*(y1-y0)/d
+    rx = -(y1-y0)*(h/d)
+    ry =  (x1-x0)*(h/d)
+    return ((xm+rx, ym+ry), (xm-rx, ym-ry))
 
 
-def fresh_page():
-    runtime = time.time()
+def draw_item(it):
+    if not it.status:
+        return
+    px = int(it.x * cm2p + xoff)
+    py = SCREEN_Y - int(it.y * cm2p + yoff)
+    pygame.draw.circle(screen, it.color, [px+20, py+20], 8 if it.typ else 4, 0)
+    txt = pygame.font.SysFont("Consola", 18).render(
+        f"{it.name} ({it.x},{it.y})", True, it.color)
+    screen.blit(txt, [px, py])
+
+
+def read_data(ser):
+    if ser.in_waiting == 0:
+        return
+
+    try:
+        line = ser.readline().decode('UTF-8', errors='ignore').strip()
+    except Exception:
+        return
+
+    if not line:
+        return
+
+    if "AT+RANGE" not in line:
+        print("[LOG]", line)
+        return
+
+    print("RAW>", line)
+
+    try:
+        # =========================================================
+        #  BATCH  format:  range:(101,109,54,...),ancid:(0,1,2,...)
+        #  Check this FIRST because it also contains the word "ancid:"
+        # =========================================================
+        if "ancid:(" in line and "range:(" in line:
+            tid = int(line.split("tid:")[1].split(",")[0])
+
+            # extract the two parenthesised lists
+            range_str  = line.split("range:(")[1].split(")")[0]
+            ancid_str  = line.split("ancid:(")[1].split(")")[0]
+
+            ranges = [float(v.strip()) if v.strip() else 0.0 for v in range_str.split(",")]
+            ancids = [int(v.strip())   if v.strip() else -1  for v in ancid_str.split(",")]
+
+            if 0 <= tid < len(tags):
+                filled = 0
+                for aid, rng in zip(ancids, ranges):
+                    if 0 <= aid < MAX_ANCHORS and rng > 0:
+                        tags[tid].list[aid] = rng
+                        filled += 1
+                print(f"  parsed batch -> tid={tid} filled={filled} pairs")
+                if filled >= 3:
+                    tags[tid].cal()
+
+        # =========================================================
+        #  SINGLE format:  range:45,ancid:0
+        # =========================================================
+        elif "ancid:" in line:
+            tid = int(line.split("tid:")[1].split(",")[0])
+            aid = int(line.split("ancid:")[1].split(",")[0])
+            rng = float(line.split("range:")[1].split(",")[0])
+
+            if 0 <= tid < len(tags) and 0 <= aid < MAX_ANCHORS:
+                tags[tid].list[aid] = rng
+                print(f"  parsed single -> tid={tid} anc={aid} rng={rng}")
+                tags[tid].cal()
+        else:
+            print("  unrecognized AT+RANGE format")
+
+    except Exception as e:
+        print(f"Parse error: {e} | Line: {line}")
+
+
+def refresh():
     screen.fill(WHITE)
-    for uwb in anc:
-        draw_uwb(uwb)
-    for uwb in tag:
-        draw_uwb(uwb)
+    pygame.draw.line(screen, GREY, (SCREEN_X//2, 0), (SCREEN_X//2, SCREEN_Y), 1)
+    pygame.draw.line(screen, GREY, (0, SCREEN_Y//2), (SCREEN_X, SCREEN_Y//2), 1)
 
-    pygame.draw.line(screen, BLACK, (CENTER_X_PIEXL, 0),
-                     (CENTER_X_PIEXL, SCREEN_Y), 1)
-    pygame.draw.line(screen, BLACK, (0, CENTER_Y_PIEXL),
-                     (SCREEN_X, CENTER_Y_PIEXL), 1)
-
+    for a in anchors:
+        draw_item(a)
+    for t in tags:
+        draw_item(t)
     pygame.display.flip()
 
-    print("Fresh Over, Use Time:")
-    print(time.time() - runtime)
 
-
-def distance(x1, y1, x2, y2):
-    return math.sqrt((x2-x1) ** 2 + (y2 - y1)**2)
-
-# Main Function .............................................................
-
-
-SCREEN_X = 800
-SCREEN_Y = 800
-
+# ================= MAIN =================
+SCREEN_X, SCREEN_Y = 800, 800
 pygame.init()
 screen = pygame.display.set_mode([SCREEN_X, SCREEN_Y])
-ser = serial.Serial(get_frist_com(), 115200)
 
-anc = []
-tag = []
-anc_count = 4
-tag_count = 8
+com = get_first_com()
+if not com:
+    raise SystemExit("No COM port")
+ser = serial.Serial(com, 115200, timeout=0.05)
 
-# A0X, A0Y = 2066, 514
-# A1X, A1Y = 2243, 1418
-# A2X, A2Y = 427, 1726
-# A3X, A3Y = 458, 112
+anchors = []
+for i in range(MAX_ANCHORS):
+    a = UWB(f"A{i}", 0)
+    if i in ANCHORS:
+        a.set_loc(*ANCHORS[i])
+    anchors.append(a)
 
-# A0X, A0Y = 0, 0
-# A1X, A1Y = 1000, 0
-# A2X, A2Y = 1000, 1000
-# A3X, A3Y = 0, 1000
+tags = [UWB(f"T{i}", 1) for i in range(MAX_TAGS)]
 
-A0X, A0Y = 0, 0
-A1X, A1Y = 130, 0
-A2X, A2Y = 130, 130
-A3X, A3Y = 0, 130
+xs = [v[0] for v in ANCHORS.values()]
+ys = [v[1] for v in ANCHORS.values()]
+mx, my = sum(xs)/len(xs), sum(ys)/len(ys)
+mr = max(math.hypot(x-mx, y-my) for x,y in ANCHORS.values()) or 100
 
+cm2p = (SCREEN_X/2 * 0.9) / mr
+xoff = SCREEN_X/2 - mx*cm2p
+yoff = SCREEN_Y/2 - my*cm2p
 
-CENTER_X = int((A0X+A1X+A2X)/3)
-CENTER_Y = int((A0Y+A1Y+A2Y)/3)
-
-r0 = distance(A0X, A0Y, CENTER_X, CENTER_Y)
-r1 = distance(A1X, A1Y, CENTER_X, CENTER_Y)
-r2 = distance(A2X, A2Y, CENTER_X, CENTER_Y)
-r3 = distance(A3X, A3Y, CENTER_X, CENTER_Y)
-
-r = max(r0, r1, r2, r3)
-
-cm2p = SCREEN_X / 2 * 0.9 / r
-
-# meter to pixel
-# 1000 cm =  1000 piexl
-# cm2p = 1
-# 1000 cm =  500 piexl
-# cm2p = 0.5
-
-x_offset = SCREEN_X / 2 - CENTER_X * cm2p
-y_offset = SCREEN_Y / 2 - CENTER_Y * cm2p
-
-CENTER_X_PIEXL = CENTER_X * cm2p + x_offset
-CENTER_Y_PIEXL = CENTER_Y * cm2p + y_offset
-
-for i in range(anc_count):
-    name = "ANC " + str(i)
-    anc.append(UWB(name, 0))
-for i in range(tag_count):
-    name = "TAG " + str(i)
-    tag.append(UWB(name, 1))
-anc[0].set_location(A0X, A0Y)
-anc[1].set_location(A1X, A1Y)
-anc[2].set_location(A2X, A2Y)
-anc[3].set_location(A3X, A3Y)
-
-fresh_page()
-ser.write("begin".encode('UTF-8'))
+refresh()
 ser.reset_input_buffer()
 
-runtime = time.time()
+t_next = time.time()
 
 while True:
-    read_data()
+    for ev in pygame.event.get():
+        if ev.type == pygame.QUIT:
+            exit()
 
-    if (time.time() - runtime) > 0.5:
-        fresh_page()
-        runtime = time.time()
-        ser.reset_input_buffer()
+    read_data(ser)
 
-
-
-# Package Command
-# pyinstaller --onefile .\position.py
+    if time.time() >= t_next:
+        refresh()
+        t_next = time.time() + 0.5

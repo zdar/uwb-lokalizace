@@ -7,7 +7,7 @@ PORT = 50000
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.settimeout(2.5)
 
-msg = b"POS,192.168.4.2,90,0.00"
+msg = b"POS,192.168.4.4,19.09, 93.06"
 sock.sendto(msg, (ANL_IP, PORT))
 print(f"Sent: {msg}")
 
