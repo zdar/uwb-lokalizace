@@ -16,7 +16,7 @@ AT+ROLE?    -> Query current role
 
 // User config  ------------------------------------------
 
-#define UWB_INDEX 3
+#define UWB_INDEX 0
 #define UWB_TAG_COUNT 5
 
 // Define the built-in BOOT button pin
@@ -78,6 +78,7 @@ void configureUWB();
 void wifiSetup();
 void udpLoop();
 void sendHeartbeat();
+void setNodePosition(IPAddress from, float x, float y);
 void handleUdpPacket();
 void registerNode(IPAddress from);
 String ssidForNetId(uint16_t netId);
@@ -110,6 +111,9 @@ const unsigned long WIFI_RECONNECT_TIMEOUT = 30000;  // Try reconnect for 30s
 struct NodeInfo {
     IPAddress ip;
     unsigned long lastSeen;
+    float x = 0.0f;
+    float y = 0.0f;
+    bool hasPos = false;
 };
 NodeInfo registry[MAX_REGISTRY_ENTRIES];
 int registryCount = 0;
@@ -172,6 +176,17 @@ void setup()
     // Start WiFi control plane after UWB configuration
     wifiSetup();
     
+        if (systemRole == 1) {
+        registry[0].ip = WiFi.softAPIP();   // 192.168.4.1
+        registry[0].lastSeen = millis();
+        registry[0].x = 0.0f;
+        registry[0].y = 0.0f;
+        registry[0].hasPos = true;
+        registryCount = 1;
+
+        SERIAL_LOG.println(F("ANL registered as A1 at (0.00, 0.00)"));
+    }
+
     // Show completion screen
     displayReadyScreen();
     
@@ -643,29 +658,110 @@ void sendHeartbeat()
 void handleUdpPacket()
 {
     int packetSize = udp.parsePacket();
-    if (packetSize <= 0) {
-        return;
-    }
+    if (packetSize <= 0) return;
 
-    char buffer[128];
-    int len = udp.read(buffer, sizeof(buffer) - 1);
-    if (len <= 0) {
-        return;
-    }
-    buffer[len] = '\0';
-    String payload = String(buffer);
+    char buf[128];
+    int len = udp.read(buf, sizeof(buf) - 1);
+    if (len <= 0) return;
+    buf[len] = '\0';
+
     IPAddress remoteIp = udp.remoteIP();
+    uint16_t remotePort = udp.remotePort();
 
-    SERIAL_LOG.print(F("UDP packet from "));
-    SERIAL_LOG.println(remoteIp);
-    SERIAL_LOG.print(F("Payload: "));
-    SERIAL_LOG.println(payload);
+    // ---------- POS ----------
+    if (len >= 4 && strncmp(buf, "POS,", 4) == 0) {
+        char* p = buf + 4;
+        char* tok1 = strtok(p, ",");
+        char* tok2 = strtok(NULL, ",");
+        char* tok3 = strtok(NULL, ",");
 
-    if (payload.startsWith("HB,")) {
-        registerNode(remoteIp);
-        udp.beginPacket(remoteIp, udp.remotePort());
-        udp.print(String("ACK,") + UWB_INDEX);
+        if (!tok1 || !tok2) {
+            udp.beginPacket(remoteIp, remotePort);
+            udp.print("ERR,args");
+            udp.endPacket();
+            return;
+        }
+
+        IPAddress targetIp = remoteIp;
+        float x = 0;
+        float y = 0;
+
+        if (strchr(tok1, '.')) {
+            // format: POS,<IP>,<x>,<y>
+            if (!tok3 || !targetIp.fromString(tok1)) {
+                udp.beginPacket(remoteIp, remotePort);
+                udp.print("ERR,ip");
+                udp.endPacket();
+                return;
+            }
+            x = atof(tok2);
+            y = atof(tok3);
+        } else {
+            // format: POS,<x>,<y>
+            x = atof(tok1);
+            y = atof(tok2);
+        }
+
+        setNodePosition(targetIp, x, y);
+
+        // VISUAL FEEDBACK: 2-second flash on ANL OLED
+        display.fillRect(0, 48, 128, 16, SSD1306_BLACK);
+        display.setCursor(0, 50);
+        display.print(F("POS OK x="));
+        display.print((int)x);
+        display.display();
+
+        // ACK back to laptop
+        udp.beginPacket(remoteIp, remotePort);
+        udp.print("ACK,POS_OK,");
+        udp.print(x, 2);
+        udp.print(",");
+        udp.println(y, 2);
         udp.endPacket();
+
+        return;
+    }
+
+    // ---------- HEARTBEAT ----------
+    if (len >= 3 && strncmp(buf, "HB,", 3) == 0) {
+        registerNode(remoteIp);
+        udp.beginPacket(remoteIp, remotePort);
+        udp.print("ACK,HB,");
+        udp.println(UWB_INDEX);
+        udp.endPacket();
+        return;
+    }
+}
+
+void setNodePosition(IPAddress from, float x, float y)
+{
+    for (int i = 0; i < registryCount; i++) {
+        if (registry[i].ip == from) {
+            registry[i].x = x;
+            registry[i].y = y;
+            registry[i].hasPos = true;
+            SERIAL_LOG.print(F("Node "));
+            SERIAL_LOG.print(i);
+            SERIAL_LOG.print(F(" position set: "));
+            SERIAL_LOG.print(x, 2);
+            SERIAL_LOG.print(F(", "));
+            SERIAL_LOG.println(y, 2);
+            return;
+        }
+    }
+    if (registryCount < MAX_REGISTRY_ENTRIES) {
+        registry[registryCount].ip = from;
+        registry[registryCount].lastSeen = millis();
+        registry[registryCount].x = x;
+        registry[registryCount].y = y;
+        registry[registryCount].hasPos = true;
+        SERIAL_LOG.print(F("Registered node "));
+        SERIAL_LOG.print(registryCount);
+        SERIAL_LOG.print(F(" and set position: "));
+        SERIAL_LOG.print(x, 2);
+        SERIAL_LOG.print(F(", "));
+        SERIAL_LOG.println(y, 2);
+        registryCount++;
     }
 }
 
@@ -976,6 +1072,7 @@ void drawAnlDashboard()
 {
     static unsigned long lastDashboardUpdate = 0;
     static int lastDisplayedCount = -1;
+    static int lastDisplayedFixed = -1;
 
     // Only update display every 2 seconds to avoid flicker
     if (millis() - lastDashboardUpdate < 2000) {
@@ -985,19 +1082,24 @@ void drawAnlDashboard()
 
     // Count active nodes (not stale)
     int activeNodes = 0;
+    int fixedCount = 0;
     unsigned long now = millis();
     for (int i = 0; i < registryCount; i++) {
         unsigned long age = now - registry[i].lastSeen;
         if (age < NODE_TIMEOUT_MS) {
             activeNodes++;
         }
+        if (registry[i].hasPos) {
+            fixedCount++;
+        }
     }
 
-    // Don't redraw if count hasn't changed
-    if (activeNodes == lastDisplayedCount) {
+    // Don't redraw if values haven't changed
+    if (activeNodes == lastDisplayedCount && fixedCount == lastDisplayedFixed) {
         return;
     }
     lastDisplayedCount = activeNodes;
+    lastDisplayedFixed = fixedCount;
 
     // Draw ANL dashboard at bottom
     display.fillRect(0, 48, 128, 16, SSD1306_BLACK);  // Clear status area
@@ -1005,12 +1107,18 @@ void drawAnlDashboard()
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(0, 50);
 
-    display.print(F("ANL | Connected: "));
-    display.println(activeNodes);
+    display.print(F("ANL C:"));
+    display.print(activeNodes);
+    display.print(F(" F:"));
+    display.print(fixedCount);
+    display.print(F("/"));
+    display.println(registryCount);
 
     display.display();
     SERIAL_LOG.print(F("[ANL Dashboard] Active nodes: "));
-    SERIAL_LOG.println(activeNodes);
+    SERIAL_LOG.print(activeNodes);
+    SERIAL_LOG.print(F(" | Fixed: "));
+    SERIAL_LOG.println(fixedCount);
 }
 
 void printRegistryTable()
@@ -1031,6 +1139,14 @@ void printRegistryTable()
         SERIAL_LOG.print(registry[i].ip);
         SERIAL_LOG.print(F(" | Age(ms): "));
         SERIAL_LOG.print(age);
+        if (registry[i].hasPos) {
+            SERIAL_LOG.print(F(" | Pos: "));
+            SERIAL_LOG.print(registry[i].x, 2);
+            SERIAL_LOG.print(F(","));
+            SERIAL_LOG.print(registry[i].y, 2);
+        } else {
+            SERIAL_LOG.print(F(" | Pos: unset"));
+        }
         SERIAL_LOG.println(age < NODE_TIMEOUT_MS ? F(" [OK]") : F(" [STALE]"));
     }
     SERIAL_LOG.println(F("=================================="));
