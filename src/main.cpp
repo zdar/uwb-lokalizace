@@ -25,7 +25,7 @@ Use 2.5.7    Adafruit_SSD1306
 
 //!!!!! CHANGE THIS BEFORE EACH FLASH !!!!!
 // ANY index can be the ANL. Just pick unique numbers 0..7!
-#define UWB_INDEX 1
+#define UWB_INDEX 0
 //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 #define UWB_TAG_COUNT 8
@@ -1030,7 +1030,14 @@ void handleIncomingUdp()
         }
 
         // Register / keepalive
-        registerNode(remoteIp, (uint8_t)tid);
+        uint8_t knownRole = 1; // default anchor
+        for (int i = 0; i < registryCount; i++) {
+            if (registry[i].ip == remoteIp) {
+            knownRole = registry[i].role;
+            break;
+    }
+}
+registerNode(remoteIp, (uint8_t)tid, knownRole);
 
         // Store samples for median filtering during calibration
         if (cal.targetId != 255 && (uint8_t)tid == cal.targetId) {
@@ -1047,12 +1054,63 @@ void handleIncomingUdp()
             }
         }
 
-        SERIAL_LOG.print(F("[RPT] tid="));
-        SERIAL_LOG.print(tid);
-        SERIAL_LOG.print(F(" ranges="));
-        SERIAL_LOG.print(rc);
-        SERIAL_LOG.print(F(" ancids="));
-        SERIAL_LOG.println(ac);
+        // (RPT logging disabled to keep serial clean)
+        // SERIAL_LOG.print(F("[RPT] tid="));
+        // SERIAL_LOG.print(tid);
+        // SERIAL_LOG.print(F(" ranges="));
+        // SERIAL_LOG.print(rc);
+        // SERIAL_LOG.print(F(" ancids="));
+        // SERIAL_LOG.println(ac);
+
+        // ---------- Option C: solve position on ANL and broadcast ----------
+        {
+            float vr[8];
+            uint8_t va[8];
+            int vc = 0;
+            int pairs = (rc < ac) ? rc : ac;
+            for (int j = 0; j < pairs; j++) {
+                if (ancids[j] >= 0 && ancids[j] < 8 && ranges[j] > 0) {
+                    uint8_t a = (uint8_t)ancids[j];
+                    bool fixed = false;
+                    for (int ri = 0; ri < registryCount; ri++) {
+                        if (registry[ri].id == a && registry[ri].hasPos) {
+                            fixed = true;
+                            break;
+                        }
+                    }
+                    if (fixed && vc < 8) {
+                        va[vc] = a;
+                        vr[vc] = ranges[j];
+                        vc++;
+                    }
+                }
+            }
+
+            if (vc >= 3) {
+                float sx, sy;
+                if (solveTrilateration2D(vr[0], vr[1], vr[2],
+                                         va[0], va[1], va[2],
+                                         sx, sy)) {
+                    SERIAL_LOG.print(F("[SOL] tid="));
+                    SERIAL_LOG.print(tid);
+                    SERIAL_LOG.print(F(" x="));
+                    SERIAL_LOG.print(sx, 2);
+                    SERIAL_LOG.print(F(" y="));
+                    SERIAL_LOG.println(sy, 2);
+
+                    char solPkt[64];
+                    snprintf(solPkt, sizeof(solPkt), "SOL,%d,%.2f,%.2f", tid, sx, sy);
+                    udp.beginPacket(IPAddress(255, 255, 255, 255), WIFI_PORT);
+                    udp.write((const uint8_t*)solPkt, strlen(solPkt));
+                    udp.endPacket();
+
+                    // Also echo over serial so a PC connected via USB can read it
+                    SERIAL_LOG.println(solPkt);
+                }
+            }
+        }
+        // ------------------------------------------------------------------
+
         return;
     }
 
