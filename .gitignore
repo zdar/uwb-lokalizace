@@ -22,3 +22,8 @@ Thumbs.db
 
 # Keep your local private libs!
 !lib/
+
+# API keys and secrets
+.env
+:USERPROFILE
+.continue

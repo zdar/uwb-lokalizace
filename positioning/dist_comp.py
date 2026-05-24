@@ -1,12 +1,39 @@
+import matplotlib
+matplotlib.use('Agg')  
+import matplotlib.pyplot as plt
 
-import math
+# Paste your current ANL registry coordinates here
+anchors = [
+    {"id": 0, "x": 0.00,   "y": 0.00,   "label": "ANL (A0)"},
+    {"id": 4, "x": 70.00, "y": 0.00,   "label": "A4"},
+    {"id": 3, "x": -0.32, "y": 96.00,  "label": "A3"},
+    {"id": 2, "x": 41.54,  "y": -84.33,  "label": "A2"},
+]
 
+fig, ax = plt.subplots(figsize=(6, 6))
 
-d  = 90
-d1 = 95
-d2 = 117
-a  = (d1**2 - d2**2 + d**2) / (2 * d)
-h  = math.sqrt(abs(d1**2 - a**2))
-x  = a
-y  = h       # or -h; pick the sign that matches where you physically placed A3
-print(f"Calculated position: ({x:.2f}, {y:.2f})")
+for a in anchors:
+    color = "red" if a["id"] == 0 else "blue"
+    ax.plot(a["x"], a["y"], "o", markersize=12, color=color)
+    ax.annotate(
+        f'{a["label"]}\n({a["x"]:.1f}, {a["y"]:.1f})',
+        (a["x"], a["y"]),
+        textcoords="offset points",
+        xytext=(0, 12),
+        ha="center",
+        fontsize=9,
+    )
+
+# # Connect them with thin grey lines so you can eyeball the shape
+# xs = [a["x"] for a in anchors] + [anchors[0]["x"]]
+# ys = [a["y"] for a in anchors] + [anchors[0]["y"]]
+# ax.plot(xs, ys, "-", color="grey", alpha=0.4, linewidth=1)
+
+ax.set_aspect("equal", adjustable="box")
+ax.set_xlabel("X")
+ax.set_ylabel("Y")
+ax.set_title("UWB Anchor Positions from ANL Registry")
+ax.grid(True, linestyle="--", alpha=0.4)
+plt.tight_layout()
+plt.savefig('anchors.png', dpi=150)
+print("Saved plot to anchors.png")

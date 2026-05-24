@@ -1,32 +1,42 @@
 /*
 For ESP32S3 UWB AT Demo - MERGED FIRMWARE
-Anchor + Tag combined with role switching via AT command
+Identical binary on all nodes. Behavior set by provisioning:
+- System Role: ANL (AP) or NODE (STA)
+- UWB Role:    TAG (0) or ANCHOR (1) via AT+ROLE or EEPROM
+- UWB_INDEX:   0..7 (must be UNIQUE per node, ANL can be any index)
+
+Auto-calibration sequence (ANL only):
+1. Picks next unfixed node, sends ROLE,0 -> becomes temp Tag.
+2. Waits ~25 s for reboot + WiFi rejoin + UWB config.
+3. Collects wireless RPT ranges for ~15 s (median filter).
+4. Solves position:
+   - 1 fixed anchor known -> place on X-axis at measured distance.
+   - 2 fixed anchors known -> two-circle intersection, pick +Y.
+   - 3+ fixed anchors known -> trilateration.
+5. Stores coordinate, sends ROLE,1 -> back to Anchor.
+6. Repeats until all nodes fixed.
 
 Use 2.0.0    Wire
 Use 1.11.7   Adafruit_GFX_Library
 Use 1.14.4   Adafruit_BusIO
 Use 2.0.0    SPI
 Use 2.5.7    Adafruit_SSD1306
-
-Phase 1: Role-Switching Logic
-AT+ROLE=0   -> Switch to TAG mode
-AT+ROLE=1   -> Switch to ANCHOR mode
-AT+ROLE?    -> Query current role
 */
 
-// User config  ------------------------------------------
+//!!!!! CHANGE THIS BEFORE EACH FLASH !!!!!
+// ANY index can be the ANL. Just pick unique numbers 0..7!
+#define UWB_INDEX 1
+//!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
-#define UWB_INDEX 3
-#define UWB_TAG_COUNT 5
+#define UWB_TAG_COUNT 8
+#define MAX_CAL_SAMPLES 5
 
-// Define the built-in BOOT button pin
 #define BUTTON_PIN 0
 
-// EEPROM settings
 #define EEPROM_SIZE 512
-#define ROLE_ADDRESS 0  // Address to store role (0=TAG, 1=ANCHOR)
-#define SYSTEM_ROLE_ADDRESS 1 // Address to store system role (0=node, 1=ANL)
-#define NETID_ADDRESS 2       // Address to store the 16-bit network ID
+#define ROLE_ADDRESS 0
+#define SYSTEM_ROLE_ADDRESS 1
+#define NETID_ADDRESS 2
 #define DEFAULT_NETID 1234
 
 #define WIFI_PORT 50000
@@ -34,9 +44,7 @@ AT+ROLE?    -> Query current role
 #define AP_CHANNEL 6
 #define WIFI_PASSWORD "rtlsnet12"
 #define MAX_REGISTRY_ENTRIES 16
-#define NODE_TIMEOUT_MS 10000  // Consider a node stale if no heartbeat for 10 seconds
-
-// User config end  ------------------------------------------
+#define NODE_TIMEOUT_MS 10000
 
 #include <Wire.h>
 #include <Adafruit_GFX.h>
@@ -45,18 +53,16 @@ AT+ROLE?    -> Query current role
 #include <EEPROM.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
+#include <math.h>
 
 #define SERIAL_LOG Serial
 #define SERIAL_AT mySerial2
 
 HardwareSerial SERIAL_AT(2);
 
-// ESP32S3
 #define RESET 16
-
 #define IO_RXD2 18
 #define IO_TXD2 17
-
 #define I2C_SDA 39
 #define I2C_SCL 38
 
@@ -78,9 +84,11 @@ void configureUWB();
 void wifiSetup();
 void udpLoop();
 void sendHeartbeat();
+void relayUwbLine(const char* line);
+void handleIncomingUdp();
+void autoCalibrateLoop();
 void setNodePosition(IPAddress from, float x, float y);
-void handleUdpPacket();
-void registerNode(IPAddress from);
+void registerNode(IPAddress from, uint8_t nodeId, uint8_t nodeRole = 1);
 String ssidForNetId(uint16_t netId);
 String netIdString(uint16_t netId);
 void displayRoleScreen(uint8_t role);
@@ -93,11 +101,15 @@ void monitorWifiHealth();
 void updateWifiStatusDisplay();
 void drawAnlDashboard();
 void printRegistryTable();
+bool getAnchorPos(uint8_t anchorId, float &x, float &y);
+bool solveTrilateration2D(float r0, float r1, float r2,
+                          uint8_t a0, uint8_t a1, uint8_t a2,
+                          float &outX, float &outY);
 // --------------------------------------------
 
 // Global variables
-uint8_t currentRole = 0;  // 0=TAG, 1=ANCHOR
-uint8_t systemRole = 0;   // 0=node, 1=ANL
+uint8_t currentRole = 0;
+uint8_t systemRole = 0;
 uint16_t networkId = DEFAULT_NETID;
 
 WiFiUDP udp;
@@ -105,8 +117,8 @@ unsigned long lastHeartbeatTime = 0;
 unsigned long lastWifiCheckTime = 0;
 unsigned long wifiLostTime = 0;
 bool wifiWasConnected = false;
-const unsigned long WIFI_CHECK_INTERVAL = 5000;  // Check every 5 seconds
-const unsigned long WIFI_RECONNECT_TIMEOUT = 30000;  // Try reconnect for 30s
+const unsigned long WIFI_CHECK_INTERVAL = 5000;
+const unsigned long WIFI_RECONNECT_TIMEOUT = 30000;
 
 struct NodeInfo {
     IPAddress ip;
@@ -114,46 +126,325 @@ struct NodeInfo {
     float x = 0.0f;
     float y = 0.0f;
     bool hasPos = false;
+    uint8_t id = 255;
+    uint8_t role = 1;
 };
 NodeInfo registry[MAX_REGISTRY_ENTRIES];
 int registryCount = 0;
 
-// Variables for debounce (so one press doesn't count as 50)
-unsigned long lastDebounceTime = 0;  
-unsigned long debounceDelay = 200;    
-bool reportingState = true; // Keep track of whether the firehose is ON or OFF
+unsigned long lastDebounceTime = 0;
+unsigned long debounceDelay = 200;
+bool reportingState = true;
 
+// Buffer for capturing UWB lines for wireless relay
+char rangeLineBuf[256];
+int rangeLineIdx = 0;
+
+// ================== AUTO-CALIBRATION STATE ==================
+struct {
+    uint8_t targetId;          // UWB_INDEX being calibrated (255 = idle)
+    uint8_t phase;             // 0=idle, 1=wait reboot, 2=collecting, 3=wait revert
+    unsigned long timer;
+    IPAddress targetIp;        // IP at the time ROLE,0 was sent (fallback)
+    float samples[8][MAX_CAL_SAMPLES];
+    uint8_t sampleCount[8];
+} cal = { 255, 0, 0, IPAddress(), {{0}}, {0} };
+// ============================================================
+
+bool getAnchorPos(uint8_t anchorId, float &x, float &y)
+{
+    for (int i = 0; i < registryCount; i++) {
+        if (registry[i].id == anchorId && registry[i].hasPos) {
+            x = registry[i].x;
+            y = registry[i].y;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool solveTrilateration2D(float r0, float r1, float r2,
+                          uint8_t a0, uint8_t a1, uint8_t a2,
+                          float &outX, float &outY)
+{
+    float x0, y0, x1, y1, x2, y2;
+    if (!getAnchorPos(a0, x0, y0)) return false;
+    if (!getAnchorPos(a1, x1, y1)) return false;
+    if (!getAnchorPos(a2, x2, y2)) return false;
+
+    float dx = x1 - x0;
+    float dy = y1 - y0;
+    float d  = sqrt(dx*dx + dy*dy);
+
+    if (d <= 0.0f || d > r0 + r1 || d < fabs(r0 - r1)) return false;
+
+    float a = (r0*r0 - r1*r1 + d*d) / (2.0f * d);
+    float h = sqrt(max(r0*r0 - a*a, 0.0f));
+
+    float xm = x0 + a * dx / d;
+    float ym = y0 + a * dy / d;
+
+    float rx = -dy * (h / d);
+    float ry =  dx * (h / d);
+
+    float xa = xm + rx, ya = ym + ry;
+    float xb = xm - rx, yb = ym - ry;
+
+    float da = sqrt((xa - x2)*(xa - x2) + (ya - y2)*(ya - y2));
+    float db = sqrt((xb - x2)*(xb - x2) + (yb - y2)*(yb - y2));
+
+    if (fabs(da - r2) < fabs(db - r2)) {
+        outX = xa;  outY = ya;
+    } else {
+        outX = xb;  outY = yb;
+    }
+    return true;
+}
+
+// ==============================================================
+// AUTO-CALIBRATION STATE MACHINE (runs only on ANL)
+// ==============================================================
+bool isNodeAlive(uint8_t nodeId)
+{
+    for (int i = 0; i < registryCount; i++) {
+        if (registry[i].id == nodeId && (millis() - registry[i].lastSeen) < NODE_TIMEOUT_MS)
+            return true;
+    }
+    return false;
+}
+
+IPAddress getNodeIp(uint8_t nodeId)
+{
+    for (int i = 0; i < registryCount; i++) {
+        if (registry[i].id == nodeId && (millis() - registry[i].lastSeen) < NODE_TIMEOUT_MS)
+            return registry[i].ip;
+    }
+    return IPAddress();
+}
+
+void commitCalibrationResult(uint8_t targetId, float x, float y)
+{
+    int idx = -1;
+    for (int i = 0; i < registryCount; i++) {
+        if (registry[i].id == targetId) idx = i;
+    }
+    if (idx < 0) {
+        SERIAL_LOG.println(F("[AUTO] target ID vanished from registry"));
+        return;
+    }
+    registry[idx].x = x;
+    registry[idx].y = y;
+    registry[idx].hasPos = true;
+    SERIAL_LOG.print(F("[AUTO] Node ID "));
+    SERIAL_LOG.print(targetId);
+    SERIAL_LOG.print(F(" fixed at "));
+    SERIAL_LOG.print(x, 2);
+    SERIAL_LOG.print(F(", "));
+    SERIAL_LOG.println(y, 2);
+}
+
+float medianSample(uint8_t anchor)
+{
+    uint8_t n = cal.sampleCount[anchor];
+    if (n == 0) return -1.0f;
+    float s[MAX_CAL_SAMPLES];
+    memcpy(s, cal.samples[anchor], n * sizeof(float));
+    // insertion sort (n <= 5, so this is trivial)
+    for (uint8_t i = 1; i < n; i++) {
+        float key = s[i];
+        int j = (int)i - 1;
+        while (j >= 0 && s[j] > key) {
+            s[j + 1] = s[j];
+            j--;
+        }
+        s[j + 1] = key;
+    }
+    if (n % 2 == 1) return s[n / 2];
+    return (s[n / 2 - 1] + s[n / 2]) / 2.0f;
+}
+
+void autoCalibrateLoop()
+{
+    const unsigned long ROLE_SWITCH_DELAY = 60000; // 60s: enough for UWB reconfig
+    const unsigned long COLLECT_TIME      = 20000; // 20s: gather multiple samples
+
+    if (systemRole != 1) return;
+
+    switch (cal.phase) {
+        case 0: {
+            uint8_t candidate = 255;
+            for (int i = 1; i < registryCount; i++) {
+                if (!registry[i].hasPos && registry[i].id != 255 && registry[i].id != (uint8_t)UWB_INDEX) {
+                    if (isNodeAlive(registry[i].id) && registry[i].role == 1) {
+                        candidate = registry[i].id;
+                        break;
+                    }
+                }
+            }
+            if (candidate == 255) return;
+
+            cal.targetId = candidate;
+            cal.phase = 1;
+            cal.timer = millis();
+            memset(cal.sampleCount, 0, sizeof(cal.sampleCount));
+            memset(cal.samples, 0, sizeof(cal.samples));
+
+            IPAddress ip = getNodeIp(candidate);
+            cal.targetIp = ip; // remember for fallback
+
+            SERIAL_LOG.print(F("[CAL] Target node ID "));
+            SERIAL_LOG.print(candidate);
+            SERIAL_LOG.print(F(" IP "));
+            SERIAL_LOG.println(ip);
+
+            if (ip != IPAddress()) {
+                udp.beginPacket(ip, WIFI_PORT);
+                udp.print("ROLE,0");
+                udp.endPacket();
+                SERIAL_LOG.println(F("[CAL] Sent ROLE,0 (Tag)"));
+            } else {
+                SERIAL_LOG.println(F("[CAL] IP not found, waiting..."));
+            }
+            break;
+        }
+
+        case 1: {
+            // Node is rebooting and reconfiguring UWB. Just wait.
+            if (millis() - cal.timer < ROLE_SWITCH_DELAY) return;
+            memset(cal.sampleCount, 0, sizeof(cal.sampleCount));
+            memset(cal.samples, 0, sizeof(cal.samples));
+            cal.phase = 2;
+            cal.timer = millis();
+            SERIAL_LOG.println(F("[CAL] Window open, collecting RPT..."));
+            break;
+        }
+
+        case 2: {
+            if (millis() - cal.timer < COLLECT_TIME) return;
+
+            float vr[8];
+            uint8_t va[8];
+            int vc = 0;
+
+            for (int a = 0; a < 8; a++) {
+                if (cal.sampleCount[a] == 0) continue;
+                float r = medianSample((uint8_t)a);
+                if (r <= 0.0f) continue;
+                bool fixed = false;
+                for (int ri = 0; ri < registryCount; ri++) {
+                    if (registry[ri].id == (uint8_t)a && registry[ri].hasPos) {
+                        fixed = true;
+                        break;
+                    }
+                }
+                if (fixed && vc < 8) {
+                    va[vc] = (uint8_t)a;
+                    vr[vc] = r;
+                    vc++;
+                }
+            }
+
+            SERIAL_LOG.print(F("[CAL] Median ranges from "));
+            SERIAL_LOG.print(vc);
+            SERIAL_LOG.println(F(" fixed anchors"));
+
+            bool solved = false;
+            float sx = 0, sy = 0;
+
+            if (vc >= 3) {
+                solved = solveTrilateration2D(vr[0], vr[1], vr[2],
+                                              va[0], va[1], va[2],
+                                              sx, sy);
+            } else if (vc == 2) {
+                float x0, y0, x1, y1;
+                if (getAnchorPos(va[0], x0, y0) && getAnchorPos(va[1], x1, y1)) {
+                    float dx = x1 - x0;
+                    float dy = y1 - y0;
+                    float d  = sqrt(dx*dx + dy*dy);
+                    if (d > 0 && d < vr[0] + vr[1] && d > fabs(vr[0] - vr[1])) {
+                        float a = (vr[0]*vr[0] - vr[1]*vr[1] + d*d) / (2.0f * d);
+                        float h = sqrt(max(vr[0]*vr[0] - a*a, 0.0f));
+                        float xm = x0 + a * dx / d;
+                        float ym = y0 + a * dy / d;
+                        float rx = -dy * (h / d);
+                        float ry =  dx * (h / d);
+                        float xa = xm + rx, ya = ym + ry;
+                        float xb = xm - rx, yb = ym - ry;
+                        sx = (ya >= yb) ? xa : xb;
+                        sy = (ya >= yb) ? ya : yb;
+                        solved = true;
+                    }
+                }
+            } else if (vc == 1) {
+                sx = vr[0];
+                sy = 0.0f;
+                solved = true;
+            }
+
+            if (solved) {
+                commitCalibrationResult(cal.targetId, sx, sy);
+            } else {
+                SERIAL_LOG.println(F("[AUTO] Solve failed (geometry/noise)"));
+            }
+
+            // Use the IP we actually saw RPTs from; only fall back to registry if empty
+            IPAddress ip = cal.targetIp;
+            if (ip == IPAddress()) ip = getNodeIp(cal.targetId);
+            if (ip != IPAddress()) {
+                udp.beginPacket(ip, WIFI_PORT);
+                udp.print("ROLE,1");
+                udp.endPacket();
+                SERIAL_LOG.println(F("[CAL] Sent ROLE,1 (Anchor)"));
+            } else {
+                SERIAL_LOG.println(F("[CAL] CRITICAL: no IP to send ROLE,1"));
+            }
+
+            cal.phase = 3;
+            cal.timer = millis();
+            break;
+        }
+
+        case 3: {
+            // Wait for node to reboot back to Anchor.
+            if (millis() - cal.timer < ROLE_SWITCH_DELAY) return;
+            SERIAL_LOG.println(F("[CAL] Done, looking for next..."));
+            cal.targetId = 255;
+            cal.targetIp = IPAddress();
+            cal.phase = 0;
+            break;
+        }
+    }
+}
 
 void setup()
 {
     EEPROM.begin(EEPROM_SIZE);
-    
+
     pinMode(RESET, OUTPUT);
     digitalWrite(RESET, HIGH);
 
     SERIAL_LOG.begin(115200);
-
     SERIAL_LOG.println(F("Hello! ESP32-S3 AT command V1.0 Test - MERGED"));
     SERIAL_AT.begin(115200, SERIAL_8N1, IO_RXD2, IO_TXD2);
 
-    SERIAL_AT.print("AT\r\n"); 
-    
+    SERIAL_AT.print("AT\r\n");
+
     Wire.begin(I2C_SDA, I2C_SCL);
     delay(1000);
-    
-    // SSD1306_SWITCHCAPVCC = generate display voltage from 3.3V internally
+
     if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C))
-    { 
+    {
         SERIAL_LOG.println(F("SSD1306 allocation failed"));
-        for (;;)
-            ; // Don't proceed, loop forever
+        for (;;);
     }
     display.clearDisplay();
 
-    // Load saved roles and network configuration from EEPROM
     currentRole = loadRole();
     systemRole = loadSystemRole();
     networkId = loadNetworkId();
+
+    // Let currentRole stay exactly as saved in EEPROM.
+    // If EEPROM is blank, loadRole defaults to 1 (Anchor) for safety.
 
     SERIAL_LOG.print(F("Loaded role from EEPROM: "));
     SERIAL_LOG.println(currentRole);
@@ -162,7 +453,7 @@ void setup()
     SERIAL_LOG.print(F("Loaded network ID: "));
     SERIAL_LOG.println(networkId);
 
-    pinMode(BUTTON_PIN, INPUT_PULLUP); 
+    pinMode(BUTTON_PIN, INPUT_PULLUP);
     maybeEnterProvisioning();
 
     logoshow();
@@ -170,27 +461,23 @@ void setup()
 
     sendData("AT?", 2000, 1);
 
-    // Configure UWB based on current role and network
     configureUWB();
-
-    // Start WiFi control plane after UWB configuration
     wifiSetup();
-    
-        if (systemRole == 1) {
-        registry[0].ip = WiFi.softAPIP();   // 192.168.4.1
+
+    if (systemRole == 1) {
+        registry[0].ip = WiFi.softAPIP();
         registry[0].lastSeen = millis();
         registry[0].x = 0.0f;
         registry[0].y = 0.0f;
         registry[0].hasPos = true;
+        registry[0].id = (uint8_t)UWB_INDEX;
         registryCount = 1;
 
-        SERIAL_LOG.println(F("ANL registered as A1 at (0.00, 0.00)"));
+        SERIAL_LOG.print(F("ANL registered at (0.00, 0.00) with ID "));
+        SERIAL_LOG.println(UWB_INDEX);
     }
 
-    // Show completion screen
     displayReadyScreen();
-    
-    // Show role + ID again after ready
     logoshow();
 
     SERIAL_LOG.println(F("===================================="));
@@ -199,62 +486,86 @@ void setup()
         SERIAL_LOG.println(F("MODE: TAG"));
     } else {
         SERIAL_LOG.println(F("MODE: ANCHOR"));
-        SERIAL_LOG.println(F("PRESS THE 'BOOT' BUTTON TO TOGGLE REPORTING! "));
     }
-    SERIAL_LOG.println(F("AT+ROLE=0  -> Switch to TAG"));
-    SERIAL_LOG.println(F("AT+ROLE=1  -> Switch to ANCHOR"));
-    SERIAL_LOG.println(F("AT+ROLE?   -> Query role"));
+    SERIAL_LOG.println(F("SHORT press  = toggle reporting (Anchor only)"));
+    SERIAL_LOG.println(F("HOLD 2.5 sec = toggle TAG/ANCHOR + reboot"));
     SERIAL_LOG.println(F("===================================="));
 }
 
 void loop()
 {
-    // 1. Check the physical BOOT button (in both roles)
-    if (digitalRead(BUTTON_PIN) == LOW) {
-        
-        // Debounce: Only trigger if enough time has passed
-        if ((millis() - lastDebounceTime) > debounceDelay) {
-            
-            // Toggle the state
-            reportingState = !reportingState; 
-            
-            if (reportingState == false) {
-                SERIAL_LOG.println(F("\n--- BUTTON PRESSED: TURNING REPORTING OFF ---"));
-                SERIAL_AT.print("AT+SETRPT=0\r\n");
-            } else {
-                SERIAL_LOG.println(F("\n--- BUTTON PRESSED: TURNING REPORTING ON ---"));
-                SERIAL_AT.print("AT+SETRPT=1\r\n");
-            }
-            
-            lastDebounceTime = millis(); // Reset the debounce timer
-        }
+    // ==========================================
+    // BOOT BUTTON: short press = toggle reporting (anchors only)
+    //              long hold 2.5s = toggle TAG/ANCHOR and reboot
+    // ==========================================
+    static bool btnWasDown = false;
+    static unsigned long btnDownT = 0;
+    static bool roleToggleDone = false;
+
+    bool btnNow = (digitalRead(BUTTON_PIN) == LOW);
+
+    if (btnNow && !btnWasDown) {
+        btnDownT = millis();
+        btnWasDown = true;
+        roleToggleDone = false;
     }
 
-    // 2. Normal Keyboard Passthrough (with AT command interception)
+    if (btnWasDown) {
+        if (btnNow) {
+            unsigned long held = millis() - btnDownT;
+            if (!roleToggleDone && held >= 2500) {
+                roleToggleDone = true;
+                uint8_t newRole = (currentRole == 0) ? 1 : 0;
+                saveRole(newRole);
+                display.clearDisplay();
+                display.setTextSize(2);
+                display.setTextColor(SSD1306_WHITE);
+                display.setCursor(0, 18);
+                display.println(newRole == 1 ? F("ANCHOR") : F("TAG"));
+                display.setCursor(0, 42);
+                display.setTextSize(1);
+                display.println(F("Rebooting..."));
+                display.display();
+                delay(800);
+                ESP.restart();
+            }
+        } else {
+            unsigned long held = millis() - btnDownT;
+            btnWasDown = false;
+            if (!roleToggleDone && held >= debounceDelay) {
+                if (currentRole == 1) {
+                    reportingState = !reportingState;
+                    if (reportingState) {
+                        SERIAL_LOG.println(F("--- RPT ON ---"));
+                        SERIAL_AT.print("AT+SETRPT=1\r\n");
+                    } else {
+                        SERIAL_LOG.println(F("--- RPT OFF ---"));
+                        SERIAL_AT.print("AT+SETRPT=0\r\n");
+                    }
+                } else {
+                    SERIAL_LOG.println(F("--- TAG: reporting locked ON ---"));
+                }
+            }
+            roleToggleDone = false;
+        }
+    }
+    // ==========================================
+
     while (SERIAL_LOG.available() > 0)
     {
         char c = SERIAL_LOG.read();
-        
-        // Check if this is an AT command
         if (c == 'A') {
             String atCmd = "";
             atCmd += c;
-            
-            // Read the rest of the line
             unsigned long timeout = millis() + 100;
             while (millis() < timeout && SERIAL_LOG.available() > 0) {
                 c = SERIAL_LOG.read();
-                if (c == '\r' || c == '\n') {
-                    break;
-                }
+                if (c == '\r' || c == '\n') break;
                 atCmd += c;
             }
-            
-            // Check if it's a ROLE command
             if (atCmd.startsWith("AT+ROLE")) {
                 processATCommand(atCmd);
             } else {
-                // Pass through to UWB module
                 SERIAL_AT.write(atCmd.c_str(), atCmd.length());
                 SERIAL_AT.write('\r');
                 SERIAL_AT.write('\n');
@@ -264,23 +575,41 @@ void loop()
         }
         yield();
     }
-    
-    // 3. Pass UWB module output directly to the serial monitor
+
     while (SERIAL_AT.available() > 0)
     {
-        SERIAL_LOG.write(SERIAL_AT.read());
+        char c = SERIAL_AT.read();
+        SERIAL_LOG.write(c);
+
+        if (rangeLineIdx < (int)sizeof(rangeLineBuf) - 1) {
+            rangeLineBuf[rangeLineIdx++] = c;
+        }
+
+        if (c == '\n') {
+            if (rangeLineIdx > 0) {
+                int end = rangeLineIdx - 1;
+                while (end >= 0 && (rangeLineBuf[end] == '\r' || rangeLineBuf[end] == '\n' || rangeLineBuf[end] == ' ')) {
+                    rangeLineBuf[end] = '\0';
+                    end--;
+                }
+                if (systemRole == 0 && currentRole == 0 && strncmp(rangeLineBuf, "AT+RANGE", 8) == 0) {
+                    relayUwbLine(rangeLineBuf);
+                }
+                rangeLineIdx = 0;
+            }
+        }
         yield();
     }
 
     udpLoop();
+    autoCalibrateLoop();
     monitorWifiHealth();
     printRegistryTable();
 
-    // NEW: Show live ANL dashboard instead of just a static line
     if (systemRole == 1) {
         drawAnlDashboard();
     } else {
-        updateWifiStatusDisplay();  // nodes keep the old bottom-line WiFi status
+        updateWifiStatusDisplay();
     }
 }
 
@@ -288,13 +617,13 @@ void loop()
 void logoshow(void)
 {
     display.clearDisplay();
-    display.setTextSize(1);              
-    display.setTextColor(SSD1306_WHITE); 
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
 
     display.setTextSize(2);
     String temp = "";
     display.setCursor(0, 0);
-    
+
     if (currentRole == 0) {
         temp = temp + "T" + UWB_INDEX;
     } else {
@@ -305,10 +634,9 @@ void logoshow(void)
 
     display.setCursor(0, 24);
     display.setTextSize(1);
-
     display.print(F("FW: "));
 
-    String dateStr = __DATE__;  // "MMM DD YYYY"
+    String dateStr = __DATE__;
     String mon = dateStr.substring(0, 3);
     int m = 0;
     if (mon == "Jan") m = 1;
@@ -354,17 +682,14 @@ void displayRoleScreen(uint8_t role)
     display.setTextSize(2);
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(0, 10);
-    
     if (role == 0) {
         display.println(F("MODE: TAG"));
     } else {
         display.println(F("MODE: ANCHOR"));
     }
-    
     display.setTextSize(1);
     display.setCursor(0, 40);
     display.println(F("Configuring..."));
-    
     display.display();
     delay(1500);
 }
@@ -376,7 +701,6 @@ void displayReadyScreen()
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(0, 0);
     display.println(F("READY!"));
-    
     display.setTextSize(1);
     display.setCursor(0, 24);
     if (currentRole == 0) {
@@ -384,7 +708,6 @@ void displayReadyScreen()
     } else {
         display.println(F("ANCHOR Mode Active"));
     }
-    
     display.setCursor(0, 38);
     if (systemRole == 1) {
         display.print(F("ANL AP: "));
@@ -392,7 +715,6 @@ void displayReadyScreen()
         display.print(F("JOIN NET: "));
     }
     display.println(ssidForNetId(networkId));
-    
     display.setCursor(0, 52);
     display.print(F("WiFi: "));
     if (systemRole == 1 || WiFi.status() == WL_CONNECTED) {
@@ -400,7 +722,6 @@ void displayReadyScreen()
     } else {
         display.println(F("FAIL"));
     }
-    
     display.display();
     delay(4000);
 }
@@ -408,31 +729,22 @@ void displayReadyScreen()
 String sendData(String command, const int timeout, boolean debug)
 {
     String response = "";
-    
-    // FIXED: Appends the proper backslash carriage return + line feed
-    command = command + "\r\n"; 
-
+    command = command + "\r\n";
     SERIAL_LOG.print(command);
-    SERIAL_AT.print(command); // Changed from println to print so it doesn't double up
-
+    SERIAL_AT.print(command);
     long int time = millis();
-
     while ((time + timeout) > millis())
     {
         while (SERIAL_AT.available())
         {
-            // The esp has data so display its output to the serial window
-            char c = SERIAL_AT.read(); // read the next character.
+            char c = SERIAL_AT.read();
             response += c;
         }
     }
-
-    if (debug)
-    {
+    if (debug) {
         SERIAL_LOG.print(response);
     }
-
-    return response;                
+    return response;
 }
 
 String config_cmd()
@@ -440,7 +752,7 @@ String config_cmd()
     String temp = "AT+SETCFG=";
     temp = temp + UWB_INDEX;
     temp = temp + ",";
-    temp = temp + currentRole;  // 0=TAG, 1=ANCHOR
+    temp = temp + currentRole;
     temp = temp + ",1";
     temp = temp + ",1";
     return temp;
@@ -455,15 +767,10 @@ String cap_cmd()
     return temp;
 }
 
-// ============== ROLE MANAGEMENT ==============
-
 uint8_t loadRole()
 {
     uint8_t role = EEPROM.read(ROLE_ADDRESS);
-    // Validate: role should be 0 or 1
-    if (role != 0 && role != 1) {
-        return 0;  // Default to TAG mode
-    }
+    if (role != 0 && role != 1) return 1;
     return role;
 }
 
@@ -478,9 +785,7 @@ void saveRole(uint8_t role)
 uint8_t loadSystemRole()
 {
     uint8_t role = EEPROM.read(SYSTEM_ROLE_ADDRESS);
-    if (role != 0 && role != 1) {
-        return 0;
-    }
+    if (role != 0 && role != 1) return 0;
     return role;
 }
 
@@ -497,17 +802,13 @@ uint16_t loadNetworkId()
     uint16_t low = EEPROM.read(NETID_ADDRESS);
     uint16_t high = EEPROM.read(NETID_ADDRESS + 1);
     uint16_t value = (high << 8) | low;
-    if (value < 1000 || value > 9999) {
-        return DEFAULT_NETID;
-    }
+    if (value < 1000 || value > 9999) return DEFAULT_NETID;
     return value;
 }
 
 void saveNetworkId(uint16_t netId)
 {
-    if (netId < 1000) {
-        netId = DEFAULT_NETID;
-    }
+    if (netId < 1000) netId = DEFAULT_NETID;
     EEPROM.write(NETID_ADDRESS, netId & 0xFF);
     EEPROM.write(NETID_ADDRESS + 1, (netId >> 8) & 0xFF);
     EEPROM.commit();
@@ -516,24 +817,24 @@ void saveNetworkId(uint16_t netId)
 void configureUWB()
 {
     sendData("AT?", 2000, 1);
-    
     if (currentRole == 0) {
-        // TAG mode configuration
         SERIAL_LOG.println(F(">>> Configuring as TAG"));
         sendData("AT+RESTORE", 5000, 1);
     } else {
-        // ANCHOR mode configuration
         SERIAL_LOG.println(F(">>> Configuring as ANCHOR"));
     }
-
     sendData(config_cmd(), 2000, 1);
     sendData(cap_cmd(), 2000, 1);
     sendData(String("AT+SETPAN=") + networkId, 2000, 1);
-    
-    if (reportingState) {
+
+    if (currentRole == 0) {
         sendData("AT+SETRPT=1", 2000, 1);
     } else {
-        sendData("AT+SETRPT=0", 2000, 1);
+        if (reportingState) {
+            sendData("AT+SETRPT=1", 2000, 1);
+        } else {
+            sendData("AT+SETRPT=0", 2000, 1);
+        }
     }
     sendData("AT+SAVE", 2000, 1);
     sendData("AT+RESTART", 2000, 1);
@@ -554,7 +855,6 @@ void wifiSetup()
         String ssid = ssidForNetId(networkId);
         SERIAL_LOG.print(F("Joining network: "));
         SERIAL_LOG.println(ssid);
-
         display.clearDisplay();
         display.setTextSize(1);
         display.setTextColor(SSD1306_WHITE);
@@ -581,9 +881,7 @@ void wifiSetup()
             WiFi.begin(ssid.c_str(), WIFI_PASSWORD);
             unsigned long start = millis();
             while (millis() - start < 15000) {
-                if (WiFi.status() == WL_CONNECTED) {
-                    break;
-                }
+                if (WiFi.status() == WL_CONNECTED) break;
                 delay(200);
             }
             if (WiFi.status() == WL_CONNECTED) {
@@ -635,9 +933,9 @@ void wifiSetup()
 
 void udpLoop()
 {
-    if (systemRole == 1) {
-        handleUdpPacket();
-    } else if (WiFi.status() == WL_CONNECTED) {
+    handleIncomingUdp();
+
+    if (systemRole == 0 && WiFi.status() == WL_CONNECTED) {
         if (millis() - lastHeartbeatTime >= HEARTBEAT_INTERVAL) {
             sendHeartbeat();
             lastHeartbeatTime = millis();
@@ -647,7 +945,7 @@ void udpLoop()
 
 void sendHeartbeat()
 {
-    String payload = String("HB,") + UWB_INDEX + "," + networkId;
+    String payload = String("HB,") + UWB_INDEX + "," + currentRole + "," + networkId;
     udp.beginPacket("192.168.4.1", WIFI_PORT);
     udp.write((const uint8_t *)payload.c_str(), payload.length());
     udp.endPacket();
@@ -655,12 +953,24 @@ void sendHeartbeat()
     SERIAL_LOG.println(payload);
 }
 
-void handleUdpPacket()
+void relayUwbLine(const char* line)
+{
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    char pkt[280];
+    snprintf(pkt, sizeof(pkt), "RPT,%s", line);
+
+    udp.beginPacket("192.168.4.1", WIFI_PORT);
+    udp.write((const uint8_t*)pkt, strlen(pkt));
+    udp.endPacket();
+}
+
+void handleIncomingUdp()
 {
     int packetSize = udp.parsePacket();
     if (packetSize <= 0) return;
 
-    char buf[128];
+    char buf[256];
     int len = udp.read(buf, sizeof(buf) - 1);
     if (len <= 0) return;
     buf[len] = '\0';
@@ -668,8 +978,86 @@ void handleUdpPacket()
     IPAddress remoteIp = udp.remoteIP();
     uint16_t remotePort = udp.remotePort();
 
-    // ---------- POS ----------
-    if (len >= 4 && strncmp(buf, "POS,", 4) == 0) {
+    // ---------- RPT: wireless range report (ANL only) ----------
+    if (systemRole == 1 && len >= 4 && strncmp(buf, "RPT,", 4) == 0) {
+        const char* rpt = buf + 4;
+
+        const char* p = strstr(rpt, "tid:");
+        if (!p) return;
+        int tid = atoi(p + 4);
+
+        p = strstr(rpt, "range:(");
+        if (!p) return;
+        p += 7;
+
+        float ranges[8] = {0};
+        int rc = 0;
+        char tmp[12];
+        int ti = 0;
+        while (*p && rc < 8) {
+            if (*p == '-' || (*p >= '0' && *p <= '9')) {
+                if (ti < 11) tmp[ti++] = *p;
+            } else if (*p == ',' || *p == ')') {
+                if (ti > 0) {
+                    tmp[ti] = '\0';
+                    ranges[rc++] = (float)atoi(tmp);
+                    ti = 0;
+                }
+                if (*p == ')') break;
+            }
+            p++;
+        }
+
+        p = strstr(rpt, "ancid:(");
+        if (!p) return;
+        p += 7;
+
+        int ancids[8] = {-1};
+        int ac = 0;
+        ti = 0;
+        while (*p && ac < 8) {
+            if (*p == '-' || (*p >= '0' && *p <= '9')) {
+                if (ti < 11) tmp[ti++] = *p;
+            } else if (*p == ',' || *p == ')') {
+                if (ti > 0) {
+                    tmp[ti] = '\0';
+                    ancids[ac++] = atoi(tmp);
+                    ti = 0;
+                }
+                if (*p == ')') break;
+            }
+            p++;
+        }
+
+        // Register / keepalive
+        registerNode(remoteIp, (uint8_t)tid);
+
+        // Store samples for median filtering during calibration
+        if (cal.targetId != 255 && (uint8_t)tid == cal.targetId) {
+            cal.targetIp = remoteIp; // update target IP in case it changed
+            
+            int pairs = (rc < ac) ? rc : ac;
+            for (int j = 0; j < pairs; j++) {
+                if (ancids[j] >= 0 && ancids[j] < 8) {
+                    uint8_t a = (uint8_t)ancids[j];
+                    if (cal.sampleCount[a] < MAX_CAL_SAMPLES) {
+                        cal.samples[a][cal.sampleCount[a]++] = ranges[j];
+                    }
+                }
+            }
+        }
+
+        SERIAL_LOG.print(F("[RPT] tid="));
+        SERIAL_LOG.print(tid);
+        SERIAL_LOG.print(F(" ranges="));
+        SERIAL_LOG.print(rc);
+        SERIAL_LOG.print(F(" ancids="));
+        SERIAL_LOG.println(ac);
+        return;
+    }
+
+    // ---------- POS: position fix (ANL only) ----------
+    if (systemRole == 1 && len >= 4 && strncmp(buf, "POS,", 4) == 0) {
         char* p = buf + 4;
         char* tok1 = strtok(p, ",");
         char* tok2 = strtok(NULL, ",");
@@ -687,7 +1075,6 @@ void handleUdpPacket()
         float y = 0;
 
         if (strchr(tok1, '.')) {
-            // format: POS,<IP>,<x>,<y>
             if (!tok3 || !targetIp.fromString(tok1)) {
                 udp.beginPacket(remoteIp, remotePort);
                 udp.print("ERR,ip");
@@ -697,38 +1084,62 @@ void handleUdpPacket()
             x = atof(tok2);
             y = atof(tok3);
         } else {
-            // format: POS,<x>,<y>
             x = atof(tok1);
             y = atof(tok2);
         }
 
         setNodePosition(targetIp, x, y);
 
-        // VISUAL FEEDBACK: 2-second flash on ANL OLED
         display.fillRect(0, 48, 128, 16, SSD1306_BLACK);
         display.setCursor(0, 50);
         display.print(F("POS OK x="));
         display.print((int)x);
         display.display();
 
-        // ACK back to laptop
         udp.beginPacket(remoteIp, remotePort);
         udp.print("ACK,POS_OK,");
         udp.print(x, 2);
         udp.print(",");
         udp.println(y, 2);
         udp.endPacket();
-
         return;
     }
 
-    // ---------- HEARTBEAT ----------
-    if (len >= 3 && strncmp(buf, "HB,", 3) == 0) {
-        registerNode(remoteIp);
+       // ---------- HB: heartbeat (ANL only) ----------
+    if (systemRole == 1 && len >= 3 && strncmp(buf, "HB,", 3) == 0) {
+        char* p = buf + 3;
+        char* idTok = strtok(p, ",");
+        char* roleTok = strtok(NULL, ",");
+        uint8_t nodeId = 255;
+        uint8_t nodeRole = 1;   // default anchor if missing
+        if (idTok) nodeId = (uint8_t)atoi(idTok);
+        if (roleTok) nodeRole = (uint8_t)atoi(roleTok);
+
+        registerNode(remoteIp, nodeId, nodeRole);
         udp.beginPacket(remoteIp, remotePort);
         udp.print("ACK,HB,");
         udp.println(UWB_INDEX);
         udp.endPacket();
+        return;
+    }
+
+    // ---------- ROLE command (node only) ----------
+    if (systemRole == 0 && len >= 5 && strncmp(buf, "ROLE,", 5) == 0) {
+        int newRole = atoi(buf + 5);
+        if (newRole == 0 || newRole == 1) {
+            saveRole((uint8_t)newRole);
+            udp.beginPacket(remoteIp, remotePort);
+            udp.print("ACK,ROLE,");
+            udp.println(newRole);
+            udp.endPacket();
+            delay(500);
+            ESP.restart();
+        }
+        return;
+    }
+
+    // ---------- ACK to node (ignored silently) ----------
+    if (systemRole == 0 && len >= 4 && strncmp(buf, "ACK,", 4) == 0) {
         return;
     }
 }
@@ -765,20 +1176,42 @@ void setNodePosition(IPAddress from, float x, float y)
     }
 }
 
-void registerNode(IPAddress from)
+void registerNode(IPAddress from, uint8_t nodeId, uint8_t nodeRole)
 {
+    int existingIdx = -1;
     for (int i = 0; i < registryCount; i++) {
         if (registry[i].ip == from) {
-            registry[i].lastSeen = millis();
-            return;
+            existingIdx = i;
+            break;
         }
     }
+
+    if (existingIdx >= 0) {
+        registry[existingIdx].lastSeen = millis();
+        registry[existingIdx].role = nodeRole;           // <-- update role
+        if (nodeId != 255 && registry[existingIdx].id == 255) {
+            registry[existingIdx].id = nodeId;
+        }
+        return;
+    }
+
+    if (nodeId != 255) {
+        for (int i = 0; i < registryCount; i++) {
+            if (registry[i].id == nodeId) {
+                registry[i].ip = from;
+                registry[i].lastSeen = millis();
+                registry[i].role = nodeRole;             // <-- update role
+                return;
+            }
+        }
+    }
+
     if (registryCount < MAX_REGISTRY_ENTRIES) {
         registry[registryCount].ip = from;
         registry[registryCount].lastSeen = millis();
+        registry[registryCount].id = nodeId;
+        registry[registryCount].role = nodeRole;         // <-- set role
         registryCount++;
-        SERIAL_LOG.print(F("Registered node: "));
-        SERIAL_LOG.println(from);
     }
 }
 
@@ -839,9 +1272,7 @@ void provisioningMenu()
                 systemRole = (systemRole == 1) ? 0 : 1;
             } else if (stage == 1) {
                 networkId++;
-                if (networkId > 9999) {
-                    networkId = 1000;
-                }
+                if (networkId > 9999) networkId = 1000;
             }
         } else if (event == 2) {
             if (stage == 0) {
@@ -876,9 +1307,7 @@ int waitForButtonEvent(unsigned long timeout)
             unsigned long pressStart = millis();
             while (digitalRead(BUTTON_PIN) == LOW) {
                 if (millis() - pressStart >= 800) {
-                    while (digitalRead(BUTTON_PIN) == LOW) {
-                        delay(10);
-                    }
+                    while (digitalRead(BUTTON_PIN) == LOW) delay(10);
                     return 2;
                 }
                 delay(10);
@@ -925,12 +1354,11 @@ void processATCommand(String command)
 {
     command.trim();
     command.toUpperCase();
-    
+
     SERIAL_LOG.println(F("\n=== PROCESSING CUSTOM AT COMMAND ==="));
     SERIAL_LOG.println(command);
-    
+
     if (command.startsWith("AT+ROLE?")) {
-        // Query current role
         SERIAL_LOG.print(F("Current Role: "));
         if (currentRole == 0) {
             SERIAL_LOG.println(F("TAG (0)"));
@@ -939,28 +1367,24 @@ void processATCommand(String command)
         }
         return;
     }
-    
+
     if (command.startsWith("AT+ROLE=")) {
-        // Extract the role value
-        String valueStr = command.substring(8);  // Skip "AT+ROLE="
+        String valueStr = command.substring(8);
         valueStr.trim();
-        
         int newRole = valueStr.toInt();
-        
+
         if (newRole == 0 || newRole == 1) {
             if (newRole != currentRole) {
                 SERIAL_LOG.print(F("Switching from "));
                 SERIAL_LOG.print(currentRole);
                 SERIAL_LOG.print(F(" to "));
                 SERIAL_LOG.println(newRole);
-                
+
                 currentRole = newRole;
                 saveRole(currentRole);
-                
+
                 SERIAL_LOG.println(F("Role saved. Please restart the device."));
                 displayRoleScreen(currentRole);
-                
-                // Optional: Auto-restart after a delay
                 delay(2000);
                 SERIAL_LOG.println(F("Auto-restarting..."));
                 ESP.restart();
@@ -972,55 +1396,43 @@ void processATCommand(String command)
         }
         return;
     }
-    
+
     SERIAL_LOG.println(F("Unknown custom command"));
 }
 
 void monitorWifiHealth()
 {
-    // ANL doesn't need WiFi health monitoring
-    if (systemRole == 1) {
-        return;
-    }
+    if (systemRole == 1) return;
 
     unsigned long now = millis();
-
-    // Check WiFi status periodically
-    if (now - lastWifiCheckTime < WIFI_CHECK_INTERVAL) {
-        return;
-    }
+    if (now - lastWifiCheckTime < WIFI_CHECK_INTERVAL) return;
     lastWifiCheckTime = now;
 
     bool isConnected = (WiFi.status() == WL_CONNECTED);
 
     if (isConnected && !wifiWasConnected) {
-        // WiFi just reconnected
         SERIAL_LOG.println(F("[WiFi] RECONNECTED!"));
         SERIAL_LOG.print(F("IP: "));
         SERIAL_LOG.println(WiFi.localIP());
         wifiWasConnected = true;
         wifiLostTime = 0;
     } else if (!isConnected && wifiWasConnected) {
-        // WiFi just lost
         SERIAL_LOG.println(F("[WiFi] CONNECTION LOST - Starting reconnect..."));
         wifiWasConnected = false;
         wifiLostTime = now;
-
         String ssid = ssidForNetId(networkId);
         WiFi.begin(ssid.c_str(), WIFI_PASSWORD);
     } else if (!isConnected && !wifiWasConnected) {
-        // WiFi is still disconnected
         unsigned long downtime = now - wifiLostTime;
         if (downtime > WIFI_RECONNECT_TIMEOUT) {
             SERIAL_LOG.print(F("[WiFi] Still disconnected after "));
             SERIAL_LOG.print(WIFI_RECONNECT_TIMEOUT / 1000);
             SERIAL_LOG.println(F("s - retrying..."));
-
             String ssid = ssidForNetId(networkId);
             WiFi.disconnect();
             delay(100);
             WiFi.begin(ssid.c_str(), WIFI_PASSWORD);
-            wifiLostTime = now;  // Reset the timer
+            wifiLostTime = now;
         }
     }
 }
@@ -1030,22 +1442,14 @@ void updateWifiStatusDisplay()
     static unsigned long lastDisplayUpdate = 0;
     static bool lastDisplayedConnected = false;
 
-    // Only update display every 2 seconds to avoid flicker
-    if (millis() - lastDisplayUpdate < 2000) {
-        return;
-    }
+    if (millis() - lastDisplayUpdate < 2000) return;
     lastDisplayUpdate = millis();
 
     bool isConnected = (systemRole == 1 || WiFi.status() == WL_CONNECTED);
-
-    // Don't redraw if status hasn't changed
-    if (isConnected == lastDisplayedConnected) {
-        return;
-    }
+    if (isConnected == lastDisplayedConnected) return;
     lastDisplayedConnected = isConnected;
 
-    // Small status line at bottom of display
-    display.fillRect(0, 48, 128, 16, SSD1306_BLACK);  // Clear status area
+    display.fillRect(0, 48, 128, 16, SSD1306_BLACK);
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(0, 50);
@@ -1058,14 +1462,7 @@ void updateWifiStatusDisplay()
     } else {
         display.println(F("WiFi LOST - Reconnecting..."));
     }
-
     display.display();
-
-    // Also log it
-    if (systemRole == 0) {
-        SERIAL_LOG.print(F("[Display] WiFi Status: "));
-        SERIAL_LOG.println(isConnected ? F("OK") : F("LOST"));
-    }
 }
 
 void drawAnlDashboard()
@@ -1074,35 +1471,27 @@ void drawAnlDashboard()
     static int lastDisplayedCount = -1;
     static int lastDisplayedFixed = -1;
 
-    // Only update display every 2 seconds to avoid flicker
-    if (millis() - lastDashboardUpdate < 2000) {
-        return;
+    if (systemRole == 1 && registryCount > 0) {
+        registry[0].lastSeen = millis();
     }
+
+    if (millis() - lastDashboardUpdate < 2000) return;
     lastDashboardUpdate = millis();
 
-    // Count active nodes (not stale)
     int activeNodes = 0;
     int fixedCount = 0;
     unsigned long now = millis();
     for (int i = 0; i < registryCount; i++) {
         unsigned long age = now - registry[i].lastSeen;
-        if (age < NODE_TIMEOUT_MS) {
-            activeNodes++;
-        }
-        if (registry[i].hasPos) {
-            fixedCount++;
-        }
+        if (age < NODE_TIMEOUT_MS) activeNodes++;
+        if (registry[i].hasPos) fixedCount++;
     }
 
-    // Don't redraw if values haven't changed
-    if (activeNodes == lastDisplayedCount && fixedCount == lastDisplayedFixed) {
-        return;
-    }
+    if (activeNodes == lastDisplayedCount && fixedCount == lastDisplayedFixed) return;
     lastDisplayedCount = activeNodes;
     lastDisplayedFixed = fixedCount;
 
-    // Draw ANL dashboard at bottom
-    display.fillRect(0, 48, 128, 16, SSD1306_BLACK);  // Clear status area
+    display.fillRect(0, 48, 128, 16, SSD1306_BLACK);
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(0, 50);
@@ -1126,8 +1515,7 @@ void printRegistryTable()
     static unsigned long lastPrint = 0;
     if (millis() - lastPrint < 5000) return;
     lastPrint = millis();
-
-    if (systemRole != 1) return;  // Only ANL prints registry
+    if (systemRole != 1) return;
 
     SERIAL_LOG.println(F("\n========== ANL REGISTRY =========="));
     unsigned long now = millis();
@@ -1135,6 +1523,8 @@ void printRegistryTable()
         unsigned long age = now - registry[i].lastSeen;
         SERIAL_LOG.print(F("Node "));
         SERIAL_LOG.print(i);
+        SERIAL_LOG.print(F(" | ID:"));
+        SERIAL_LOG.print(registry[i].id);
         SERIAL_LOG.print(F(" | IP: "));
         SERIAL_LOG.print(registry[i].ip);
         SERIAL_LOG.print(F(" | Age(ms): "));
