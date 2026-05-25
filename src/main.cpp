@@ -28,6 +28,8 @@ Use 2.5.7    Adafruit_SSD1306
 #define UWB_INDEX 0
 //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
+#define POC_DISABLE_AUTO_CAL 1
+
 #define UWB_TAG_COUNT 8
 #define MAX_CAL_SAMPLES 5
 
@@ -84,10 +86,11 @@ void configureUWB();
 void wifiSetup();
 void udpLoop();
 void sendHeartbeat();
+void broadcastLog(const char* msg);
 void relayUwbLine(const char* line);
+void sendSnap();
 void handleIncomingUdp();
 void autoCalibrateLoop();
-void setNodePosition(IPAddress from, float x, float y);
 void registerNode(IPAddress from, uint8_t nodeId, uint8_t nodeRole = 1);
 String ssidForNetId(uint16_t netId);
 String netIdString(uint16_t netId);
@@ -99,12 +102,9 @@ int waitForButtonEvent(unsigned long timeout);
 void showProvisioningScreen(uint8_t stage);
 void monitorWifiHealth();
 void updateWifiStatusDisplay();
+void updateSnapDisplay();
 void drawAnlDashboard();
 void printRegistryTable();
-bool getAnchorPos(uint8_t anchorId, float &x, float &y);
-bool solveTrilateration2D(float r0, float r1, float r2,
-                          uint8_t a0, uint8_t a1, uint8_t a2,
-                          float &outX, float &outY);
 // --------------------------------------------
 
 // Global variables
@@ -123,9 +123,6 @@ const unsigned long WIFI_RECONNECT_TIMEOUT = 30000;
 struct NodeInfo {
     IPAddress ip;
     unsigned long lastSeen;
-    float x = 0.0f;
-    float y = 0.0f;
-    bool hasPos = false;
     uint8_t id = 255;
     uint8_t role = 1;
 };
@@ -140,6 +137,10 @@ bool reportingState = true;
 char rangeLineBuf[256];
 int rangeLineIdx = 0;
 
+// SNAP stream state (tag side)
+bool snapActive = false;
+unsigned long snapEndTime = 0;
+
 // ================== AUTO-CALIBRATION STATE ==================
 struct {
     uint8_t targetId;          // UWB_INDEX being calibrated (255 = idle)
@@ -150,56 +151,6 @@ struct {
     uint8_t sampleCount[8];
 } cal = { 255, 0, 0, IPAddress(), {{0}}, {0} };
 // ============================================================
-
-bool getAnchorPos(uint8_t anchorId, float &x, float &y)
-{
-    for (int i = 0; i < registryCount; i++) {
-        if (registry[i].id == anchorId && registry[i].hasPos) {
-            x = registry[i].x;
-            y = registry[i].y;
-            return true;
-        }
-    }
-    return false;
-}
-
-bool solveTrilateration2D(float r0, float r1, float r2,
-                          uint8_t a0, uint8_t a1, uint8_t a2,
-                          float &outX, float &outY)
-{
-    float x0, y0, x1, y1, x2, y2;
-    if (!getAnchorPos(a0, x0, y0)) return false;
-    if (!getAnchorPos(a1, x1, y1)) return false;
-    if (!getAnchorPos(a2, x2, y2)) return false;
-
-    float dx = x1 - x0;
-    float dy = y1 - y0;
-    float d  = sqrt(dx*dx + dy*dy);
-
-    if (d <= 0.0f || d > r0 + r1 || d < fabs(r0 - r1)) return false;
-
-    float a = (r0*r0 - r1*r1 + d*d) / (2.0f * d);
-    float h = sqrt(max(r0*r0 - a*a, 0.0f));
-
-    float xm = x0 + a * dx / d;
-    float ym = y0 + a * dy / d;
-
-    float rx = -dy * (h / d);
-    float ry =  dx * (h / d);
-
-    float xa = xm + rx, ya = ym + ry;
-    float xb = xm - rx, yb = ym - ry;
-
-    float da = sqrt((xa - x2)*(xa - x2) + (ya - y2)*(ya - y2));
-    float db = sqrt((xb - x2)*(xb - x2) + (yb - y2)*(yb - y2));
-
-    if (fabs(da - r2) < fabs(db - r2)) {
-        outX = xa;  outY = ya;
-    } else {
-        outX = xb;  outY = yb;
-    }
-    return true;
-}
 
 // ==============================================================
 // AUTO-CALIBRATION STATE MACHINE (runs only on ANL)
@@ -222,26 +173,6 @@ IPAddress getNodeIp(uint8_t nodeId)
     return IPAddress();
 }
 
-void commitCalibrationResult(uint8_t targetId, float x, float y)
-{
-    int idx = -1;
-    for (int i = 0; i < registryCount; i++) {
-        if (registry[i].id == targetId) idx = i;
-    }
-    if (idx < 0) {
-        SERIAL_LOG.println(F("[AUTO] target ID vanished from registry"));
-        return;
-    }
-    registry[idx].x = x;
-    registry[idx].y = y;
-    registry[idx].hasPos = true;
-    SERIAL_LOG.print(F("[AUTO] Node ID "));
-    SERIAL_LOG.print(targetId);
-    SERIAL_LOG.print(F(" fixed at "));
-    SERIAL_LOG.print(x, 2);
-    SERIAL_LOG.print(F(", "));
-    SERIAL_LOG.println(y, 2);
-}
 
 float medianSample(uint8_t anchor)
 {
@@ -265,6 +196,9 @@ float medianSample(uint8_t anchor)
 
 void autoCalibrateLoop()
 {
+#if POC_DISABLE_AUTO_CAL
+    return;
+#else
     const unsigned long ROLE_SWITCH_DELAY = 60000; // 60s: enough for UWB reconfig
     const unsigned long COLLECT_TIME      = 20000; // 20s: gather multiple samples
 
@@ -274,7 +208,7 @@ void autoCalibrateLoop()
         case 0: {
             uint8_t candidate = 255;
             for (int i = 1; i < registryCount; i++) {
-                if (!registry[i].hasPos && registry[i].id != 255 && registry[i].id != (uint8_t)UWB_INDEX) {
+                if (registry[i].id != 255 && registry[i].id != (uint8_t)UWB_INDEX) {
                     if (isNodeAlive(registry[i].id) && registry[i].role == 1) {
                         candidate = registry[i].id;
                         break;
@@ -332,7 +266,7 @@ void autoCalibrateLoop()
                 if (r <= 0.0f) continue;
                 bool fixed = false;
                 for (int ri = 0; ri < registryCount; ri++) {
-                    if (registry[ri].id == (uint8_t)a && registry[ri].hasPos) {
+                    if (registry[ri].id == (uint8_t)a) {
                         fixed = true;
                         break;
                     }
@@ -348,44 +282,8 @@ void autoCalibrateLoop()
             SERIAL_LOG.print(vc);
             SERIAL_LOG.println(F(" fixed anchors"));
 
-            bool solved = false;
-            float sx = 0, sy = 0;
-
-            if (vc >= 3) {
-                solved = solveTrilateration2D(vr[0], vr[1], vr[2],
-                                              va[0], va[1], va[2],
-                                              sx, sy);
-            } else if (vc == 2) {
-                float x0, y0, x1, y1;
-                if (getAnchorPos(va[0], x0, y0) && getAnchorPos(va[1], x1, y1)) {
-                    float dx = x1 - x0;
-                    float dy = y1 - y0;
-                    float d  = sqrt(dx*dx + dy*dy);
-                    if (d > 0 && d < vr[0] + vr[1] && d > fabs(vr[0] - vr[1])) {
-                        float a = (vr[0]*vr[0] - vr[1]*vr[1] + d*d) / (2.0f * d);
-                        float h = sqrt(max(vr[0]*vr[0] - a*a, 0.0f));
-                        float xm = x0 + a * dx / d;
-                        float ym = y0 + a * dy / d;
-                        float rx = -dy * (h / d);
-                        float ry =  dx * (h / d);
-                        float xa = xm + rx, ya = ym + ry;
-                        float xb = xm - rx, yb = ym - ry;
-                        sx = (ya >= yb) ? xa : xb;
-                        sy = (ya >= yb) ? ya : yb;
-                        solved = true;
-                    }
-                }
-            } else if (vc == 1) {
-                sx = vr[0];
-                sy = 0.0f;
-                solved = true;
-            }
-
-            if (solved) {
-                commitCalibrationResult(cal.targetId, sx, sy);
-            } else {
-                SERIAL_LOG.println(F("[AUTO] Solve failed (geometry/noise)"));
-            }
+            // Position solving removed for PoC - raw data only
+            SERIAL_LOG.println(F("[CAL] Position solving disabled in PoC mode"));
 
             // Use the IP we actually saw RPTs from; only fall back to registry if empty
             IPAddress ip = cal.targetIp;
@@ -414,6 +312,7 @@ void autoCalibrateLoop()
             break;
         }
     }
+#endif
 }
 
 void setup()
@@ -467,13 +366,10 @@ void setup()
     if (systemRole == 1) {
         registry[0].ip = WiFi.softAPIP();
         registry[0].lastSeen = millis();
-        registry[0].x = 0.0f;
-        registry[0].y = 0.0f;
-        registry[0].hasPos = true;
         registry[0].id = (uint8_t)UWB_INDEX;
         registryCount = 1;
 
-        SERIAL_LOG.print(F("ANL registered at (0.00, 0.00) with ID "));
+        SERIAL_LOG.print(F("ANL registered with ID "));
         SERIAL_LOG.println(UWB_INDEX);
     }
 
@@ -543,7 +439,8 @@ void loop()
                         SERIAL_AT.print("AT+SETRPT=0\r\n");
                     }
                 } else {
-                    SERIAL_LOG.println(F("--- TAG: reporting locked ON ---"));
+                    // Tag short press: start 5-second SNAP stream
+                    sendSnap();
                 }
             }
             roleToggleDone = false;
@@ -594,6 +491,14 @@ void loop()
                 }
                 if (systemRole == 0 && currentRole == 0 && strncmp(rangeLineBuf, "AT+RANGE", 8) == 0) {
                     relayUwbLine(rangeLineBuf);
+                    // During SNAP window, send each AT+RANGE line as a SNAP packet
+                    if (snapActive && millis() < snapEndTime) {
+                        char snapPkt[280];
+                        snprintf(snapPkt, sizeof(snapPkt), "SNAP,%d,%s,%lu", UWB_INDEX, rangeLineBuf, millis());
+                        udp.beginPacket("192.168.4.1", WIFI_PORT);
+                        udp.write((const uint8_t*)snapPkt, strlen(snapPkt));
+                        udp.endPacket();
+                    }
                 }
                 rangeLineIdx = 0;
             }
@@ -606,7 +511,9 @@ void loop()
     monitorWifiHealth();
     printRegistryTable();
 
-    if (systemRole == 1) {
+    if (systemRole == 0 && currentRole == 0 && snapActive) {
+        updateSnapDisplay();
+    } else if (systemRole == 1) {
         drawAnlDashboard();
     } else {
         updateWifiStatusDisplay();
@@ -965,6 +872,22 @@ void relayUwbLine(const char* line)
     udp.endPacket();
 }
 
+void broadcastLog(const char* msg)
+{
+    if (systemRole != 1) return;
+    udp.beginPacket(IPAddress(255, 255, 255, 255), WIFI_PORT);
+    udp.write((const uint8_t*)msg, strlen(msg));
+    udp.endPacket();
+}
+
+void sendSnap()
+{
+    if (systemRole != 0 || currentRole != 0) return;
+    snapActive = true;
+    snapEndTime = millis() + 5000;
+    SERIAL_LOG.println(F("[SNAP] 5-second stream started"));
+}
+
 void handleIncomingUdp()
 {
     int packetSize = udp.parsePacket();
@@ -1068,44 +991,14 @@ registerNode(remoteIp, (uint8_t)tid, knownRole);
             uint8_t va[8];
             int vc = 0;
             int pairs = (rc < ac) ? rc : ac;
+            // PoC: log raw RPT data instead of solving position
             for (int j = 0; j < pairs; j++) {
                 if (ancids[j] >= 0 && ancids[j] < 8 && ranges[j] > 0) {
                     uint8_t a = (uint8_t)ancids[j];
-                    bool fixed = false;
-                    for (int ri = 0; ri < registryCount; ri++) {
-                        if (registry[ri].id == a && registry[ri].hasPos) {
-                            fixed = true;
-                            break;
-                        }
-                    }
-                    if (fixed && vc < 8) {
-                        va[vc] = a;
-                        vr[vc] = ranges[j];
-                        vc++;
-                    }
-                }
-            }
-
-            if (vc >= 3) {
-                float sx, sy;
-                if (solveTrilateration2D(vr[0], vr[1], vr[2],
-                                         va[0], va[1], va[2],
-                                         sx, sy)) {
-                    SERIAL_LOG.print(F("[SOL] tid="));
-                    SERIAL_LOG.print(tid);
-                    SERIAL_LOG.print(F(" x="));
-                    SERIAL_LOG.print(sx, 2);
-                    SERIAL_LOG.print(F(" y="));
-                    SERIAL_LOG.println(sy, 2);
-
-                    char solPkt[64];
-                    snprintf(solPkt, sizeof(solPkt), "SOL,%d,%.2f,%.2f", tid, sx, sy);
-                    udp.beginPacket(IPAddress(255, 255, 255, 255), WIFI_PORT);
-                    udp.write((const uint8_t*)solPkt, strlen(solPkt));
-                    udp.endPacket();
-
-                    // Also echo over serial so a PC connected via USB can read it
-                    SERIAL_LOG.println(solPkt);
+                    char logBuf[64];
+                    snprintf(logBuf, sizeof(logBuf), "RPT,%d,%d,%d,0,%lu", tid, a, ranges[j], millis());
+                    SERIAL_LOG.println(logBuf);
+                    broadcastLog(logBuf);
                 }
             }
         }
@@ -1114,52 +1007,10 @@ registerNode(remoteIp, (uint8_t)tid, knownRole);
         return;
     }
 
-    // ---------- POS: position fix (ANL only) ----------
-    if (systemRole == 1 && len >= 4 && strncmp(buf, "POS,", 4) == 0) {
-        char* p = buf + 4;
-        char* tok1 = strtok(p, ",");
-        char* tok2 = strtok(NULL, ",");
-        char* tok3 = strtok(NULL, ",");
-
-        if (!tok1 || !tok2) {
-            udp.beginPacket(remoteIp, remotePort);
-            udp.print("ERR,args");
-            udp.endPacket();
-            return;
-        }
-
-        IPAddress targetIp = remoteIp;
-        float x = 0;
-        float y = 0;
-
-        if (strchr(tok1, '.')) {
-            if (!tok3 || !targetIp.fromString(tok1)) {
-                udp.beginPacket(remoteIp, remotePort);
-                udp.print("ERR,ip");
-                udp.endPacket();
-                return;
-            }
-            x = atof(tok2);
-            y = atof(tok3);
-        } else {
-            x = atof(tok1);
-            y = atof(tok2);
-        }
-
-        setNodePosition(targetIp, x, y);
-
-        display.fillRect(0, 48, 128, 16, SSD1306_BLACK);
-        display.setCursor(0, 50);
-        display.print(F("POS OK x="));
-        display.print((int)x);
-        display.display();
-
-        udp.beginPacket(remoteIp, remotePort);
-        udp.print("ACK,POS_OK,");
-        udp.print(x, 2);
-        udp.print(",");
-        udp.println(y, 2);
-        udp.endPacket();
+    // ---------- SNAP: tag snapshot stream (ANL only) ----------
+    if (systemRole == 1 && len >= 5 && strncmp(buf, "SNAP,", 5) == 0) {
+        // Broadcast the raw SNAP line so any logger on the network captures it
+        broadcastLog(buf);
         return;
     }
 
@@ -1199,38 +1050,6 @@ registerNode(remoteIp, (uint8_t)tid, knownRole);
     // ---------- ACK to node (ignored silently) ----------
     if (systemRole == 0 && len >= 4 && strncmp(buf, "ACK,", 4) == 0) {
         return;
-    }
-}
-
-void setNodePosition(IPAddress from, float x, float y)
-{
-    for (int i = 0; i < registryCount; i++) {
-        if (registry[i].ip == from) {
-            registry[i].x = x;
-            registry[i].y = y;
-            registry[i].hasPos = true;
-            SERIAL_LOG.print(F("Node "));
-            SERIAL_LOG.print(i);
-            SERIAL_LOG.print(F(" position set: "));
-            SERIAL_LOG.print(x, 2);
-            SERIAL_LOG.print(F(", "));
-            SERIAL_LOG.println(y, 2);
-            return;
-        }
-    }
-    if (registryCount < MAX_REGISTRY_ENTRIES) {
-        registry[registryCount].ip = from;
-        registry[registryCount].lastSeen = millis();
-        registry[registryCount].x = x;
-        registry[registryCount].y = y;
-        registry[registryCount].hasPos = true;
-        SERIAL_LOG.print(F("Registered node "));
-        SERIAL_LOG.print(registryCount);
-        SERIAL_LOG.print(F(" and set position: "));
-        SERIAL_LOG.print(x, 2);
-        SERIAL_LOG.print(F(", "));
-        SERIAL_LOG.println(y, 2);
-        registryCount++;
     }
 }
 
@@ -1495,6 +1314,32 @@ void monitorWifiHealth()
     }
 }
 
+void updateSnapDisplay()
+{
+    static unsigned long lastUpdate = 0;
+    if (millis() - lastUpdate < 200) return;
+    lastUpdate = millis();
+
+    long remaining = (long)(snapEndTime - millis());
+    display.clearDisplay();
+    display.setTextSize(2);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 18);
+
+    if (remaining > 0) {
+        int sec = (remaining / 1000) + 1;
+        if (sec > 5) sec = 5;
+        display.print(sec);
+        display.println(F("..."));
+    } else {
+        display.println(F("OK"));
+        if (millis() - snapEndTime > 1000) {
+            snapActive = false;
+        }
+    }
+    display.display();
+}
+
 void updateWifiStatusDisplay()
 {
     static unsigned long lastDisplayUpdate = 0;
@@ -1537,17 +1382,14 @@ void drawAnlDashboard()
     lastDashboardUpdate = millis();
 
     int activeNodes = 0;
-    int fixedCount = 0;
     unsigned long now = millis();
     for (int i = 0; i < registryCount; i++) {
         unsigned long age = now - registry[i].lastSeen;
         if (age < NODE_TIMEOUT_MS) activeNodes++;
-        if (registry[i].hasPos) fixedCount++;
     }
 
-    if (activeNodes == lastDisplayedCount && fixedCount == lastDisplayedFixed) return;
+    if (activeNodes == lastDisplayedCount) return;
     lastDisplayedCount = activeNodes;
-    lastDisplayedFixed = fixedCount;
 
     display.fillRect(0, 48, 128, 16, SSD1306_BLACK);
     display.setTextSize(1);
@@ -1556,16 +1398,14 @@ void drawAnlDashboard()
 
     display.print(F("ANL C:"));
     display.print(activeNodes);
-    display.print(F(" F:"));
-    display.print(fixedCount);
     display.print(F("/"));
     display.println(registryCount);
 
     display.display();
     SERIAL_LOG.print(F("[ANL Dashboard] Active nodes: "));
     SERIAL_LOG.print(activeNodes);
-    SERIAL_LOG.print(F(" | Fixed: "));
-    SERIAL_LOG.println(fixedCount);
+    SERIAL_LOG.print(F(" | Total: "));
+    SERIAL_LOG.println(registryCount);
 }
 
 void printRegistryTable()
@@ -1587,14 +1427,8 @@ void printRegistryTable()
         SERIAL_LOG.print(registry[i].ip);
         SERIAL_LOG.print(F(" | Age(ms): "));
         SERIAL_LOG.print(age);
-        if (registry[i].hasPos) {
-            SERIAL_LOG.print(F(" | Pos: "));
-            SERIAL_LOG.print(registry[i].x, 2);
-            SERIAL_LOG.print(F(","));
-            SERIAL_LOG.print(registry[i].y, 2);
-        } else {
-            SERIAL_LOG.print(F(" | Pos: unset"));
-        }
+        SERIAL_LOG.print(F(" | Role: "));
+        SERIAL_LOG.print(registry[i].role == 1 ? F("A") : F("T"));
         SERIAL_LOG.println(age < NODE_TIMEOUT_MS ? F(" [OK]") : F(" [STALE]"));
     }
     SERIAL_LOG.println(F("=================================="));
