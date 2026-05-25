@@ -8,7 +8,7 @@ Usage:
 
 For each SNAP row, parses the AT+RANGE line to extract distances from the
 temporary tag to each anchor. After collecting all SNAP data, prints a
-median distance matrix.
+median distance matrix and saves it to a CSV file.
 """
 
 import csv
@@ -76,8 +76,12 @@ def main():
 
     print(f"Reading {csv_path}")
 
+    # Ask for an optional comment
+    comment = input("Comment for this measurement (press Enter to skip): ").strip()
+
     # Collect all (tag_id, anchor_id) -> [range_cm samples]
     samples = defaultdict(list)
+    sources = defaultdict(set)  # (tag_id, anchor_id) -> {BTN, UDP, ...}
 
     with open(csv_path, "r", newline="") as f:
         reader = csv.DictReader(f)
@@ -92,9 +96,11 @@ def main():
             except ValueError:
                 continue
 
-            raw_line = row.get("range_cm", "")
+            raw_line = row.get("raw_line", "")
             if not raw_line:
                 continue
+
+            source = row.get("source", "BTN").strip()
 
             parsed = parse_at_range(raw_line)
             if parsed is None:
@@ -103,7 +109,9 @@ def main():
             pairs = min(len(ancids), len(ranges))
             for i in range(pairs):
                 if ranges[i] > 0:
-                    samples[(tag_id, ancids[i])].append(ranges[i])
+                    key = (tag_id, ancids[i])
+                    samples[key].append(ranges[i])
+                    sources[key].add(source)
 
     if not samples:
         print("No SNAP data found in CSV.")
@@ -129,13 +137,15 @@ def main():
                 row_str += f"{'—':>8} "
         print(row_str)
 
-    # Also save as simple CSV matrix
+    # Save as simple CSV matrix
     out_path = csv_path.replace("uwb_log_", "uwb_matrix_")
     with open(out_path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["from_id", "to_id", "median_cm", "samples"])
+        writer.writerow(["comment", comment])
+        writer.writerow(["from_id", "to_id", "median_cm", "samples", "sources"])
         for (frm, to), vals in sorted(samples.items()):
-            writer.writerow([frm, to, f"{median(vals):.1f}", len(vals)])
+            src_str = "|".join(sorted(sources.get((frm, to), {"?"})))
+            writer.writerow([frm, to, f"{median(vals):.1f}", len(vals), src_str])
     print(f"\nSaved matrix to {out_path}")
 
 

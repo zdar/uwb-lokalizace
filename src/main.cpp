@@ -88,7 +88,7 @@ void udpLoop();
 void sendHeartbeat();
 void broadcastLog(const char* msg);
 void relayUwbLine(const char* line);
-void sendSnap();
+void sendSnap(const char* source);
 void handleIncomingUdp();
 void autoCalibrateLoop();
 void registerNode(IPAddress from, uint8_t nodeId, uint8_t nodeRole = 1);
@@ -140,6 +140,7 @@ int rangeLineIdx = 0;
 // SNAP stream state (tag side)
 bool snapActive = false;
 unsigned long snapEndTime = 0;
+char snapSource[8] = "BTN";   // "BTN" or "UDP"
 
 // ================== AUTO-CALIBRATION STATE ==================
 struct {
@@ -440,7 +441,7 @@ void loop()
                     }
                 } else {
                     // Tag short press: start 5-second SNAP stream
-                    sendSnap();
+                    sendSnap("BTN");
                 }
             }
             roleToggleDone = false;
@@ -494,7 +495,7 @@ void loop()
                     // During SNAP window, send each AT+RANGE line as a SNAP packet
                     if (snapActive && millis() < snapEndTime) {
                         char snapPkt[280];
-                        snprintf(snapPkt, sizeof(snapPkt), "SNAP,%d,%s,%lu", UWB_INDEX, rangeLineBuf, millis());
+                        snprintf(snapPkt, sizeof(snapPkt), "SNAP,%d,%s,%s,%lu", UWB_INDEX, snapSource, rangeLineBuf, millis());
                         udp.beginPacket("192.168.4.1", WIFI_PORT);
                         udp.write((const uint8_t*)snapPkt, strlen(snapPkt));
                         udp.endPacket();
@@ -886,14 +887,16 @@ void broadcastLog(const char* msg)
     SERIAL_LOG.println(msg);
 }
 
-void sendSnap()
+void sendSnap(const char* source)
 {
     if (systemRole != 0 || currentRole != 0) return;
     snapActive = true;
     snapEndTime = millis() + 5000;
-    SERIAL_LOG.println(F("[SNAP] 5-second stream started"));
-    SERIAL_LOG.print(F("[SNAP] Sending to "));
-    SERIAL_LOG.println(WiFi.gatewayIP());
+    strncpy(snapSource, source, sizeof(snapSource) - 1);
+    snapSource[sizeof(snapSource) - 1] = '\0';
+    SERIAL_LOG.print(F("[SNAP] 5s stream started ("));
+    SERIAL_LOG.print(source);
+    SERIAL_LOG.println(F(")"));
 }
 
 void handleIncomingUdp()
@@ -1044,7 +1047,7 @@ registerNode(remoteIp, (uint8_t)tid, knownRole);
 
     // ---------- SNAP command (tag node only) ----------
     if (systemRole == 0 && currentRole == 0 && len >= 4 && strncmp(buf, "SNAP", 4) == 0) {
-        sendSnap();
+        sendSnap("UDP");
         udp.beginPacket(remoteIp, remotePort);
         udp.print("ACK,SNAP,");
         udp.println(UWB_INDEX);

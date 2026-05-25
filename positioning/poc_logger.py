@@ -7,11 +7,7 @@ Listens on UDP port 50000 for structured log packets from the ANL,
 parses them, and writes to a timestamped CSV file.
 
 Packet types handled:
-  RPT,<tag_id>,<anchor_id>,<range_cm>,<rssi>,<ts>
-  SNAP,<tag_id>,<raw_at_range_line>,<ts>
-  DIST,<from_id>,<to_id>,<raw_cm>,<median_cm>,<ts>
-  CAL_POINT,<anchor_id>,<known_cm>,<measured_cm>,<ts>
-  CAL_DONE,<anchor_id>,<delay>,<ts>
+  SNAP,<tag_id>,<source>,<raw_at_range_line>,<ts>
 
 Usage:
   python poc_logger.py
@@ -25,21 +21,13 @@ from datetime import datetime
 
 UDP_PORT = 50000
 
-# CSV columns (wide format — empty cells for irrelevant fields)
+# Minimal CSV columns — no empty cells
 CSV_COLUMNS = [
     "timestamp_ms",
     "type",
     "tag_id",
-    "anchor_id",
-    "range_cm",
-    "rssi_dbm",
-    "from_id",
-    "to_id",
-    "median_cm",
-    "known_cm",
-    "measured_cm",
-    "delay",
-    "snap_flag",
+    "source",
+    "raw_line",
 ]
 
 
@@ -65,37 +53,12 @@ def parse_line(line: str) -> dict | None:
     row["type"] = typ
     row["timestamp_ms"] = ts
 
-    if typ == "RPT" and len(parts) >= 5:
-        # RPT,tag_id,anchor_id,range_cm,rssi,ts
+    if typ == "SNAP" and len(parts) >= 5:
+        # SNAP,tag_id,source,<raw AT+RANGE line>,ts
         row["tag_id"] = parts[1]
-        row["anchor_id"] = parts[2]
-        row["range_cm"] = parts[3]
-        row["rssi_dbm"] = parts[4]
-
-    elif typ == "SNAP" and len(parts) >= 4:
-        # SNAP,tag_id,<raw AT+RANGE line>,ts
-        row["tag_id"] = parts[1]
-        row["snap_flag"] = "1"
-        row["range_cm"] = ",".join(parts[2:-1])
-        row["rssi_dbm"] = ""
-
-    elif typ == "DIST" and len(parts) >= 6:
-        # DIST,from_id,to_id,raw_cm,median_cm,ts
-        row["from_id"] = parts[1]
-        row["to_id"] = parts[2]
-        row["range_cm"] = parts[3]
-        row["median_cm"] = parts[4]
-
-    elif typ == "CAL_POINT" and len(parts) >= 5:
-        # CAL_POINT,anchor_id,known_cm,measured_cm,ts
-        row["anchor_id"] = parts[1]
-        row["known_cm"] = parts[2]
-        row["measured_cm"] = parts[3]
-
-    elif typ == "CAL_DONE" and len(parts) >= 4:
-        # CAL_DONE,anchor_id,delay,ts
-        row["anchor_id"] = parts[1]
-        row["delay"] = parts[2]
+        row["source"] = parts[2]
+        # Everything between source and ts is the raw line
+        row["raw_line"] = ",".join(parts[3:-1])
 
     else:
         return None
@@ -160,18 +123,13 @@ def main():
                     continue
 
                 # Debug: print every raw packet
-                print(f"[RAW from {addr[0]}] {text[:100]}")
-
-                # Skip raw relay packets that contain the full AT+RANGE string
-                if text.startswith("RPT,") and "AT+RANGE" in text:
-                    print("  -> skipped (raw relay)")
-                    continue
+                print(f"[RAW from {addr[0]}] {text[:120]}")
 
                 row = parse_line(text)
                 if row:
                     writer.writerow(row)
                     f.flush()
-                    print(f"  -> [{row['type']}] logged")
+                    print(f"  -> [{row['type']}] src={row['source']} logged")
                 else:
                     print(f"  -> UNKNOWN (not parsed)")
 
