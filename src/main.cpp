@@ -496,7 +496,8 @@ void loop()
                     if (snapActive && millis() < snapEndTime) {
                         char snapPkt[280];
                         snprintf(snapPkt, sizeof(snapPkt), "SNAP,%d,%s,%s,%lu", UWB_INDEX, snapSource, rangeLineBuf, millis());
-                        udp.beginPacket("192.168.4.1", WIFI_PORT);
+                        // Broadcast so any listener on the network receives it
+                        udp.beginPacket("192.168.4.255", WIFI_PORT);
                         udp.write((const uint8_t*)snapPkt, strlen(snapPkt));
                         udp.endPacket();
                     }
