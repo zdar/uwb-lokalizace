@@ -25,7 +25,7 @@ Use 2.5.7    Adafruit_SSD1306
 
 //!!!!! CHANGE THIS BEFORE EACH FLASH !!!!!
 // ANY index can be the ANL. Just pick unique numbers 0..7!
-#define UWB_INDEX 3
+#define UWB_INDEX 4
 //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 #define POC_DISABLE_AUTO_CAL 1
@@ -1037,6 +1037,16 @@ registerNode(remoteIp, (uint8_t)tid, knownRole);
         registerNode(remoteIp, nodeId, nodeRole);
         udp.beginPacket(remoteIp, remotePort);
         udp.print("ACK,HB,");
+        udp.println(UWB_INDEX);
+        udp.endPacket();
+        return;
+    }
+
+    // ---------- SNAP command (tag node only) ----------
+    if (systemRole == 0 && currentRole == 0 && len >= 4 && strncmp(buf, "SNAP", 4) == 0) {
+        sendSnap();
+        udp.beginPacket(remoteIp, remotePort);
+        udp.print("ACK,SNAP,");
         udp.println(UWB_INDEX);
         udp.endPacket();
         return;
