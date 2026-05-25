@@ -141,20 +141,6 @@ int rangeLineIdx = 0;
 bool snapActive = false;
 unsigned long snapEndTime = 0;
 
-// ================== MEASURE MODE STATE ==================
-// Cycles anchors to TAG mode one at a time to measure anchor-to-anchor distances
-struct {
-    bool active = false;
-    uint8_t phase = 0;             // 0=idle, 1=wait reboot, 2=collecting, 3=wait revert
-    uint8_t currentAnchor = 255;   // UWB_INDEX currently in TAG mode
-    uint8_t nextIdx = 0;           // index into registry for next candidate
-    unsigned long timer = 0;
-    unsigned long collectDuration = 10000; // 10s per anchor
-    float samples[8][MAX_CAL_SAMPLES];
-    uint8_t sampleCount[8];
-} measure;
-// ============================================================
-
 // ================== AUTO-CALIBRATION STATE ==================
 struct {
     uint8_t targetId;          // UWB_INDEX being calibrated (255 = idle)
@@ -329,123 +315,6 @@ void autoCalibrateLoop()
 #endif
 }
 
-// ==============================================================
-// MEASURE MODE: cycle anchors to TAG to measure anchor-to-anchor distances
-// Triggered by UDP command "MEASURE" on ANL
-// ==============================================================
-void measureLoop()
-{
-    if (systemRole != 1) return;
-    if (!measure.active) return;
-
-    const unsigned long REBOOT_DELAY = 30000; // 30s for reboot + rejoin
-
-    switch (measure.phase) {
-        case 0: { // idle -> pick next anchor
-            // Find next anchor in registry
-            uint8_t candidate = 255;
-            for (int i = measure.nextIdx; i < registryCount; i++) {
-                if (registry[i].id != 255 && registry[i].id != (uint8_t)UWB_INDEX && registry[i].role == 1) {
-                    candidate = registry[i].id;
-                    measure.nextIdx = i + 1;
-                    break;
-                }
-            }
-            if (candidate == 255) {
-                // No more anchors — measurement complete
-                measure.active = false;
-                measure.nextIdx = 0;
-                SERIAL_LOG.println(F("[MEASURE] Complete"));
-                broadcastLog("DIST,DONE,0,0,0,0");
-                return;
-            }
-            measure.currentAnchor = candidate;
-            measure.phase = 1;
-            measure.timer = millis();
-            memset(measure.sampleCount, 0, sizeof(measure.sampleCount));
-            memset(measure.samples, 0, sizeof(measure.samples));
-
-            IPAddress ip = getNodeIp(candidate);
-            if (ip != IPAddress()) {
-                udp.beginPacket(ip, WIFI_PORT);
-                udp.print("ROLE,0");
-                udp.endPacket();
-                SERIAL_LOG.print(F("[MEASURE] Sent ROLE,0 to anchor "));
-                SERIAL_LOG.println(candidate);
-            } else {
-                SERIAL_LOG.print(F("[MEASURE] IP not found for anchor "));
-                SERIAL_LOG.println(candidate);
-                measure.phase = 0; // skip and try next
-            }
-            break;
-        }
-
-        case 1: { // wait for reboot
-            if (millis() - measure.timer < REBOOT_DELAY) return;
-            memset(measure.sampleCount, 0, sizeof(measure.sampleCount));
-            memset(measure.samples, 0, sizeof(measure.samples));
-            measure.phase = 2;
-            measure.timer = millis();
-            SERIAL_LOG.print(F("[MEASURE] Collecting from anchor "));
-            SERIAL_LOG.println(measure.currentAnchor);
-            break;
-        }
-
-        case 2: { // collect RPT samples
-            if (millis() - measure.timer < measure.collectDuration) return;
-
-            // Compute median for each anchor pair and broadcast DIST
-            for (int a = 0; a < 8; a++) {
-                if (measure.sampleCount[a] == 0) continue;
-                float s[MAX_CAL_SAMPLES];
-                memcpy(s, measure.samples[a], measure.sampleCount[a] * sizeof(float));
-                // insertion sort
-                uint8_t n = measure.sampleCount[a];
-                for (uint8_t i = 1; i < n; i++) {
-                    float key = s[i];
-                    int j = (int)i - 1;
-                    while (j >= 0 && s[j] > key) {
-                        s[j + 1] = s[j];
-                        j--;
-                    }
-                    s[j + 1] = key;
-                }
-                float median = (n % 2 == 1) ? s[n / 2] : (s[n / 2 - 1] + s[n / 2]) / 2.0f;
-                int medCm = (int)(median + 0.5f);
-
-                char distBuf[64];
-                snprintf(distBuf, sizeof(distBuf), "DIST,%d,%d,%d,%d,%lu",
-                         measure.currentAnchor, a, medCm, medCm, millis());
-                SERIAL_LOG.println(distBuf);
-                broadcastLog(distBuf);
-            }
-
-            // Revert to anchor
-            IPAddress ip = getNodeIp(measure.currentAnchor);
-            if (ip != IPAddress()) {
-                udp.beginPacket(ip, WIFI_PORT);
-                udp.print("ROLE,1");
-                udp.endPacket();
-                SERIAL_LOG.print(F("[MEASURE] Sent ROLE,1 to "));
-                SERIAL_LOG.println(measure.currentAnchor);
-            }
-            measure.phase = 3;
-            measure.timer = millis();
-            break;
-        }
-
-        case 3: { // wait for revert reboot
-            if (millis() - measure.timer < REBOOT_DELAY) return;
-            SERIAL_LOG.print(F("[MEASURE] Anchor "));
-            SERIAL_LOG.print(measure.currentAnchor);
-            SERIAL_LOG.println(F(" back to anchor mode"));
-            measure.currentAnchor = 255;
-            measure.phase = 0;
-            break;
-        }
-    }
-}
-
 void setup()
 {
     EEPROM.begin(EEPROM_SIZE);
@@ -607,7 +476,7 @@ void loop()
     while (SERIAL_AT.available() > 0)
     {
         char c = SERIAL_AT.read();
-        SERIAL_LOG.write(c);
+        // SERIAL_LOG.write(c);  // PoC: disable serial echo to reduce noise
 
         if (rangeLineIdx < (int)sizeof(rangeLineBuf) - 1) {
             rangeLineBuf[rangeLineIdx++] = c;
@@ -639,7 +508,6 @@ void loop()
 
     udpLoop();
     autoCalibrateLoop();
-    measureLoop();
     monitorWifiHealth();
     printRegistryTable();
 
@@ -1004,8 +872,8 @@ void relayUwbLine(const char* line)
     udp.beginPacket("192.168.4.1", WIFI_PORT);
     udp.write((const uint8_t*)pkt, strlen(pkt));
     udp.endPacket();
-    SERIAL_LOG.print(F("[RELAY] "));
-    SERIAL_LOG.println(pkt);
+    // SERIAL_LOG.print(F("[RELAY] "));
+    // SERIAL_LOG.println(pkt);
 }
 
 void broadcastLog(const char* msg)
@@ -1117,19 +985,6 @@ registerNode(remoteIp, (uint8_t)tid, knownRole);
             }
         }
 
-        // Store samples for MEASURE mode
-        if (measure.active && measure.phase == 2 && (uint8_t)tid == measure.currentAnchor) {
-            int pairs = (rc < ac) ? rc : ac;
-            for (int j = 0; j < pairs; j++) {
-                if (ancids[j] >= 0 && ancids[j] < 8) {
-                    uint8_t a = (uint8_t)ancids[j];
-                    if (measure.sampleCount[a] < MAX_CAL_SAMPLES) {
-                        measure.samples[a][measure.sampleCount[a]++] = ranges[j];
-                    }
-                }
-            }
-        }
-
         // (RPT logging disabled to keep serial clean)
         // SERIAL_LOG.print(F("[RPT] tid="));
         // SERIAL_LOG.print(tid);
@@ -1198,21 +1053,6 @@ registerNode(remoteIp, (uint8_t)tid, knownRole);
             udp.endPacket();
             delay(500);
             ESP.restart();
-        }
-        return;
-    }
-
-    // ---------- MEASURE command (ANL only) ----------
-    if (systemRole == 1 && len >= 7 && strncmp(buf, "MEASURE", 7) == 0) {
-        if (!measure.active) {
-            measure.active = true;
-            measure.phase = 0;
-            measure.nextIdx = 0;
-            measure.currentAnchor = 255;
-            SERIAL_LOG.println(F("[MEASURE] Started"));
-            broadcastLog("DIST,START,0,0,0,0");
-        } else {
-            SERIAL_LOG.println(F("[MEASURE] Already active"));
         }
         return;
     }
@@ -1505,19 +1345,8 @@ void updateSnapDisplay()
         display.println(F("OK"));
         if (millis() - snapEndTime > 1000) {
             snapActive = false;
-            // Force WiFi status display refresh after SNAP ends
-            display.clearDisplay();
-            display.setTextSize(1);
-            display.setTextColor(SSD1306_WHITE);
-            display.setCursor(0, 0);
-            display.println(F("TAG READY"));
-            display.setCursor(0, 18);
-            display.print(F("ID: "));
-            display.println(UWB_INDEX);
-            display.setCursor(0, 50);
-            display.print(F("WiFi OK | "));
-            display.println(WiFi.localIP());
-            display.display();
+            // Return to normal WiFi status display
+            updateWifiStatusDisplay();
             return;
         }
     }

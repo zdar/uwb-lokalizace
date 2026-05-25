@@ -1,119 +1,142 @@
 """
 poc_measure.py
-Trigger anchor-to-anchor distance matrix measurement and collect DIST output.
-Run from Windows PowerShell (not WSL) so UDP broadcast works.
+Build an anchor-to-anchor distance matrix from a poc_logger.py CSV file.
 
 Usage:
-    python poc_measure.py
+    python poc_measure.py <csv_file>
+    python poc_measure.py                  # uses most recent uwb_log_*.csv
 
-Sends "MEASURE" UDP packet to ANL (192.168.4.1:50000), then listens for
-DIST lines and prints a matrix at the end.
+For each SNAP row, parses the AT+RANGE line to extract distances from the
+temporary tag to each anchor. After collecting all SNAP data, prints a
+median distance matrix.
 """
 
-import socket
 import csv
+import sys
 import os
-from datetime import datetime
-
-ANL_IP = "192.168.4.1"
-WIFI_PORT = 50000
-LISTEN_PORT = 50000
+import glob
+from collections import defaultdict
 
 
-def get_rtls_ip() -> str:
-    import subprocess
-    try:
-        result = subprocess.run(["ipconfig"], capture_output=True, text=True)
-        lines = result.stdout.split("\n")
-        for i, line in enumerate(lines):
-            if "192.168.4." in line:
-                parts = line.split(":")
-                if len(parts) >= 2:
-                    ip = parts[1].strip().split()[0]
-                    return ip
-        for i, line in enumerate(lines):
-            if "192.168.4." in line:
-                for j in range(i, min(i + 5, len(lines))):
-                    if "192.168.4." in lines[j]:
-                        parts = lines[j].split(":")
-                        if len(parts) >= 2:
-                            ip = parts[1].strip().split()[0]
-                            return ip
-    except Exception:
-        pass
-    return "0.0.0.0"
+def parse_at_range(line: str) -> tuple[list[int], list[float]] | None:
+    """Parse AT+RANGE line: AT+RANGE:0,ancid:(0,1,2),range:(123,456,789),..."""
+    # Find ancid:(...)
+    anc_start = line.find("ancid:(")
+    if anc_start < 0:
+        return None
+    anc_start += 7
+    anc_end = line.find(")", anc_start)
+    if anc_end < 0:
+        return None
+    ancids_str = line[anc_start:anc_end]
+    ancids = [int(x.strip()) for x in ancids_str.split(",") if x.strip().lstrip("-").isdigit()]
+
+    # Find range:(...)
+    rng_start = line.find("range:(")
+    if rng_start < 0:
+        return None
+    rng_start += 7
+    rng_end = line.find(")", rng_start)
+    if rng_end < 0:
+        return None
+    rngs_str = line[rng_start:rng_end]
+    ranges = []
+    for x in rngs_str.split(","):
+        x = x.strip()
+        if not x:
+            continue
+        try:
+            ranges.append(float(x))
+        except ValueError:
+            pass
+
+    return ancids, ranges
+
+
+def median(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    s = sorted(values)
+    n = len(s)
+    if n % 2 == 1:
+        return s[n // 2]
+    return (s[n // 2 - 1] + s[n // 2]) / 2.0
 
 
 def main():
-    listen_ip = get_rtls_ip()
-    print(f"Listening on {listen_ip}:{LISTEN_PORT}")
-
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind((listen_ip, LISTEN_PORT))
-    sock.settimeout(1.0)
-
-    # Send MEASURE command to ANL
-    print(f"Sending MEASURE to {ANL_IP}:{WIFI_PORT} ...")
-    sock.sendto(b"MEASURE", (ANL_IP, WIFI_PORT))
-
-    dist_rows = []
-    print("Waiting for DIST output (this takes ~2 minutes for 4 anchors) ...")
-    print("Press Ctrl+C to stop early.\n")
-
-    done = False
-    try:
-        while not done:
-            try:
-                data, addr = sock.recvfrom(1024)
-            except socket.timeout:
-                continue
-            line = data.decode("utf-8", errors="ignore").strip()
-            if not line:
-                continue
-            print(line)
-            if line.startswith("DIST,"):
-                parts = line.split(",")
-                if len(parts) >= 6 and parts[1] == "DONE":
-                    done = True
-                else:
-                    dist_rows.append(parts)
-    except KeyboardInterrupt:
-        print("\nStopped by user.")
-
-    sock.close()
-
-    # Save to CSV
-    if dist_rows:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        csv_path = os.path.join(os.path.dirname(__file__), f"uwb_dist_{ts}.csv")
-        with open(csv_path, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["from_id", "to_id", "median_cm", "ts"])
-            for row in dist_rows:
-                # DIST,from_id,to_id,raw_cm,median_cm,ts
-                if len(row) >= 6:
-                    writer.writerow([row[1], row[2], row[4], row[5]])
-        print(f"\nSaved {len(dist_rows)} DIST rows to {csv_path}")
-
-        # Print matrix
-        ids = sorted(set(int(r[1]) for r in dist_rows if r[1].isdigit()) |
-                     set(int(r[2]) for r in dist_rows if r[2].isdigit()))
-        print("\nDistance matrix (cm):")
-        header = "    " + " ".join(f"{i:>6}" for i in ids)
-        print(header)
-        for i in ids:
-            row_str = f"{i:>3} "
-            for j in ids:
-                val = ""
-                for r in dist_rows:
-                    if int(r[1]) == i and int(r[2]) == j:
-                        val = r[4]
-                        break
-                row_str += f"{val:>6} "
-            print(row_str)
+    if len(sys.argv) >= 2:
+        csv_path = sys.argv[1]
     else:
-        print("\nNo DIST rows captured.")
+        # Find most recent uwb_log_*.csv
+        files = glob.glob(os.path.join(os.path.dirname(__file__), "uwb_log_*.csv"))
+        if not files:
+            print("No uwb_log_*.csv found. Usage: python poc_measure.py <csv_file>")
+            sys.exit(1)
+        csv_path = max(files, key=os.path.getmtime)
+
+    print(f"Reading {csv_path}")
+
+    # Collect all (tag_id, anchor_id) -> [range_cm samples]
+    samples = defaultdict(list)
+
+    with open(csv_path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row.get("type") != "SNAP":
+                continue
+            tag_id_str = row.get("tag_id", "").strip()
+            if not tag_id_str:
+                continue
+            try:
+                tag_id = int(tag_id_str)
+            except ValueError:
+                continue
+
+            raw_line = row.get("range_cm", "")
+            if not raw_line:
+                continue
+
+            parsed = parse_at_range(raw_line)
+            if parsed is None:
+                continue
+            ancids, ranges = parsed
+            pairs = min(len(ancids), len(ranges))
+            for i in range(pairs):
+                if ranges[i] > 0:
+                    samples[(tag_id, ancids[i])].append(ranges[i])
+
+    if not samples:
+        print("No SNAP data found in CSV.")
+        sys.exit(1)
+
+    # Build median matrix
+    ids = sorted(set(k[0] for k in samples.keys()) | set(k[1] for k in samples.keys()))
+
+    print(f"\nCollected {sum(len(v) for v in samples.values())} range samples")
+    print(f"Nodes involved: {ids}\n")
+
+    # Print matrix
+    header = "    " + " ".join(f"{i:>8}" for i in ids)
+    print(header)
+    for i in ids:
+        row_str = f"{i:>3} "
+        for j in ids:
+            key = (i, j)
+            if key in samples and samples[key]:
+                med = median(samples[key])
+                row_str += f"{med:>8.1f} "
+            else:
+                row_str += f"{'—':>8} "
+        print(row_str)
+
+    # Also save as simple CSV matrix
+    out_path = csv_path.replace("uwb_log_", "uwb_matrix_")
+    with open(out_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["from_id", "to_id", "median_cm", "samples"])
+        for (frm, to), vals in sorted(samples.items()):
+            writer.writerow([frm, to, f"{median(vals):.1f}", len(vals)])
+    print(f"\nSaved matrix to {out_path}")
 
 
 if __name__ == "__main__":

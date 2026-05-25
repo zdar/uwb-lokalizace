@@ -92,39 +92,49 @@ You should immediately see `[RPT]` lines flowing from the tag.
 
 ---
 
-## Step 7: Anchor-to-Anchor Distance Matrix (MEASURE)
+## Step 7: Anchor-to-Anchor Distance Matrix (Manual SNAP)
 
-This cycles each anchor to TAG mode temporarily so ANL can measure distances between all anchor pairs.
+To measure distances between all anchors, temporarily turn each anchor into a TAG, press SNAP, then revert it back to ANCHOR.
 
-### Option A: Python script (recommended)
+### For each anchor (one at a time):
+1. **Hold button for 2.5s** on the anchor → OLED shows "TAG" → reboots
+2. **Short-press** the button → OLED counts down `5...` → `OK`
+3. **Wait for it to finish**
+4. **Hold button for 2.5s** again → OLED shows "ANCHOR" → reboots back
+5. **Move to next anchor**
+
+### Build the matrix
 ```powershell
 cd positioning
 python poc_measure.py
 ```
-
-### Option B: PowerShell one-liner
-```powershell
-$udp = New-Object System.Net.Sockets.UdpClient; $b = [System.Text.Encoding]::ASCII.GetBytes("MEASURE"); $udp.Send($b, $b.Length, "192.168.4.1", 50000)
-```
-
-### What happens
-1. Script sends `"MEASURE"` to ANL
-2. ANL picks first anchor, sends `"ROLE,0"` (become TAG), waits 30s for reboot
-3. Collects RPT for 10s, computes median, broadcasts `DIST,from,to,raw,median,ts`
-4. Sends `"ROLE,1"` to revert to anchor, waits 30s
-5. Repeats for next anchor
-6. Final line: `DIST,DONE,0,0,0,0`
-
-**Duration:** ~2 minutes for 4 anchors (30s reboot + 10s collect + 30s revert per anchor)
+This reads the latest `uwb_log_*.csv`, extracts all SNAP data, and prints a median distance matrix between all nodes.
 
 ---
 
-## Step 8: Verify CSV
+## Step 8: Antenna Delay Calibration
+
+1. Place a tag at a **known distance** from all anchors (e.g. exactly 100 cm).
+2. Press **SNAP** on the tag.
+3. Run:
+```powershell
+cd positioning
+python poc_calibrate.py
+```
+4. Enter the known distance for each anchor when prompted.
+5. The script prints `AT+SETANT=<delay>` for each anchor.
+6. Connect to each anchor via USB serial (115200 baud) and send:
+   ```
+   AT+SETANT=<delay>
+   AT+SAVE
+   ```
+
+---
+
+## Step 9: Verify CSV
 
 Open the CSV file. You should see:
-- `RPT` rows during normal operation (debug only, not in CSV)
-- `SNAP` rows after button press
-- `DIST` rows after MEASURE command
+- `SNAP` rows after button press (contains raw AT+RANGE lines)
 
 Columns: `timestamp_ms, type, tag_id, anchor_id, range_cm, ...`
 
@@ -149,6 +159,16 @@ Columns: `timestamp_ms, type, tag_id, anchor_id, range_cm, ...`
 | Short press | < 200ms | Anchor: toggle reporting. Tag: start SNAP. |
 | Hold | 2.5s | Toggle TAG/ANCHOR + reboot |
 | Hold during boot | 2s | Enter provisioning menu |
+
+---
+
+## Python Scripts Summary
+
+| Script | Purpose | When to run |
+|--------|---------|-------------|
+| `poc_logger.py` | Listen to UDP broadcast, write CSV | Always running during test |
+| `poc_measure.py` | Build distance matrix from CSV | After all anchors have been SNAPped as tags |
+| `poc_calibrate.py` | Compute antenna delays from CSV | After calibration SNAP at known distance |
 
 ---
 
