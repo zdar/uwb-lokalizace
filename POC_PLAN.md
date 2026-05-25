@@ -1,4 +1,4 @@
-# PoC Plan: 3D UWB Raw Data Collection
+t# PoC Plan: 3D UWB Raw Data Collection
 
 ## Architecture (5 modules now, scalable to 8+)
 

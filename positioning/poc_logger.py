@@ -8,7 +8,7 @@ parses them, and writes to a timestamped CSV file.
 
 Packet types handled:
   RPT,<tag_id>,<anchor_id>,<range_cm>,<rssi>,<ts>
-  SNAP,<tag_id>,<range_csv>,<ancid_csv>,<ts>
+  SNAP,<tag_id>,<raw_at_range_line>,<ts>
   DIST,<from_id>,<to_id>,<raw_cm>,<median_cm>,<ts>
   CAL_POINT,<anchor_id>,<known_cm>,<measured_cm>,<ts>
   CAL_DONE,<anchor_id>,<delay>,<ts>
@@ -24,7 +24,6 @@ import os
 from datetime import datetime
 
 UDP_PORT = 50000
-UDP_BIND = "0.0.0.0"
 
 # CSV columns (wide format — empty cells for irrelevant fields)
 CSV_COLUMNS = [
@@ -75,12 +74,10 @@ def parse_line(line: str) -> dict | None:
 
     elif typ == "SNAP" and len(parts) >= 4:
         # SNAP,tag_id,<raw AT+RANGE line>,ts
-        # The raw AT+RANGE line may contain commas, so join everything
-        # between tag_id and the last element (timestamp).
         row["tag_id"] = parts[1]
         row["snap_flag"] = "1"
-        row["range_cm"] = ",".join(parts[2:-1])  # raw AT+RANGE payload
-        row["rssi_dbm"] = ""  # not parsed here
+        row["range_cm"] = ",".join(parts[2:-1])
+        row["rssi_dbm"] = ""
 
     elif typ == "DIST" and len(parts) >= 6:
         # DIST,from_id,to_id,raw_cm,median_cm,ts
@@ -106,10 +103,30 @@ def parse_line(line: str) -> dict | None:
     return row
 
 
+def get_rtls_ip() -> str:
+    """Find the IP address on the 192.168.4.x network."""
+    import subprocess
+    try:
+        result = subprocess.run(["ipconfig"], capture_output=True, text=True)
+        lines = result.stdout.split("\n")
+        for i, line in enumerate(lines):
+            if "192.168.4." in line:
+                # Extract IP from line like "   IPv4 Address. . . . . . . . . . . : 192.168.4.9"
+                parts = line.split(":")
+                if len(parts) >= 2:
+                    ip = parts[1].strip()
+                    if ip.startswith("192.168.4."):
+                        return ip
+    except Exception:
+        pass
+    return "0.0.0.0"
+
+
 def main():
     csv_path = make_csv_path()
+    bind_ip = get_rtls_ip()
     print(f"Logging to: {csv_path}")
-    print(f"Listening on UDP {UDP_BIND}:{UDP_PORT}")
+    print(f"Listening on UDP {bind_ip}:{UDP_PORT}")
     print("Press Ctrl+C to stop.\n")
 
     # Open CSV for writing
@@ -119,33 +136,44 @@ def main():
 
         # Open UDP socket
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.bind((UDP_BIND, UDP_PORT))
-        sock.setblocking(False)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((bind_ip, UDP_PORT))
+        except OSError as e:
+            print(f"Failed to bind to {bind_ip}:{UDP_PORT} — {e}")
+            print("Trying 0.0.0.0 instead...")
+            sock.bind(("0.0.0.0", UDP_PORT))
+        sock.settimeout(1.0)
 
         try:
             while True:
                 try:
                     data, addr = sock.recvfrom(1024)
-                except BlockingIOError:
+                except socket.timeout:
+                    continue
+                except OSError as e:
+                    print(f"[SOCKET ERROR] {e}")
                     continue
 
                 text = data.decode("utf-8", errors="ignore").strip()
                 if not text:
                     continue
 
-                # Some packets may be prefixed with RPT, from relayUwbLine
+                # Debug: print every raw packet
+                print(f"[RAW from {addr[0]}] {text[:100]}")
+
+                # Skip raw relay packets that contain the full AT+RANGE string
                 if text.startswith("RPT,") and "AT+RANGE" in text:
-                    # This is a raw relay packet — skip, we already parse structured lines
+                    print("  -> skipped (raw relay)")
                     continue
 
                 row = parse_line(text)
                 if row:
                     writer.writerow(row)
                     f.flush()
-                    print(f"[{row['type']}] {text}")
+                    print(f"  -> [{row['type']}] logged")
                 else:
-                    # Print unknown lines for debugging
-                    print(f"[UNK] {text}")
+                    print(f"  -> UNKNOWN (not parsed)")
 
         except KeyboardInterrupt:
             print("\nStopped by user.")
