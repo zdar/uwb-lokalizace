@@ -92,11 +92,39 @@ You should immediately see `[RPT]` lines flowing from the tag.
 
 ---
 
-## Step 7: Verify CSV
+## Step 7: Anchor-to-Anchor Distance Matrix (MEASURE)
+
+This cycles each anchor to TAG mode temporarily so ANL can measure distances between all anchor pairs.
+
+### Option A: Python script (recommended)
+```powershell
+cd positioning
+python poc_measure.py
+```
+
+### Option B: PowerShell one-liner
+```powershell
+$udp = New-Object System.Net.Sockets.UdpClient; $b = [System.Text.Encoding]::ASCII.GetBytes("MEASURE"); $udp.Send($b, $b.Length, "192.168.4.1", 50000)
+```
+
+### What happens
+1. Script sends `"MEASURE"` to ANL
+2. ANL picks first anchor, sends `"ROLE,0"` (become TAG), waits 30s for reboot
+3. Collects RPT for 10s, computes median, broadcasts `DIST,from,to,raw,median,ts`
+4. Sends `"ROLE,1"` to revert to anchor, waits 30s
+5. Repeats for next anchor
+6. Final line: `DIST,DONE,0,0,0,0`
+
+**Duration:** ~2 minutes for 4 anchors (30s reboot + 10s collect + 30s revert per anchor)
+
+---
+
+## Step 8: Verify CSV
 
 Open the CSV file. You should see:
-- `RPT` rows during normal operation
+- `RPT` rows during normal operation (debug only, not in CSV)
 - `SNAP` rows after button press
+- `DIST` rows after MEASURE command
 
 Columns: `timestamp_ms, type, tag_id, anchor_id, range_cm, ...`
 
