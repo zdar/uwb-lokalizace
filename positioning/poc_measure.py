@@ -1,26 +1,52 @@
 """
 poc_measure.py
-Build an anchor-to-anchor distance matrix from a poc_logger.py CSV file.
+Trigger a SNAP over WiFi, collect the 5-second stream, build a distance matrix,
+and save it with a user comment.
 
 Usage:
-    python poc_measure.py <csv_file>
-    python poc_measure.py                  # uses most recent uwb_log_*.csv
+    python poc_measure.py
 
-For each SNAP row, parses the AT+RANGE line to extract distances from the
-temporary tag to each anchor. After collecting all SNAP data, prints a
-median distance matrix and saves it to a CSV file.
+The script:
+  1. Asks for an optional comment
+  2. Sends UDP "SNAP" broadcast to the tag
+  3. Listens for 6 seconds
+  4. Builds a median distance matrix
+  5. Saves to uwb_matrix_*.csv
 """
 
+import socket
 import csv
-import sys
 import os
-import glob
+import sys
+import time
 from collections import defaultdict
+from datetime import datetime
+
+UDP_PORT = 50000
+BROADCAST_IP = "192.168.4.255"
+LISTEN_SECONDS = 6
+
+
+def get_rtls_ip() -> str:
+    """Find the IP address on the 192.168.4.x network."""
+    import subprocess
+    try:
+        result = subprocess.run(["ipconfig"], capture_output=True, text=True)
+        lines = result.stdout.split("\n")
+        for line in lines:
+            if "192.168.4." in line:
+                parts = line.split(":")
+                if len(parts) >= 2:
+                    ip = parts[1].strip()
+                    if ip.startswith("192.168.4."):
+                        return ip
+    except Exception:
+        pass
+    return "0.0.0.0"
 
 
 def parse_at_range(line: str) -> tuple[list[int], list[float]] | None:
     """Parse AT+RANGE line: AT+RANGE:0,ancid:(0,1,2),range:(123,456,789),..."""
-    # Find ancid:(...)
     anc_start = line.find("ancid:(")
     if anc_start < 0:
         return None
@@ -31,7 +57,6 @@ def parse_at_range(line: str) -> tuple[list[int], list[float]] | None:
     ancids_str = line[anc_start:anc_end]
     ancids = [int(x.strip()) for x in ancids_str.split(",") if x.strip().lstrip("-").isdigit()]
 
-    # Find range:(...)
     rng_start = line.find("range:(")
     if rng_start < 0:
         return None
@@ -64,66 +89,80 @@ def median(values: list[float]) -> float:
 
 
 def main():
-    if len(sys.argv) >= 2:
-        csv_path = sys.argv[1]
-    else:
-        # Find most recent uwb_log_*.csv
-        files = glob.glob(os.path.join(os.path.dirname(__file__), "uwb_log_*.csv"))
-        if not files:
-            print("No uwb_log_*.csv found. Usage: python poc_measure.py <csv_file>")
-            sys.exit(1)
-        csv_path = max(files, key=os.path.getmtime)
-
-    print(f"Reading {csv_path}")
-
-    # Ask for an optional comment
     comment = input("Comment for this measurement (press Enter to skip): ").strip()
 
-    # Collect all (tag_id, anchor_id) -> [range_cm samples]
+    bind_ip = get_rtls_ip()
+    print(f"\nUsing IP: {bind_ip}")
+    print("Sending SNAP trigger...")
+
+    # Open UDP socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind((bind_ip, UDP_PORT))
+    except OSError:
+        sock.bind(("0.0.0.0", UDP_PORT))
+    sock.settimeout(1.0)
+
+    # Send SNAP broadcast
+    sock.sendto(b"SNAP", (BROADCAST_IP, UDP_PORT))
+    print(f"Listening for {LISTEN_SECONDS}s...")
+
     samples = defaultdict(list)
-    sources = defaultdict(set)  # (tag_id, anchor_id) -> {BTN, UDP, ...}
+    sources = defaultdict(set)
+    start_time = time.time()
 
-    with open(csv_path, "r", newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            if row.get("type") != "SNAP":
-                continue
-            tag_id_str = row.get("tag_id", "").strip()
-            if not tag_id_str:
-                continue
-            try:
-                tag_id = int(tag_id_str)
-            except ValueError:
-                continue
+    while time.time() - start_time < LISTEN_SECONDS:
+        try:
+            data, addr = sock.recvfrom(1024)
+        except socket.timeout:
+            continue
 
-            raw_line = row.get("raw_line", "")
-            if not raw_line:
-                continue
+        text = data.decode("utf-8", errors="ignore").strip()
+        if not text.startswith("SNAP,"):
+            continue
 
-            source = row.get("source", "BTN").strip()
+        parts = text.split(",")
+        if len(parts) < 5:
+            continue
 
-            parsed = parse_at_range(raw_line)
-            if parsed is None:
-                continue
-            ancids, ranges = parsed
-            pairs = min(len(ancids), len(ranges))
-            for i in range(pairs):
-                if ranges[i] > 0:
-                    key = (tag_id, ancids[i])
-                    samples[key].append(ranges[i])
-                    sources[key].add(source)
+        # SNAP,tag_id,source,<raw_line>,ts
+        tag_id_str = parts[1]
+        source = parts[2]
+        raw_line = ",".join(parts[3:-1])
+
+        try:
+            tag_id = int(tag_id_str)
+        except ValueError:
+            continue
+
+        parsed = parse_at_range(raw_line)
+        if parsed is None:
+            continue
+
+        ancids, ranges = parsed
+        pairs = min(len(ancids), len(ranges))
+        for i in range(pairs):
+            if ranges[i] > 0:
+                key = (tag_id, ancids[i])
+                samples[key].append(ranges[i])
+                sources[key].add(source)
+
+    sock.close()
 
     if not samples:
-        print("No SNAP data found in CSV.")
+        print("\nNo SNAP data received. Make sure:")
+        print("  - The tag is powered on and connected to WiFi")
+        print("  - You are connected to the RTLS-NET-XXXX AP")
+        print("  - The tag has the latest firmware flashed")
         sys.exit(1)
 
-    # Build median matrix
+    # Build matrix
     ids = sorted(set(k[0] for k in samples.keys()) | set(k[1] for k in samples.keys()))
 
     print(f"\nCollected {sum(len(v) for v in samples.values())} range samples")
     print(f"Nodes involved: {ids}\n")
 
-    # Print matrix
     header = "    " + " ".join(f"{i:>8}" for i in ids)
     print(header)
     for i in ids:
@@ -137,8 +176,9 @@ def main():
                 row_str += f"{'—':>8} "
         print(row_str)
 
-    # Save as simple CSV matrix
-    out_path = csv_path.replace("uwb_log_", "uwb_matrix_")
+    # Save
+    now = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = os.path.join(os.path.dirname(__file__), f"uwb_matrix_{now}.csv")
     with open(out_path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["comment", comment])
