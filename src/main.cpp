@@ -25,7 +25,7 @@ Use 2.5.7    Adafruit_SSD1306
 
 //!!!!! CHANGE THIS BEFORE EACH FLASH !!!!!
 // ANY index can be the ANL. Just pick unique numbers 0..7!
-#define UWB_INDEX 4
+#define UWB_INDEX 3
 //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 #define POC_DISABLE_AUTO_CAL 1
@@ -728,10 +728,11 @@ void configureUWB()
     sendData("AT?", 2000, 1);
     if (currentRole == 0) {
         SERIAL_LOG.println(F(">>> Configuring as TAG"));
-        sendData("AT+RESTORE", 5000, 1);
     } else {
         SERIAL_LOG.println(F(">>> Configuring as ANCHOR"));
     }
+    // PoC: restore factory defaults on every boot for clean state
+    sendData("AT+RESTORE", 5000, 1);
     sendData(config_cmd(), 2000, 1);
     sendData(cap_cmd(), 2000, 1);
     sendData(String("AT+SETPAN=") + networkId, 2000, 1);
