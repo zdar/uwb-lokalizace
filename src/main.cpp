@@ -25,7 +25,7 @@ Use 2.5.7    Adafruit_SSD1306
 
 //!!!!! CHANGE THIS BEFORE EACH FLASH !!!!!
 // ANY index can be the ANL. Just pick unique numbers 0..9!
-#define UWB_INDEX 9
+#define UWB_INDEX 8
 //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 #define POC_DISABLE_AUTO_CAL 1
@@ -423,7 +423,7 @@ void loop()
                 display.println(newRole == 1 ? F("ANCHOR") : F("TAG"));
                 display.setCursor(0, 42);
                 display.setTextSize(1);
-                display.println(F("Rebooting..."));
+                display.println(F("Switching..."));
                 display.display();
                 delay(800);
                 reconfigureUWB(newRole);
@@ -737,7 +737,7 @@ void reconfigureUWB(uint8_t newRole)
     SERIAL_LOG.println(newRole);
 
     currentRole = newRole;
-    // Role is NOT saved to EEPROM — volatile only
+    // Role is NOT saved to ESP32 EEPROM — volatile only
 
     // Flush pending UWB serial data
     while (SERIAL_AT.available()) SERIAL_AT.read();
@@ -748,11 +748,9 @@ void reconfigureUWB(uint8_t newRole)
         snapActive = false;
     }
 
-    sendData("AT+RESTORE", 5000, 1);
+    // Minimal reconfiguration — no AT+RESTORE needed for a simple role swap.
+    // PAN ID and capabilities stay intact; only role and reporting change.
     sendData(config_cmd(), 2000, 1);
-    sendData(cap_cmd(), 2000, 1);
-    sendData(String("AT+SETPAN=") + networkId, 2000, 1);
-
     if (currentRole == 0) {
         sendData("AT+SETRPT=1", 2000, 1);
     } else {
@@ -762,8 +760,8 @@ void reconfigureUWB(uint8_t newRole)
     sendData("AT+SAVE", 2000, 1);
     sendData("AT+RESTART", 2000, 1);
 
-    // Wait for UWB module to reboot
-    delay(3000);
+    // Wait for UWB module to reboot (much shorter than full restore cycle)
+    delay(1500);
 
     // Flush boot messages
     while (SERIAL_AT.available()) SERIAL_AT.read();
@@ -1062,18 +1060,18 @@ registerNode(remoteIp, (uint8_t)tid, knownRole);
             uint8_t va[10];
             int vc = 0;
             int pairs = (rc < ac) ? rc : ac;
-            // PoC: log raw RPT data instead of solving position
-            for (int j = 0; j < pairs; j++) {
-                if (ancids[j] >= 0 && ancids[j] < 10 && ranges[j] > 0) {
-                    uint8_t a = (uint8_t)ancids[j];
-                    int rangeCm = (int)(ranges[j] + 0.5f);
-                    char logBuf[64];
-                    snprintf(logBuf, sizeof(logBuf), "RPT,%d,%d,%d,0,%lu", tid, a, rangeCm, millis());
-                    SERIAL_LOG.println(logBuf);
-                    // PoC: only broadcast SNAP, not RPT (RPT is debug only)
-                    // broadcastLog(logBuf);
-                }
-            }
+            // RPT serial output disabled to keep USB serial clean
+            // for (int j = 0; j < pairs; j++) {
+            //     if (ancids[j] >= 0 && ancids[j] < 10 && ranges[j] > 0) {
+            //         uint8_t a = (uint8_t)ancids[j];
+            //         int rangeCm = (int)(ranges[j] + 0.5f);
+            //         char logBuf[64];
+            //         snprintf(logBuf, sizeof(logBuf), "RPT,%d,%d,%d,0,%lu", tid, a, rangeCm, millis());
+            //         SERIAL_LOG.println(logBuf);
+            //         // PoC: only broadcast SNAP, not RPT (RPT is debug only)
+            //         // broadcastLog(logBuf);
+            //     }
+            // }
         }
         // ------------------------------------------------------------------
 
@@ -1081,9 +1079,13 @@ registerNode(remoteIp, (uint8_t)tid, knownRole);
     }
 
     // ---------- SNAP: tag snapshot stream (ANL only) ----------
+    // NOTE: removed rebroadcast — the tag already broadcasts to 192.168.4.255,
+    // so every listener on the subnet receives the packet directly.
+    // Rebroadcasting here caused duplicate rows in CSV logs.
+    // We also echo the raw SNAP line to USB serial so a PC connected to the
+    // ANL can collect CSV data without joining the WiFi network.
     if (systemRole == 1 && len >= 5 && strncmp(buf, "SNAP,", 5) == 0) {
-        // Broadcast the raw SNAP line so any logger on the network captures it
-        broadcastLog(buf);
+        SERIAL_LOG.println(buf);
         return;
     }
 
@@ -1105,8 +1107,20 @@ registerNode(remoteIp, (uint8_t)tid, knownRole);
         return;
     }
 
+    // ---------- PING: discovery probe (any node) ----------
+    if (len == 4 && strncmp(buf, "PING", 4) == 0) {
+        char pong[64];
+        snprintf(pong, sizeof(pong), "PONG,%d,%d,%d,%lu", UWB_INDEX, currentRole, networkId, millis());
+        udp.beginPacket(remoteIp, remotePort);
+        udp.write((const uint8_t*)pong, strlen(pong));
+        udp.endPacket();
+        return;
+    }
+
     // ---------- SNAP command (tag node only) ----------
-    if (systemRole == 0 && currentRole == 0 && len >= 4 && strncmp(buf, "SNAP", 4) == 0) {
+    // Must be EXACTLY "SNAP" (len==4) so we don't re-trigger on our own
+    // broadcasted data packets like "SNAP,0,UDP,AT+RANGE=...,12345".
+    if (systemRole == 0 && currentRole == 0 && len == 4 && strncmp(buf, "SNAP", 4) == 0) {
         sendSnap("UDP");
         udp.beginPacket(remoteIp, remotePort);
         udp.print("ACK,SNAP,");

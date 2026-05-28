@@ -17,17 +17,18 @@ import socket
 import csv
 import sys
 import os
+import time
 from datetime import datetime
 
 UDP_PORT = 50000
 
-# Minimal CSV columns — no empty cells
 CSV_COLUMNS = [
     "timestamp_ms",
     "type",
     "tag_id",
     "source",
     "raw_line",
+    "comment",
 ]
 
 
@@ -92,6 +93,11 @@ def main():
     print(f"Listening on UDP {bind_ip}:{UDP_PORT}")
     print("Press Ctrl+C to stop.\n")
 
+    # Deduplication buffer: store dedup_key -> arrival_time.
+    # Window = 2 seconds.
+    seen_packets = {}
+    dedup_window = 2.0
+
     # Open CSV for writing
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
@@ -127,6 +133,18 @@ def main():
 
                 row = parse_line(text)
                 if row:
+                    # Deduplication
+                    dedup_key = (row["tag_id"], row["source"], row["raw_line"], row["timestamp_ms"])
+                    now_mono = time.time()
+                    seen_packets = {
+                        k: v for k, v in seen_packets.items()
+                        if now_mono - v < dedup_window
+                    }
+                    if dedup_key in seen_packets:
+                        print(f"  -> DUPLICATE suppressed")
+                        continue
+                    seen_packets[dedup_key] = now_mono
+
                     writer.writerow(row)
                     f.flush()
                     print(f"  -> [{row['type']}] src={row['source']} logged")

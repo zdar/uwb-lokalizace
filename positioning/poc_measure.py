@@ -29,6 +29,7 @@ CSV_COLUMNS = [
     "tag_id",
     "source",
     "raw_line",
+    "comment",
 ]
 
 
@@ -102,7 +103,8 @@ def main():
                 "type": "COMMENT",
                 "tag_id": "",
                 "source": "",
-                "raw_line": comment,
+                "raw_line": "",
+                "comment": comment,
             })
 
         # Send trigger
@@ -112,6 +114,11 @@ def main():
         start_time = time.time()
         packets_received = 0
         snap_count = 0
+
+        # Deduplication buffer: store dedup_key -> arrival_time.
+        # Window = 2 seconds.
+        seen_packets = {}
+        dedup_window = 2.0
 
         while time.time() - start_time < LISTEN_SECONDS:
             try:
@@ -136,12 +143,26 @@ def main():
             raw_line = ",".join(parts[3:-1])
             ts = parts[-1]
 
+            # Deduplication key
+            dedup_key = (tag_id_str, source, raw_line, ts)
+            now_mono = time.time()
+            # Clean old entries
+            seen_packets = {
+                k: v for k, v in seen_packets.items()
+                if now_mono - v < dedup_window
+            }
+            if dedup_key in seen_packets:
+                print(f"  -> DUPLICATE suppressed")
+                continue
+            seen_packets[dedup_key] = now_mono
+
             writer.writerow({
                 "timestamp_ms": ts,
                 "type": "SNAP",
                 "tag_id": tag_id_str,
                 "source": source,
                 "raw_line": raw_line,
+                "comment": "",
             })
             f.flush()
             snap_count += 1
