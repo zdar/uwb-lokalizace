@@ -3,7 +3,7 @@ For ESP32S3 UWB AT Demo - MERGED FIRMWARE
 Identical binary on all nodes. Behavior set by provisioning:
 - System Role: ANL (AP) or NODE (STA)
 - UWB Role:    TAG (0) or ANCHOR (1) via AT+ROLE or EEPROM
-- UWB_INDEX:   0..7 (must be UNIQUE per node, ANL can be any index)
+- UWB_INDEX:   0..9 (must be UNIQUE per node, ANL can be any index)
 
 Auto-calibration sequence (ANL only):
 1. Picks next unfixed node, sends ROLE,0 -> becomes temp Tag.
@@ -24,13 +24,14 @@ Use 2.5.7    Adafruit_SSD1306
 */
 
 //!!!!! CHANGE THIS BEFORE EACH FLASH !!!!!
-// ANY index can be the ANL. Just pick unique numbers 0..7!
-#define UWB_INDEX 3
+// ANY index can be the ANL. Just pick unique numbers 0..9!
+#define UWB_INDEX 9
 //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 #define POC_DISABLE_AUTO_CAL 1
 
-#define UWB_TAG_COUNT 8
+#define UWB_TAG_COUNT 2
+#define UWB_ANCHOR_COUNT 8
 #define MAX_CAL_SAMPLES 5
 
 #define BUTTON_PIN 0
@@ -83,6 +84,7 @@ void saveSystemRole(uint8_t role);
 uint16_t loadNetworkId();
 void saveNetworkId(uint16_t netId);
 void configureUWB();
+void reconfigureUWB(uint8_t newRole);
 void wifiSetup();
 void udpLoop();
 void sendHeartbeat();
@@ -95,7 +97,7 @@ void registerNode(IPAddress from, uint8_t nodeId, uint8_t nodeRole = 1);
 String ssidForNetId(uint16_t netId);
 String netIdString(uint16_t netId);
 void displayRoleScreen(uint8_t role);
-void displayReadyScreen();
+void displayReadyScreen(unsigned long showDelay = 4000);
 void maybeEnterProvisioning();
 void provisioningMenu();
 int waitForButtonEvent(unsigned long timeout);
@@ -129,6 +131,7 @@ struct NodeInfo {
 NodeInfo registry[MAX_REGISTRY_ENTRIES];
 int registryCount = 0;
 
+bool pendingDisplayRefresh = false;
 unsigned long lastDebounceTime = 0;
 unsigned long debounceDelay = 200;
 bool reportingState = true;
@@ -148,8 +151,8 @@ struct {
     uint8_t phase;             // 0=idle, 1=wait reboot, 2=collecting, 3=wait revert
     unsigned long timer;
     IPAddress targetIp;        // IP at the time ROLE,0 was sent (fallback)
-    float samples[8][MAX_CAL_SAMPLES];
-    uint8_t sampleCount[8];
+    float samples[10][MAX_CAL_SAMPLES];
+    uint8_t sampleCount[10];
 } cal = { 255, 0, 0, IPAddress(), {{0}}, {0} };
 // ============================================================
 
@@ -257,11 +260,11 @@ void autoCalibrateLoop()
         case 2: {
             if (millis() - cal.timer < COLLECT_TIME) return;
 
-            float vr[8];
-            uint8_t va[8];
+            float vr[10];
+            uint8_t va[10];
             int vc = 0;
 
-            for (int a = 0; a < 8; a++) {
+            for (int a = 0; a < 10; a++) {
                 if (cal.sampleCount[a] == 0) continue;
                 float r = medianSample((uint8_t)a);
                 if (r <= 0.0f) continue;
@@ -272,7 +275,7 @@ void autoCalibrateLoop()
                         break;
                     }
                 }
-                if (fixed && vc < 8) {
+                if (fixed && vc < 10) {
                     va[vc] = (uint8_t)a;
                     vr[vc] = r;
                     vc++;
@@ -339,7 +342,7 @@ void setup()
     }
     display.clearDisplay();
 
-    currentRole = loadRole();
+    currentRole = 1; // Always start as anchor
     systemRole = loadSystemRole();
     networkId = loadNetworkId();
 
@@ -413,7 +416,6 @@ void loop()
             if (!roleToggleDone && held >= 2500) {
                 roleToggleDone = true;
                 uint8_t newRole = (currentRole == 0) ? 1 : 0;
-                saveRole(newRole);
                 display.clearDisplay();
                 display.setTextSize(2);
                 display.setTextColor(SSD1306_WHITE);
@@ -424,7 +426,7 @@ void loop()
                 display.println(F("Rebooting..."));
                 display.display();
                 delay(800);
-                ESP.restart();
+                reconfigureUWB(newRole);
             }
         } else {
             unsigned long held = millis() - btnDownT;
@@ -603,7 +605,7 @@ void displayRoleScreen(uint8_t role)
     delay(1500);
 }
 
-void displayReadyScreen()
+void displayReadyScreen(unsigned long showDelay)
 {
     display.clearDisplay();
     display.setTextSize(2);
@@ -632,7 +634,7 @@ void displayReadyScreen()
         display.println(F("FAIL"));
     }
     display.display();
-    delay(4000);
+    delay(showDelay);
 }
 
 String sendData(String command, const int timeout, boolean debug)
@@ -649,6 +651,7 @@ String sendData(String command, const int timeout, boolean debug)
             char c = SERIAL_AT.read();
             response += c;
         }
+        yield();
     }
     if (debug) {
         SERIAL_LOG.print(response);
@@ -671,7 +674,8 @@ String cap_cmd()
 {
     String temp = "AT+SETCAP=";
     temp = temp + UWB_TAG_COUNT;
-    temp = temp + ",10";
+    temp = temp + ",";
+    temp = temp + UWB_ANCHOR_COUNT;
     temp = temp + ",1";
     return temp;
 }
@@ -721,6 +725,60 @@ void saveNetworkId(uint16_t netId)
     EEPROM.write(NETID_ADDRESS, netId & 0xFF);
     EEPROM.write(NETID_ADDRESS + 1, (netId >> 8) & 0xFF);
     EEPROM.commit();
+}
+
+void reconfigureUWB(uint8_t newRole)
+{
+    if (newRole != 0 && newRole != 1) return;
+
+    SERIAL_LOG.print(F(">>> Switching UWB role from "));
+    SERIAL_LOG.print(currentRole);
+    SERIAL_LOG.print(F(" to "));
+    SERIAL_LOG.println(newRole);
+
+    currentRole = newRole;
+    // Role is NOT saved to EEPROM — volatile only
+
+    // Flush pending UWB serial data
+    while (SERIAL_AT.available()) SERIAL_AT.read();
+    rangeLineIdx = 0;
+
+    // Reset tag-specific state when becoming anchor
+    if (currentRole == 1) {
+        snapActive = false;
+    }
+
+    sendData("AT+RESTORE", 5000, 1);
+    sendData(config_cmd(), 2000, 1);
+    sendData(cap_cmd(), 2000, 1);
+    sendData(String("AT+SETPAN=") + networkId, 2000, 1);
+
+    if (currentRole == 0) {
+        sendData("AT+SETRPT=1", 2000, 1);
+    } else {
+        reportingState = true;
+        sendData("AT+SETRPT=1", 2000, 1);
+    }
+    sendData("AT+SAVE", 2000, 1);
+    sendData("AT+RESTART", 2000, 1);
+
+    // Wait for UWB module to reboot
+    delay(3000);
+
+    // Flush boot messages
+    while (SERIAL_AT.available()) SERIAL_AT.read();
+
+    SERIAL_LOG.println(F("===================================="));
+    SERIAL_LOG.println(F("ROLE SWITCH COMPLETE"));
+    if (currentRole == 0) {
+        SERIAL_LOG.println(F("MODE: TAG"));
+    } else {
+        SERIAL_LOG.println(F("MODE: ANCHOR"));
+    }
+    SERIAL_LOG.println(F("===================================="));
+
+    logoshow();
+    pendingDisplayRefresh = true;
 }
 
 void configureUWB()
@@ -926,11 +984,11 @@ void handleIncomingUdp()
         if (!p) return;
         p += 7;
 
-        float ranges[8] = {0};
+        float ranges[10] = {0};
         int rc = 0;
         char tmp[12];
         int ti = 0;
-        while (*p && rc < 8) {
+        while (*p && rc < 10) {
             if (*p == '-' || (*p >= '0' && *p <= '9')) {
                 if (ti < 11) tmp[ti++] = *p;
             } else if (*p == ',' || *p == ')') {
@@ -948,10 +1006,10 @@ void handleIncomingUdp()
         if (!p) return;
         p += 7;
 
-        int ancids[8] = {-1};
+        int ancids[10] = {-1};
         int ac = 0;
         ti = 0;
-        while (*p && ac < 8) {
+        while (*p && ac < 10) {
             if (*p == '-' || (*p >= '0' && *p <= '9')) {
                 if (ti < 11) tmp[ti++] = *p;
             } else if (*p == ',' || *p == ')') {
@@ -981,7 +1039,7 @@ registerNode(remoteIp, (uint8_t)tid, knownRole);
             
             int pairs = (rc < ac) ? rc : ac;
             for (int j = 0; j < pairs; j++) {
-                if (ancids[j] >= 0 && ancids[j] < 8) {
+                if (ancids[j] >= 0 && ancids[j] < 10) {
                     uint8_t a = (uint8_t)ancids[j];
                     if (cal.sampleCount[a] < MAX_CAL_SAMPLES) {
                         cal.samples[a][cal.sampleCount[a]++] = ranges[j];
@@ -1000,13 +1058,13 @@ registerNode(remoteIp, (uint8_t)tid, knownRole);
 
         // ---------- Option C: solve position on ANL and broadcast ----------
         {
-            float vr[8];
-            uint8_t va[8];
+            float vr[10];
+            uint8_t va[10];
             int vc = 0;
             int pairs = (rc < ac) ? rc : ac;
             // PoC: log raw RPT data instead of solving position
             for (int j = 0; j < pairs; j++) {
-                if (ancids[j] >= 0 && ancids[j] < 8 && ranges[j] > 0) {
+                if (ancids[j] >= 0 && ancids[j] < 10 && ranges[j] > 0) {
                     uint8_t a = (uint8_t)ancids[j];
                     int rangeCm = (int)(ranges[j] + 0.5f);
                     char logBuf[64];
@@ -1061,13 +1119,11 @@ registerNode(remoteIp, (uint8_t)tid, knownRole);
     if (systemRole == 0 && len >= 5 && strncmp(buf, "ROLE,", 5) == 0) {
         int newRole = atoi(buf + 5);
         if (newRole == 0 || newRole == 1) {
-            saveRole((uint8_t)newRole);
             udp.beginPacket(remoteIp, remotePort);
             udp.print("ACK,ROLE,");
             udp.println(newRole);
             udp.endPacket();
-            delay(500);
-            ESP.restart();
+            reconfigureUWB((uint8_t)newRole);
         }
         return;
     }
@@ -1283,13 +1339,11 @@ void processATCommand(String command)
                 SERIAL_LOG.println(newRole);
 
                 currentRole = newRole;
-                saveRole(currentRole);
-
-                SERIAL_LOG.println(F("Role saved. Please restart the device."));
+                SERIAL_LOG.println(F("Role switched (not saved to EEPROM)."));
                 displayRoleScreen(currentRole);
                 delay(2000);
                 SERIAL_LOG.println(F("Auto-restarting..."));
-                ESP.restart();
+                reconfigureUWB((uint8_t)newRole);
             } else {
                 SERIAL_LOG.println(F("Already in this mode."));
             }
@@ -1373,11 +1427,12 @@ void updateWifiStatusDisplay()
     static unsigned long lastDisplayUpdate = 0;
     static bool lastDisplayedConnected = false;
 
-    if (millis() - lastDisplayUpdate < 2000) return;
+    if (!pendingDisplayRefresh && millis() - lastDisplayUpdate < 2000) return;
     lastDisplayUpdate = millis();
 
     bool isConnected = (systemRole == 1 || WiFi.status() == WL_CONNECTED);
-    if (isConnected == lastDisplayedConnected) return;
+    if (!pendingDisplayRefresh && isConnected == lastDisplayedConnected) return;
+    pendingDisplayRefresh = false;
     lastDisplayedConnected = isConnected;
 
     display.fillRect(0, 48, 128, 16, SSD1306_BLACK);
@@ -1406,7 +1461,7 @@ void drawAnlDashboard()
         registry[0].lastSeen = millis();
     }
 
-    if (millis() - lastDashboardUpdate < 2000) return;
+    if (!pendingDisplayRefresh && millis() - lastDashboardUpdate < 2000) return;
     lastDashboardUpdate = millis();
 
     int activeNodes = 0;
@@ -1416,8 +1471,10 @@ void drawAnlDashboard()
         if (age < NODE_TIMEOUT_MS) activeNodes++;
     }
 
-    if (activeNodes == lastDisplayedCount) return;
+    if (!pendingDisplayRefresh && activeNodes == lastDisplayedCount) return;
+    if (pendingDisplayRefresh) lastDisplayedCount = -1;
     lastDisplayedCount = activeNodes;
+    pendingDisplayRefresh = false;
 
     display.fillRect(0, 48, 128, 16, SSD1306_BLACK);
     display.setTextSize(1);
