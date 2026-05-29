@@ -491,7 +491,7 @@ HTML_PAGE = """
 
         function switchRole(ip, roleNum, nodeId, targetRole) {
             if (!confirm(`Switch node ${nodeId} to ${targetRole}?`)) return;
-            document.getElementById('nodeList').innerHTML = `<p><strong>Switching node ${nodeId} to ${targetRole}...</strong> Device will reboot. Please wait ~5s.</p>`;
+            document.getElementById('nodeList').innerHTML = `<p><strong>Switching node ${nodeId} to ${targetRole}...</strong> Device will reboot. Please wait ~30s.</p>`;
             fetch('/switch_role', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
@@ -501,8 +501,8 @@ HTML_PAGE = """
                     alert('ERROR: ' + data.error);
                     return;
                 }
-                // Wait 5 seconds for device to reboot before rediscovering
-                setTimeout(discoverNodes, 5000);
+                // Wait 30 seconds for device to reboot before rediscovering
+                setTimeout(discoverNodes, 30000);
             }).catch(err => {
                 alert('ERROR: ' + err);
             });

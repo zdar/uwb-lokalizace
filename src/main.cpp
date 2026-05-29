@@ -25,7 +25,7 @@ Use 2.5.7    Adafruit_SSD1306
 
 //!!!!! CHANGE THIS BEFORE EACH FLASH !!!!!
 // ANY index can be the ANL. Just pick unique numbers 0..9!
-#define UWB_INDEX 4
+#define UWB_INDEX 5
 //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 #define POC_DISABLE_AUTO_CAL 1
@@ -500,6 +500,11 @@ void loop()
                         snprintf(snapPkt, sizeof(snapPkt), "SNAP,%d,%s,%s,%lu", UWB_INDEX, snapSource, rangeLineBuf, millis());
                         // Broadcast so any listener on the network receives it
                         udp.beginPacket("192.168.4.255", WIFI_PORT);
+                        udp.write((const uint8_t*)snapPkt, strlen(snapPkt));
+                        udp.endPacket();
+                        // Also unicast to ANL (192.168.4.1) because ESP32 AP
+                        // often does not receive broadcasts from its stations.
+                        udp.beginPacket(IPAddress(192, 168, 4, 1), WIFI_PORT);
                         udp.write((const uint8_t*)snapPkt, strlen(snapPkt));
                         udp.endPacket();
                     }
