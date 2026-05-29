@@ -11,8 +11,8 @@ Then open the displayed URL in any browser.
 
 Features:
   - Discover all nodes on the network (PING / PONG)
-  - Trigger SNAP from the dedicated tag
-  - Temporarily switch any anchor to TAG, SNAP, then switch it back
+  - Trigger SNAP from any tag on the network
+  - Switch any node between TAG and ANCHOR roles
 """
 
 import os
@@ -26,7 +26,6 @@ from flask import Flask, render_template_string, jsonify, request
 
 UDP_PORT = 50000
 LISTEN_SECONDS = 6
-ROLE_SWITCH_WAIT = 20.0  # seconds to wait after ROLE command (device reboots + rejoins WiFi)
 
 CSV_COLUMNS = [
     "timestamp_ms",
@@ -47,6 +46,9 @@ measurement_state = {
     "csv_path": None,
     "snap_count": 0,
     "packets_received": 0,
+    "mode": "single",   # "single" or "auto"
+    "stop_requested": False,
+    "current_comment": "",
 }
 
 discovery_state = {
@@ -164,7 +166,7 @@ def run_discovery() -> None:
     discovery_state["running"] = False
 
 
-def run_measurement(comment: str, target_ip: str | None = None, switch_back_ip: str | None = None) -> None:
+def run_measurement(comment: str, target_ip: str | None = None) -> None:
     """Background thread: trigger SNAP, listen, write CSV."""
     global measurement_state
 
@@ -174,6 +176,8 @@ def run_measurement(comment: str, target_ip: str | None = None, switch_back_ip: 
     measurement_state["snap_count"] = 0
     measurement_state["packets_received"] = 0
     measurement_state["csv_path"] = None
+    measurement_state["mode"] = "single"
+    measurement_state["stop_requested"] = False
 
     now = datetime.now().strftime("%Y%m%d_%H%M%S")
     csv_path = os.path.join(os.path.dirname(__file__), f"uwb_log_{now}.csv")
@@ -200,15 +204,6 @@ def run_measurement(comment: str, target_ip: str | None = None, switch_back_ip: 
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
         writer.writeheader()
-        if comment:
-            writer.writerow({
-                "timestamp_ms": "",
-                "type": "COMMENT",
-                "tag_id": "",
-                "source": "",
-                "raw_line": "",
-                "comment": comment,
-            })
 
         send_snap_trigger(sock, target_ip)
         measurement_state["log"].append("SNAP trigger sent. Listening...")
@@ -262,7 +257,7 @@ def run_measurement(comment: str, target_ip: str | None = None, switch_back_ip: 
                 "tag_id": tag_id_str,
                 "source": source,
                 "raw_line": raw_line,
-                "comment": "",
+                "comment": comment,
             })
             f.flush()
 
@@ -274,21 +269,107 @@ def run_measurement(comment: str, target_ip: str | None = None, switch_back_ip: 
     measurement_state["log"].append(
         f"Done. {measurement_state['snap_count']} SNAP rows saved."
     )
+    measurement_state["running"] = False
 
-    # Switch anchor back if needed
-    if switch_back_ip:
-        measurement_state["log"].append(f"Switching {switch_back_ip} back to ANCHOR...")
-        sock2 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock2.settimeout(2.0)
+
+def run_auto_log() -> None:
+    """Background thread: continuously listen for SNAP packets and append to CSV."""
+    global measurement_state
+
+    measurement_state["running"] = True
+    measurement_state["progress"] = 0
+    measurement_state["log"] = []
+    measurement_state["snap_count"] = 0
+    measurement_state["packets_received"] = 0
+    measurement_state["csv_path"] = None
+    measurement_state["mode"] = "auto"
+    measurement_state["stop_requested"] = False
+
+    now = datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_path = os.path.join(os.path.dirname(__file__), f"uwb_log_{now}.csv")
+    measurement_state["csv_path"] = csv_path
+
+    bind_ip = get_rtls_ip()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind((bind_ip, UDP_PORT))
+        measurement_state["log"].append(f"[AUTO] Bound to {bind_ip}:{UDP_PORT}")
+    except OSError as e:
+        measurement_state["log"].append(f"[AUTO] Failed to bind to {bind_ip}:{UDP_PORT} — {e}")
+        measurement_state["log"].append("[AUTO] Trying 0.0.0.0 instead...")
         try:
-            sock2.sendto(b"ROLE,1", (switch_back_ip, UDP_PORT))
-            measurement_state["log"].append("ROLE,1 command sent.")
-        except Exception as e:
-            measurement_state["log"].append(f"Failed to send ROLE,1: {e}")
-        sock2.close()
-        time.sleep(ROLE_SWITCH_WAIT)
-        measurement_state["log"].append("Anchor should be back online.")
+            sock.bind(("0.0.0.0", UDP_PORT))
+            measurement_state["log"].append(f"[AUTO] Bound to 0.0.0.0:{UDP_PORT}")
+        except OSError as e2:
+            measurement_state["log"].append(f"[AUTO] ERROR: Failed to bind port {UDP_PORT}: {e2}")
+            measurement_state["running"] = False
+            return
+    sock.settimeout(1.0)
 
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
+        writer.writeheader()
+        measurement_state["log"].append("[AUTO] Logging started. Press button on tag anytime.")
+
+        seen_packets = {}
+        dedup_window = 2.0
+        start_time = time.time()
+
+        while not measurement_state["stop_requested"]:
+            elapsed = time.time() - start_time
+            # Fake progress that cycles every 60s so the bar isn't static
+            measurement_state["progress"] = int(((elapsed % 60) / 60) * 100)
+
+            try:
+                data, addr = sock.recvfrom(1024)
+            except socket.timeout:
+                continue
+
+            text = data.decode("utf-8", errors="ignore").strip()
+            measurement_state["packets_received"] += 1
+
+            if not text.startswith("SNAP,"):
+                continue
+
+            parts = text.split(",")
+            if len(parts) < 5:
+                continue
+
+            tag_id_str = parts[1]
+            source = parts[2]
+            raw_line = ",".join(parts[3:-1])
+            ts = parts[-1]
+
+            dedup_key = (tag_id_str, source, raw_line, ts)
+            now_mono = time.time()
+            seen_packets = {
+                k: v for k, v in seen_packets.items()
+                if now_mono - v < dedup_window
+            }
+            if dedup_key in seen_packets:
+                continue
+            seen_packets[dedup_key] = now_mono
+
+            comment = measurement_state.get("current_comment", "")
+            writer.writerow({
+                "timestamp_ms": ts,
+                "type": "SNAP",
+                "tag_id": tag_id_str,
+                "source": source,
+                "raw_line": raw_line,
+                "comment": comment,
+            })
+            f.flush()
+
+            measurement_state["snap_count"] += 1
+            measurement_state["log"].append(f"[AUTO] [{tag_id_str}] src={source} logged (total: {measurement_state['snap_count']})")
+
+    sock.close()
+    measurement_state["progress"] = 100
+    measurement_state["log"].append(
+        f"[AUTO] Stopped. {measurement_state['snap_count']} SNAP rows saved."
+    )
     measurement_state["running"] = False
 
 
@@ -313,7 +394,7 @@ HTML_PAGE = """
         .node-table { width: 100%%; border-collapse: collapse; margin-top: 10px; }
         .node-table th, .node-table td { border: 1px solid #ccc; padding: 8px; text-align: left; }
         .node-table th { background: #eee; }
-        .snap-btn { padding: 6px 12px; font-size: 14px; }
+        .role-btn { padding: 6px 12px; font-size: 14px; }
         .section { margin-top: 25px; padding: 15px; border: 1px solid #ddd; border-radius: 6px; }
     </style>
 </head>
@@ -328,11 +409,13 @@ HTML_PAGE = """
     </div>
 
     <div class="section">
-        <h2>2. SNAP from Dedicated Tag</h2>
-        <label for="comment">Comment (optional):</label>
+        <h2>2. SNAP Trigger</h2>
+        <label for="comment">Comment (applied to every row):</label>
         <input type="text" id="comment" placeholder="e.g. Position A, test run 3">
         <br>
-        <button id="startBtn" onclick="startSnap()">START SNAP (Tag)</button>
+        <button id="startBtn" onclick="startSnap()">START SNAP (all tags)</button>
+        <button id="autoBtn" onclick="startAuto()">START AUTO LOG</button>
+        <button id="stopBtn" onclick="stopAuto()" style="display:none;">STOP AUTO LOG</button>
     </div>
 
     <div class="section">
@@ -396,29 +479,63 @@ HTML_PAGE = """
             }
             let html = '<table class="node-table"><tr><th>ID</th><th>Role</th><th>IP</th><th>Net ID</th><th>Action</th></tr>';
             for (const n of nodes) {
-                const snapBtn = n.role === 'ANCHOR'
-                    ? `<button class="snap-btn" onclick="startAnchorSnap('${n.ip}', ${n.id})">SNAP with this</button>`
-                    : '<em>already TAG</em>';
-                html += `<tr><td>${n.id}</td><td>${n.role}</td><td>${n.ip}</td><td>${n.net_id}</td><td>${snapBtn}</td></tr>`;
+                const targetRole = n.role === 'ANCHOR' ? 'TAG' : 'ANCHOR';
+                const targetRoleNum = n.role === 'ANCHOR' ? '0' : '1';
+                const btnText = `Switch to ${targetRole}`;
+                const btn = `<button class="role-btn" onclick="switchRole('${n.ip}', '${targetRoleNum}', '${n.id}', '${targetRole}')">${btnText}</button>`;
+                html += `<tr><td>${n.id}</td><td>${n.role}</td><td>${n.ip}</td><td>${n.net_id}</td><td>${btn}</td></tr>`;
             }
             html += '</table>';
             div.innerHTML = html;
         }
 
-        function startSnap() {
-            const comment = document.getElementById('comment').value;
-            runMeasurement({comment: comment});
+        function switchRole(ip, roleNum, nodeId, targetRole) {
+            if (!confirm(`Switch node ${nodeId} to ${targetRole}?`)) return;
+            fetch('/switch_role', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ip: ip, role: roleNum})
+            }).then(r => r.json()).then(data => {
+                if (data.error) {
+                    alert('ERROR: ' + data.error);
+                    return;
+                }
+                alert(data.message);
+                // Refresh discovery to show updated roles
+                discoverNodes();
+            }).catch(err => {
+                alert('ERROR: ' + err);
+            });
         }
 
-        function startAnchorSnap(ip, nodeId) {
-            if (!confirm(`Switch Anchor ${nodeId} to TAG, run SNAP, then switch back?`)) return;
+        function startSnap() {
             const comment = document.getElementById('comment').value;
-            runMeasurement({comment: comment, anchor_ip: ip});
+            runMeasurement({comment: comment, mode: 'single'});
+        }
+
+        function startAuto() {
+            const comment = document.getElementById('comment').value;
+            runMeasurement({comment: comment, mode: 'auto'});
+        }
+
+        function stopAuto() {
+            fetch('/stop', {method: 'POST'})
+                .then(r => r.json())
+                .then(data => {
+                    if (data.error) {
+                        addLog('ERROR: ' + data.error);
+                        return;
+                    }
+                    addLog('Stop requested...');
+                });
         }
 
         function runMeasurement(payload) {
             const btn = document.getElementById('startBtn');
+            const autoBtn = document.getElementById('autoBtn');
+            const stopBtn = document.getElementById('stopBtn');
             btn.disabled = true;
+            autoBtn.style.display = 'none';
             document.getElementById('downloadLink').style.display = 'none';
             document.getElementById('logBox').innerHTML = '';
             addLog('Starting SNAP...');
@@ -431,12 +548,19 @@ HTML_PAGE = """
                 if (data.error) {
                     addLog('ERROR: ' + data.error);
                     btn.disabled = false;
+                    autoBtn.style.display = 'inline-block';
+                    stopBtn.style.display = 'none';
                     return;
+                }
+                if (payload.mode === 'auto') {
+                    stopBtn.style.display = 'inline-block';
                 }
                 pollInterval = setInterval(pollStatus, 500);
             }).catch(err => {
                 addLog('ERROR: ' + err);
                 btn.disabled = false;
+                autoBtn.style.display = 'inline-block';
+                stopBtn.style.display = 'none';
             });
         }
 
@@ -448,9 +572,11 @@ HTML_PAGE = """
                 for (let i = currentCount; i < data.log.length; i++) {
                     addLog(data.log[i]);
                 }
-                if (!data.running && data.progress >= 100) {
+                if (!data.running) {
                     clearInterval(pollInterval);
                     document.getElementById('startBtn').disabled = false;
+                    document.getElementById('autoBtn').style.display = 'inline-block';
+                    document.getElementById('stopBtn').style.display = 'none';
                     if (data.csv_path) {
                         const link = document.getElementById('downloadLink');
                         link.href = '/download?file=' + encodeURIComponent(data.csv_path);
@@ -488,6 +614,29 @@ def discovery_status():
     })
 
 
+@app.route("/switch_role", methods=["POST"])
+def switch_role():
+    data = request.get_json(silent=True) or {}
+    ip = data.get("ip")
+    role = data.get("role")
+
+    if not ip:
+        return jsonify({"error": "Missing IP"}), 400
+    if role not in ("0", "1"):
+        return jsonify({"error": "Role must be 0 (TAG) or 1 (ANCHOR)"}), 400
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(2.0)
+    try:
+        sock.sendto(f"ROLE,{role}".encode(), (ip, UDP_PORT))
+    except Exception as e:
+        return jsonify({"error": f"Failed to send ROLE,{role} to {ip}: {e}"}), 500
+    sock.close()
+
+    role_name = "TAG" if role == "0" else "ANCHOR"
+    return jsonify({"ok": True, "message": f"Sent ROLE,{role} ({role_name}) to {ip}. Device will reboot and rejoin."})
+
+
 @app.route("/start", methods=["POST"])
 def start():
     if measurement_state["running"]:
@@ -495,31 +644,28 @@ def start():
 
     data = request.get_json(silent=True) or {}
     comment = data.get("comment", "")
-    anchor_ip = data.get("anchor_ip", None)
+    mode = data.get("mode", "single")
 
-    target_ip = None
-    switch_back_ip = None
+    measurement_state["current_comment"] = comment
 
-    if anchor_ip:
-        # Step 1: switch anchor to TAG
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(2.0)
-        try:
-            sock.sendto(b"ROLE,0", (anchor_ip, UDP_PORT))
-        except Exception as e:
-            return jsonify({"error": f"Failed to send ROLE,0 to {anchor_ip}: {e}"}), 500
-        sock.close()
-        time.sleep(ROLE_SWITCH_WAIT)
-        target_ip = anchor_ip
-        switch_back_ip = anchor_ip
-
-    t = threading.Thread(
-        target=run_measurement,
-        args=(comment, target_ip, switch_back_ip),
-        daemon=True,
-    )
+    if mode == "auto":
+        t = threading.Thread(target=run_auto_log, daemon=True)
+    else:
+        t = threading.Thread(
+            target=run_measurement,
+            args=(comment, None),
+            daemon=True,
+        )
     t.start()
     return jsonify({"ok": True})
+
+
+@app.route("/stop", methods=["POST"])
+def stop():
+    if not measurement_state["running"]:
+        return jsonify({"error": "No measurement running"}), 400
+    measurement_state["stop_requested"] = True
+    return jsonify({"ok": True, "message": "Stop requested."})
 
 
 @app.route("/status")
@@ -531,6 +677,7 @@ def status():
         "snap_count": measurement_state["snap_count"],
         "packets_received": measurement_state["packets_received"],
         "csv_path": measurement_state["csv_path"],
+        "mode": measurement_state.get("mode", "single"),
     })
 
 

@@ -1,0 +1,5 @@
+usbipd bind --busid 9-4
+usbipd attach --wsl --busid 9-4
+usbipd detach --busid 1-2
+usbipd list
+python poc_webgui.py
