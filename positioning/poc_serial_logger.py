@@ -11,6 +11,8 @@ Usage:
     python poc_serial_logger.py COM3
     python poc_serial_logger.py /dev/ttyUSB0
 
+While logging, type a comment and press Enter to tag all subsequent SNAP rows.
+
 Requirements:
     pip install pyserial
 """
@@ -19,6 +21,7 @@ import csv
 import os
 import sys
 import time
+import threading
 from datetime import datetime
 
 import serial
@@ -95,11 +98,20 @@ def parse_snap_line(line: str) -> dict | None:
     }
 
 
+def input_thread(comment_ref: list[str], running_ref: list[bool]) -> None:
+    """Background thread: read lines from stdin and update the active comment."""
+    while running_ref[0]:
+        try:
+            line = input()
+        except EOFError:
+            break
+        comment_ref[0] = line.strip()
+        print(f"[COMMENT SET] -> '{comment_ref[0]}'")
+
+
 def main():
     preferred_port = sys.argv[1] if len(sys.argv) >= 2 else None
     port_name = choose_port(preferred_port)
-
-    comment = input("Comment for this log (press Enter to skip): ").strip()
 
     now = datetime.now().strftime("%Y%m%d_%H%M%S")
     csv_path = os.path.join(os.path.dirname(__file__), f"uwb_log_{now}.csv")
@@ -115,20 +127,19 @@ def main():
     ser.reset_input_buffer()
 
     print(f"Logging to: {csv_path}")
+    print("Type a comment and press Enter to tag all subsequent SNAP rows.")
     print("Press Ctrl+C to stop.\n")
+
+    # Shared state with the input thread
+    current_comment = [""]
+    running = [True]
+
+    t = threading.Thread(target=input_thread, args=(current_comment, running), daemon=True)
+    t.start()
 
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
         writer.writeheader()
-        if comment:
-            writer.writerow({
-                "timestamp_ms": "",
-                "type": "COMMENT",
-                "tag_id": "",
-                "source": "",
-                "raw_line": "",
-                "comment": comment,
-            })
 
         snap_count = 0
         try:
@@ -155,6 +166,7 @@ def main():
 
                 row = parse_snap_line(text)
                 if row:
+                    row["comment"] = current_comment[0]
                     writer.writerow(row)
                     f.flush()
                     snap_count += 1
@@ -163,6 +175,7 @@ def main():
         except KeyboardInterrupt:
             print("\nStopped by user.")
         finally:
+            running[0] = False
             ser.close()
             print(f"\n{snap_count} SNAP rows saved to {csv_path}")
 
