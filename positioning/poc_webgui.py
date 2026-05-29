@@ -1,4 +1,4 @@
-"""
+, """
 poc_webgui.py
 =============
 Web GUI for UWB SNAP measurements with node discovery.
@@ -94,13 +94,13 @@ def send_snap_trigger(sock: socket.socket, target_ip: str | None = None) -> None
             measurement_state["log"].append("  -> Sent SNAP to 192.168.4.255 (broadcast)")
         except Exception as e:
             measurement_state["log"].append(f"  -> Broadcast failed: {e}")
-        for i in range(2, 11):
+        for i in range(2, 16):
             ip = f"192.168.4.{i}"
             try:
                 sock.sendto(b"SNAP", (ip, UDP_PORT))
             except Exception:
                 pass
-        measurement_state["log"].append("  -> Sent SNAP to 192.168.4.2-10 (subnet scan)")
+        measurement_state["log"].append("  -> Sent SNAP to 192.168.4.2-15 (subnet scan)")
 
 
 def run_discovery() -> None:
@@ -127,7 +127,7 @@ def run_discovery() -> None:
         sock.sendto(b"PING", ("192.168.4.255", UDP_PORT))
     except Exception:
         pass
-    for i in range(2, 11):
+    for i in range(2, 16):
         try:
             sock.sendto(b"PING", (f"192.168.4.{i}", UDP_PORT))
         except Exception:
@@ -491,6 +491,7 @@ HTML_PAGE = """
 
         function switchRole(ip, roleNum, nodeId, targetRole) {
             if (!confirm(`Switch node ${nodeId} to ${targetRole}?`)) return;
+            document.getElementById('nodeList').innerHTML = `<p><strong>Switching node ${nodeId} to ${targetRole}...</strong> Device will reboot. Please wait ~5s.</p>`;
             fetch('/switch_role', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
@@ -500,9 +501,8 @@ HTML_PAGE = """
                     alert('ERROR: ' + data.error);
                     return;
                 }
-                alert(data.message);
-                // Refresh discovery to show updated roles
-                discoverNodes();
+                // Wait 5 seconds for device to reboot before rediscovering
+                setTimeout(discoverNodes, 5000);
             }).catch(err => {
                 alert('ERROR: ' + err);
             });

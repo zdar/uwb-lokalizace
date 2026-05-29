@@ -25,7 +25,7 @@ Use 2.5.7    Adafruit_SSD1306
 
 //!!!!! CHANGE THIS BEFORE EACH FLASH !!!!!
 // ANY index can be the ANL. Just pick unique numbers 0..9!
-#define UWB_INDEX 8
+#define UWB_INDEX 4
 //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 #define POC_DISABLE_AUTO_CAL 1
@@ -748,9 +748,15 @@ void reconfigureUWB(uint8_t newRole)
         snapActive = false;
     }
 
-    // Minimal reconfiguration — no AT+RESTORE needed for a simple role swap.
-    // PAN ID and capabilities stay intact; only role and reporting change.
+    // Full reconfiguration — AT+RESTORE is required for reliable role switching
+    // because the DW1000 module can get stuck in its previous role otherwise.
+    sendData("AT+RESTORE", 5000, 1);
+    // AT+RESTORE triggers a factory-reset reboot of the DW1000 module.
+    // We must wait for it to come back before sending further commands.
+    delay(8000);
     sendData(config_cmd(), 2000, 1);
+    sendData(cap_cmd(), 2000, 1);
+    sendData(String("AT+SETPAN=") + networkId, 2000, 1);
     if (currentRole == 0) {
         sendData("AT+SETRPT=1", 2000, 1);
     } else {
@@ -760,8 +766,8 @@ void reconfigureUWB(uint8_t newRole)
     sendData("AT+SAVE", 2000, 1);
     sendData("AT+RESTART", 2000, 1);
 
-    // Wait for UWB module to reboot (much shorter than full restore cycle)
-    delay(1500);
+    // Wait for UWB module to fully restore and reboot
+    delay(4000);
 
     // Flush boot messages
     while (SERIAL_AT.available()) SERIAL_AT.read();
@@ -1129,14 +1135,27 @@ registerNode(remoteIp, (uint8_t)tid, knownRole);
         return;
     }
 
-    // ---------- ROLE command (node only) ----------
-    if (systemRole == 0 && len >= 5 && strncmp(buf, "ROLE,", 5) == 0) {
+    // ---------- ROLE command (any node) ----------
+    if (len >= 5 && strncmp(buf, "ROLE,", 5) == 0) {
         int newRole = atoi(buf + 5);
         if (newRole == 0 || newRole == 1) {
             udp.beginPacket(remoteIp, remotePort);
             udp.print("ACK,ROLE,");
             udp.println(newRole);
             udp.endPacket();
+
+            // Show the same "Switching..." screen on OLED as physical button does
+            display.clearDisplay();
+            display.setTextSize(2);
+            display.setTextColor(SSD1306_WHITE);
+            display.setCursor(0, 18);
+            display.println(newRole == 1 ? F("ANCHOR") : F("TAG"));
+            display.setCursor(0, 42);
+            display.setTextSize(1);
+            display.println(F("Switching..."));
+            display.display();
+            delay(800);
+
             reconfigureUWB((uint8_t)newRole);
         }
         return;
