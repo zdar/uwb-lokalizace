@@ -1,4 +1,4 @@
-, """
+"""
 poc_webgui.py
 =============
 Web GUI for UWB SNAP measurements with node discovery.
