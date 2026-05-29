@@ -23,9 +23,9 @@ Use 2.0.0    SPI
 Use 2.5.7    Adafruit_SSD1306
 */
 
-//!!!!! CHANGE THIS BEFORE EACH FLASH !!!!!
+//!!!!! DEFAULT INDEX FOR FIRST BOOT !!!!!
 // ANY index can be the ANL. Just pick unique numbers 0..7!
-#define UWB_INDEX 0
+#define UWB_INDEX_DEFAULT 0
 //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 #define UWB_TAG_COUNT 8
@@ -37,6 +37,7 @@ Use 2.5.7    Adafruit_SSD1306
 #define ROLE_ADDRESS 0
 #define SYSTEM_ROLE_ADDRESS 1
 #define NETID_ADDRESS 2
+#define INDEX_ADDRESS 4
 #define DEFAULT_NETID 1234
 
 #define WIFI_PORT 50000
@@ -54,6 +55,7 @@ Use 2.5.7    Adafruit_SSD1306
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <math.h>
+#include <ArduinoOTA.h>
 
 #define SERIAL_LOG Serial
 #define SERIAL_AT mySerial2
@@ -80,6 +82,8 @@ uint8_t loadSystemRole();
 void saveSystemRole(uint8_t role);
 uint16_t loadNetworkId();
 void saveNetworkId(uint16_t netId);
+uint8_t loadIndex();
+void saveIndex(uint8_t idx);
 void configureUWB();
 void wifiSetup();
 void udpLoop();
@@ -105,12 +109,18 @@ bool getAnchorPos(uint8_t anchorId, float &x, float &y);
 bool solveTrilateration2D(float r0, float r1, float r2,
                           uint8_t a0, uint8_t a1, uint8_t a2,
                           float &outX, float &outY);
+void setupOTA();
+void handleOTA();
 // --------------------------------------------
 
 // Global variables
 uint8_t currentRole = 0;
 uint8_t systemRole = 0;
 uint16_t networkId = DEFAULT_NETID;
+uint8_t uwbIndex = UWB_INDEX_DEFAULT;
+bool otaEnabled = false;
+unsigned long otaEnableTime = 0;
+const unsigned long OTA_TIMEOUT_MS = 120000; // 2 minutes
 
 WiFiUDP udp;
 unsigned long lastHeartbeatTime = 0;
@@ -274,7 +284,7 @@ void autoCalibrateLoop()
         case 0: {
             uint8_t candidate = 255;
             for (int i = 1; i < registryCount; i++) {
-                if (!registry[i].hasPos && registry[i].id != 255 && registry[i].id != (uint8_t)UWB_INDEX) {
+                if (!registry[i].hasPos && registry[i].id != 255 && registry[i].id != (uint8_t)uwbIndex) {
                     if (isNodeAlive(registry[i].id) && registry[i].role == 1) {
                         candidate = registry[i].id;
                         break;
@@ -442,6 +452,7 @@ void setup()
     currentRole = loadRole();
     systemRole = loadSystemRole();
     networkId = loadNetworkId();
+    uwbIndex = loadIndex();
 
     // Let currentRole stay exactly as saved in EEPROM.
     // If EEPROM is blank, loadRole defaults to 1 (Anchor) for safety.
@@ -452,6 +463,8 @@ void setup()
     SERIAL_LOG.println(systemRole);
     SERIAL_LOG.print(F("Loaded network ID: "));
     SERIAL_LOG.println(networkId);
+    SERIAL_LOG.print(F("Loaded UWB index: "));
+    SERIAL_LOG.println(uwbIndex);
 
     pinMode(BUTTON_PIN, INPUT_PULLUP);
     maybeEnterProvisioning();
@@ -463,6 +476,7 @@ void setup()
 
     configureUWB();
     wifiSetup();
+    setupOTA();
 
     if (systemRole == 1) {
         registry[0].ip = WiFi.softAPIP();
@@ -470,11 +484,11 @@ void setup()
         registry[0].x = 0.0f;
         registry[0].y = 0.0f;
         registry[0].hasPos = true;
-        registry[0].id = (uint8_t)UWB_INDEX;
+        registry[0].id = (uint8_t)uwbIndex;
         registryCount = 1;
 
         SERIAL_LOG.print(F("ANL registered at (0.00, 0.00) with ID "));
-        SERIAL_LOG.println(UWB_INDEX);
+        SERIAL_LOG.println(uwbIndex);
     }
 
     displayReadyScreen();
@@ -605,6 +619,7 @@ void loop()
     autoCalibrateLoop();
     monitorWifiHealth();
     printRegistryTable();
+    handleOTA();
 
     if (systemRole == 1) {
         drawAnlDashboard();
@@ -625,9 +640,9 @@ void logoshow(void)
     display.setCursor(0, 0);
 
     if (currentRole == 0) {
-        temp = temp + "T" + UWB_INDEX;
+        temp = temp + "T" + uwbIndex;
     } else {
-        temp = temp + "A" + UWB_INDEX;
+        temp = temp + "A" + uwbIndex;
     }
     temp = temp + "   6.8M";
     display.println(temp);
@@ -750,7 +765,7 @@ String sendData(String command, const int timeout, boolean debug)
 String config_cmd()
 {
     String temp = "AT+SETCFG=";
-    temp = temp + UWB_INDEX;
+    temp = temp + uwbIndex;
     temp = temp + ",";
     temp = temp + currentRole;
     temp = temp + ",1";
@@ -812,6 +827,89 @@ void saveNetworkId(uint16_t netId)
     EEPROM.write(NETID_ADDRESS, netId & 0xFF);
     EEPROM.write(NETID_ADDRESS + 1, (netId >> 8) & 0xFF);
     EEPROM.commit();
+}
+
+uint8_t loadIndex()
+{
+    uint8_t idx = EEPROM.read(INDEX_ADDRESS);
+    if (idx > 7) return UWB_INDEX_DEFAULT;
+    return idx;
+}
+
+void saveIndex(uint8_t idx)
+{
+    if (idx <= 7) {
+        EEPROM.write(INDEX_ADDRESS, idx);
+        EEPROM.commit();
+    }
+}
+
+void setupOTA()
+{
+    ArduinoOTA.onStart([]() {
+        SERIAL_LOG.println(F("[OTA] Start"));
+        display.clearDisplay();
+        display.setTextSize(2);
+        display.setTextColor(SSD1306_WHITE);
+        display.setCursor(0, 18);
+        display.println(F("OTA UPDATE"));
+        display.setCursor(0, 42);
+        display.setTextSize(1);
+        display.println(F("Flashing..."));
+        display.display();
+    });
+    ArduinoOTA.onEnd([]() {
+        SERIAL_LOG.println(F("[OTA] End"));
+        display.clearDisplay();
+        display.setTextSize(2);
+        display.setTextColor(SSD1306_WHITE);
+        display.setCursor(0, 18);
+        display.println(F("DONE"));
+        display.setCursor(0, 42);
+        display.setTextSize(1);
+        display.println(F("Rebooting..."));
+        display.display();
+    });
+    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+        static int lastPct = -1;
+        int pct = (progress * 100) / total;
+        if (pct != lastPct && pct % 10 == 0) {
+            lastPct = pct;
+            SERIAL_LOG.print(F("[OTA] Progress: "));
+            SERIAL_LOG.print(pct);
+            SERIAL_LOG.println(F("%"));
+            display.fillRect(0, 56, 128, 8, SSD1306_BLACK);
+            display.setTextSize(1);
+            display.setCursor(0, 56);
+            display.print(pct);
+            display.print(F("%"));
+            display.display();
+        }
+    });
+    ArduinoOTA.onError([](ota_error_t error) {
+        SERIAL_LOG.print(F("[OTA] Error "));
+        SERIAL_LOG.println(error);
+        display.clearDisplay();
+        display.setTextSize(2);
+        display.setTextColor(SSD1306_WHITE);
+        display.setCursor(0, 18);
+        display.println(F("OTA FAIL"));
+        display.display();
+    });
+    ArduinoOTA.setPassword("rtlsota12");
+    ArduinoOTA.begin();
+    SERIAL_LOG.println(F("[OTA] Ready (password protected)"));
+}
+
+void handleOTA()
+{
+    if (otaEnabled) {
+        ArduinoOTA.handle();
+        if (millis() - otaEnableTime > OTA_TIMEOUT_MS) {
+            otaEnabled = false;
+            SERIAL_LOG.println(F("[OTA] Window expired"));
+        }
+    }
 }
 
 void configureUWB()
@@ -945,7 +1043,7 @@ void udpLoop()
 
 void sendHeartbeat()
 {
-    String payload = String("HB,") + UWB_INDEX + "," + currentRole + "," + networkId;
+    String payload = String("HB,") + uwbIndex + "," + currentRole + "," + networkId;
     udp.beginPacket("192.168.4.1", WIFI_PORT);
     udp.write((const uint8_t *)payload.c_str(), payload.length());
     udp.endPacket();
@@ -1176,7 +1274,7 @@ registerNode(remoteIp, (uint8_t)tid, knownRole);
         registerNode(remoteIp, nodeId, nodeRole);
         udp.beginPacket(remoteIp, remotePort);
         udp.print("ACK,HB,");
-        udp.println(UWB_INDEX);
+        udp.println(uwbIndex);
         udp.endPacket();
         return;
     }
@@ -1192,6 +1290,66 @@ registerNode(remoteIp, (uint8_t)tid, knownRole);
             udp.endPacket();
             delay(500);
             ESP.restart();
+        }
+        return;
+    }
+
+    // ---------- OTA command (any node) ----------
+    if (len >= 4 && strncmp(buf, "OTA,", 4) == 0) {
+        const char* pw = buf + 4;
+        if (strncmp(pw, "rtlsota12", 9) == 0) {
+            otaEnabled = true;
+            otaEnableTime = millis();
+            udp.beginPacket(remoteIp, remotePort);
+            udp.print("ACK,OTA,OK,");
+            udp.println(uwbIndex);
+            udp.endPacket();
+            SERIAL_LOG.println(F("[OTA] Window opened (2 min)"));
+            display.clearDisplay();
+            display.setTextSize(2);
+            display.setTextColor(SSD1306_WHITE);
+            display.setCursor(0, 18);
+            display.println(F("OTA READY"));
+            display.setCursor(0, 42);
+            display.setTextSize(1);
+            display.println(F("2 min window"));
+            display.display();
+        } else {
+            udp.beginPacket(remoteIp, remotePort);
+            udp.print("ERR,OTA,BADPASS");
+            udp.endPacket();
+        }
+        return;
+    }
+
+    // ---------- ID command (any node) ----------
+    if (len >= 3 && strncmp(buf, "ID,", 3) == 0) {
+        int newId = atoi(buf + 3);
+        if (newId >= 0 && newId <= 7) {
+            saveIndex((uint8_t)newId);
+            uwbIndex = (uint8_t)newId;
+            udp.beginPacket(remoteIp, remotePort);
+            udp.print("ACK,ID,");
+            udp.println(newId);
+            udp.endPacket();
+            SERIAL_LOG.print(F("[ID] Set to "));
+            SERIAL_LOG.println(newId);
+            display.clearDisplay();
+            display.setTextSize(2);
+            display.setTextColor(SSD1306_WHITE);
+            display.setCursor(0, 18);
+            display.print(F("ID="));
+            display.println(newId);
+            display.setCursor(0, 42);
+            display.setTextSize(1);
+            display.println(F("Rebooting..."));
+            display.display();
+            delay(800);
+            ESP.restart();
+        } else {
+            udp.beginPacket(remoteIp, remotePort);
+            udp.print("ERR,ID,RANGE");
+            udp.endPacket();
         }
         return;
     }
