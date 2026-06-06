@@ -27,3 +27,4 @@ Thumbs.db
 .env
 :USERPROFILE
 .continue
+src/wifi_secrets.h

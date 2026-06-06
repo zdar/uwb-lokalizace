@@ -38,12 +38,11 @@ Use 2.5.7    Adafruit_SSD1306
 #define SYSTEM_ROLE_ADDRESS 1
 #define NETID_ADDRESS 2
 #define INDEX_ADDRESS 4
+#define HOME_WIFI_FLAG_ADDRESS 5
 #define DEFAULT_NETID 1234
 
 #define WIFI_PORT 50000
 #define HEARTBEAT_INTERVAL 3000
-#define AP_CHANNEL 6
-#define WIFI_PASSWORD "rtlsnet12"
 #define MAX_REGISTRY_ENTRIES 16
 #define NODE_TIMEOUT_MS 10000
 
@@ -56,6 +55,7 @@ Use 2.5.7    Adafruit_SSD1306
 #include <WiFiUdp.h>
 #include <math.h>
 #include <ArduinoOTA.h>
+#include "wifi_secrets.h"
 
 #define SERIAL_LOG Serial
 #define SERIAL_AT mySerial2
@@ -84,6 +84,8 @@ uint16_t loadNetworkId();
 void saveNetworkId(uint16_t netId);
 uint8_t loadIndex();
 void saveIndex(uint8_t idx);
+bool loadHomeWifiFlag();
+void saveHomeWifiFlag(bool flag);
 void configureUWB();
 void wifiSetup();
 void udpLoop();
@@ -121,6 +123,7 @@ uint8_t uwbIndex = UWB_INDEX_DEFAULT;
 bool otaEnabled = false;
 unsigned long otaEnableTime = 0;
 const unsigned long OTA_TIMEOUT_MS = 120000; // 2 minutes
+bool useHomeWifi = false;  // Flag to use home WiFi instead of ANL network
 
 WiFiUDP udp;
 unsigned long lastHeartbeatTime = 0;
@@ -453,6 +456,7 @@ void setup()
     systemRole = loadSystemRole();
     networkId = loadNetworkId();
     uwbIndex = loadIndex();
+    useHomeWifi = loadHomeWifiFlag();
 
     // Let currentRole stay exactly as saved in EEPROM.
     // If EEPROM is blank, loadRole defaults to 1 (Anchor) for safety.
@@ -465,6 +469,8 @@ void setup()
     SERIAL_LOG.println(networkId);
     SERIAL_LOG.print(F("Loaded UWB index: "));
     SERIAL_LOG.println(uwbIndex);
+    SERIAL_LOG.print(F("Home WiFi mode: "));
+    SERIAL_LOG.println(useHomeWifi ? F("YES") : F("NO"));
 
     pinMode(BUTTON_PIN, INPUT_PULLUP);
     maybeEnterProvisioning();
@@ -844,6 +850,24 @@ void saveIndex(uint8_t idx)
     }
 }
 
+bool loadHomeWifiFlag()
+{
+#if ENABLE_HOME_WIFI
+    uint8_t flag = EEPROM.read(HOME_WIFI_FLAG_ADDRESS);
+    return (flag == 1);
+#else
+    return false;
+#endif
+}
+
+void saveHomeWifiFlag(bool flag)
+{
+#if ENABLE_HOME_WIFI
+    EEPROM.write(HOME_WIFI_FLAG_ADDRESS, flag ? 1 : 0);
+    EEPROM.commit();
+#endif
+}
+
 void setupOTA()
 {
     ArduinoOTA.onStart([]() {
@@ -896,7 +920,7 @@ void setupOTA()
         display.println(F("OTA FAIL"));
         display.display();
     });
-    ArduinoOTA.setPassword("rtlsota12");
+    ArduinoOTA.setPassword(OTA_PASSWORD);
     ArduinoOTA.begin();
     SERIAL_LOG.println(F("[OTA] Ready (password protected)"));
 }
@@ -945,12 +969,30 @@ void wifiSetup()
         SERIAL_LOG.print(F("Starting ANL AP: "));
         SERIAL_LOG.println(ssid);
         WiFi.mode(WIFI_AP);
-        WiFi.softAP(ssid.c_str(), WIFI_PASSWORD, AP_CHANNEL);
+        WiFi.softAP(ssid.c_str(), WIFI_AP_PASSWORD, WIFI_AP_CHANNEL);
         IPAddress apIp = WiFi.softAPIP();
         SERIAL_LOG.print(F("AP IP: "));
         SERIAL_LOG.println(apIp);
     } else {
-        String ssid = ssidForNetId(networkId);
+        // Determine which WiFi network to join
+        String ssid;
+        String password;
+        
+#if ENABLE_HOME_WIFI
+        if (useHomeWifi) {
+            ssid = HOME_WIFI_SSID;
+            password = HOME_WIFI_PASSWORD;
+            SERIAL_LOG.println(F("Using HOME WiFi mode"));
+        } else {
+            ssid = ssidForNetId(networkId);
+            password = WIFI_AP_PASSWORD;
+            SERIAL_LOG.println(F("Using ANL WiFi mode"));
+        }
+#else
+        ssid = ssidForNetId(networkId);
+        password = WIFI_AP_PASSWORD;
+#endif
+
         SERIAL_LOG.print(F("Joining network: "));
         SERIAL_LOG.println(ssid);
         display.clearDisplay();
@@ -976,7 +1018,7 @@ void wifiSetup()
             SERIAL_LOG.print(attempt + 1);
             SERIAL_LOG.println(F("..."));
 
-            WiFi.begin(ssid.c_str(), WIFI_PASSWORD);
+            WiFi.begin(ssid.c_str(), password.c_str());
             unsigned long start = millis();
             while (millis() - start < 15000) {
                 if (WiFi.status() == WL_CONNECTED) break;
@@ -1019,7 +1061,11 @@ void wifiSetup()
             display.print(F("SSID: "));
             display.println(ssid);
             display.setCursor(0, 34);
+#if ENABLE_HOME_WIFI
+            display.println(useHomeWifi ? F("Check home WiFi") : F("Check ANL NETID"));
+#else
             display.println(F("Check ANL NETID"));
+#endif
             display.setCursor(0, 50);
             display.println(F("Restart to retry"));
             display.display();
@@ -1297,7 +1343,7 @@ registerNode(remoteIp, (uint8_t)tid, knownRole);
     // ---------- OTA command (any node) ----------
     if (len >= 4 && strncmp(buf, "OTA,", 4) == 0) {
         const char* pw = buf + 4;
-        if (strncmp(pw, "rtlsota12", 9) == 0) {
+        if (strncmp(pw, OTA_PASSWORD, strlen(OTA_PASSWORD)) == 0) {
             otaEnabled = true;
             otaEnableTime = millis();
             udp.beginPacket(remoteIp, remotePort);
@@ -1487,8 +1533,17 @@ void provisioningMenu()
             if (stage == 0) {
                 systemRole = (systemRole == 1) ? 0 : 1;
             } else if (stage == 1) {
+#if ENABLE_HOME_WIFI
+                if (systemRole == 0) {
+                    useHomeWifi = !useHomeWifi;
+                } else {
+                    networkId++;
+                    if (networkId > 9999) networkId = 1000;
+                }
+#else
                 networkId++;
                 if (networkId > 9999) networkId = 1000;
+#endif
             }
         } else if (event == 2) {
             if (stage == 0) {
@@ -1496,19 +1551,35 @@ void provisioningMenu()
             } else {
                 saveSystemRole(systemRole);
                 saveNetworkId(networkId);
+                saveHomeWifiFlag(useHomeWifi);
                 display.clearDisplay();
                 display.setTextSize(1);
                 display.setTextColor(SSD1306_WHITE);
                 display.setCursor(0, 10);
                 display.println(F("PROVISION SAVED"));
-                display.setCursor(0, 30);
+                display.setCursor(0, 22);
                 display.print(F("ROLE: "));
                 display.println(systemRole == 1 ? F("ANL") : F("NODE"));
-                display.setCursor(0, 45);
+#if ENABLE_HOME_WIFI
+                if (systemRole == 0) {
+                    display.setCursor(0, 34);
+                    display.print(F("WiFi: "));
+                    display.println(useHomeWifi ? F("HOME") : F("ANL"));
+                } else {
+                    display.setCursor(0, 34);
+                    display.print(F("NETID: "));
+                    display.println(netIdString(networkId));
+                }
+#else
+                display.setCursor(0, 34);
                 display.print(F("NETID: "));
                 display.println(netIdString(networkId));
+#endif
+                display.setCursor(0, 50);
+                display.println(F("Rebooting..."));
                 display.display();
-                delay(3000);
+                delay(2000);
+                ESP.restart();
                 done = true;
             }
         }
@@ -1552,7 +1623,34 @@ void showProvisioningScreen(uint8_t stage)
         display.println(F("PRESS BTN TO TOGGLE"));
         display.setCursor(0, 58);
         display.println(F("HOLD TO NEXT"));
-    } else {
+    } else if (stage == 1) {
+#if ENABLE_HOME_WIFI
+        if (systemRole == 0) {
+            // NODE mode - show WiFi source selection
+            display.println(F("SELECT WIFI"));
+            display.setCursor(0, 12);
+            display.println(F("SOURCE:"));
+            display.setCursor(0, 28);
+            display.setTextSize(2);
+            display.println(useHomeWifi ? F("HOME") : F("ANL"));
+            display.setTextSize(1);
+            display.setCursor(0, 50);
+            display.println(F("PRESS: TOGGLE"));
+            display.setCursor(0, 58);
+            display.println(F("HOLD: SAVE"));
+        } else {
+            // ANL mode - show Network ID
+            display.println(F("SET NETWORK ID"));
+            display.setCursor(0, 22);
+            display.setTextSize(2);
+            display.println(netIdString(networkId));
+            display.setTextSize(1);
+            display.setCursor(0, 50);
+            display.println(F("PRESS: +1"));
+            display.setCursor(0, 58);
+            display.println(F("HOLD: SAVE"));
+        }
+#else
         display.println(F("SET NETWORK ID"));
         display.setCursor(0, 22);
         display.setTextSize(2);
@@ -1562,6 +1660,7 @@ void showProvisioningScreen(uint8_t stage)
         display.println(F("PRESS BTN TO INCREMENT"));
         display.setCursor(0, 58);
         display.println(F("HOLD TO SAVE"));
+#endif
     }
     display.display();
 }
@@ -1636,18 +1735,44 @@ void monitorWifiHealth()
         SERIAL_LOG.println(F("[WiFi] CONNECTION LOST - Starting reconnect..."));
         wifiWasConnected = false;
         wifiLostTime = now;
-        String ssid = ssidForNetId(networkId);
-        WiFi.begin(ssid.c_str(), WIFI_PASSWORD);
+        String ssid;
+        String password;
+#if ENABLE_HOME_WIFI
+        if (useHomeWifi) {
+            ssid = HOME_WIFI_SSID;
+            password = HOME_WIFI_PASSWORD;
+        } else {
+            ssid = ssidForNetId(networkId);
+            password = WIFI_AP_PASSWORD;
+        }
+#else
+        ssid = ssidForNetId(networkId);
+        password = WIFI_AP_PASSWORD;
+#endif
+        WiFi.begin(ssid.c_str(), password.c_str());
     } else if (!isConnected && !wifiWasConnected) {
         unsigned long downtime = now - wifiLostTime;
         if (downtime > WIFI_RECONNECT_TIMEOUT) {
             SERIAL_LOG.print(F("[WiFi] Still disconnected after "));
             SERIAL_LOG.print(WIFI_RECONNECT_TIMEOUT / 1000);
             SERIAL_LOG.println(F("s - retrying..."));
-            String ssid = ssidForNetId(networkId);
+            String ssid;
+            String password;
+#if ENABLE_HOME_WIFI
+            if (useHomeWifi) {
+                ssid = HOME_WIFI_SSID;
+                password = HOME_WIFI_PASSWORD;
+            } else {
+                ssid = ssidForNetId(networkId);
+                password = WIFI_AP_PASSWORD;
+            }
+#else
+            ssid = ssidForNetId(networkId);
+            password = WIFI_AP_PASSWORD;
+#endif
             WiFi.disconnect();
             delay(100);
-            WiFi.begin(ssid.c_str(), WIFI_PASSWORD);
+            WiFi.begin(ssid.c_str(), password.c_str());
             wifiLostTime = now;
         }
     }
