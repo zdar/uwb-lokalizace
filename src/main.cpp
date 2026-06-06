@@ -1400,6 +1400,17 @@ registerNode(remoteIp, (uint8_t)tid, knownRole);
         return;
     }
 
+    // ---------- PING: discovery request (any node) ----------
+    if (len >= 4 && strncmp(buf, "PING", 4) == 0) {
+        char pong[64];
+        snprintf(pong, sizeof(pong), "PONG,%d,%d,%d,%lu",
+                 uwbIndex, currentRole, networkId, millis());
+        udp.beginPacket(remoteIp, remotePort);
+        udp.print(pong);
+        udp.endPacket();
+        return;
+    }
+
     // ---------- ACK to node (ignored silently) ----------
     if (systemRole == 0 && len >= 4 && strncmp(buf, "ACK,", 4) == 0) {
         return;

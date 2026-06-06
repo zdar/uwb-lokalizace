@@ -33,8 +33,32 @@ from pathlib import Path
 # Config
 # ---------------------------------------------------------------------------
 UDP_PORT = 50000
-BROADCAST = "192.168.4.255"
 OTA_PASSWORD = "rtlsota12"
+
+
+def get_broadcast_address():
+    """Auto-detect the broadcast address of the current network interface."""
+    try:
+        # Create a UDP socket and connect to a public address to determine
+        # which interface/route would be used for outbound traffic.
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(0.5)
+        s.connect(("8.8.8.8", 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+
+        # Parse the local IP to compute the /24 broadcast address.
+        # This assumes a typical home network is /24 (255.255.255.0).
+        parts = local_ip.split(".")
+        broadcast = f"{parts[0]}.{parts[1]}.{parts[2]}.255"
+        print(f"[NET] Local IP: {local_ip}  Broadcast: {broadcast}")
+        return broadcast
+    except Exception as e:
+        print(f"[NET] Could not auto-detect broadcast ({e}), falling back to 192.168.4.255")
+        return "192.168.4.255"
+
+
+BROADCAST = get_broadcast_address()
 OTA_WINDOW_S = 120  # must match OTA_TIMEOUT_MS in firmware
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 FIRMWARE_BIN = PROJECT_ROOT / ".pio" / "build" / "esp32s3-ota" / "firmware.bin"
@@ -125,15 +149,73 @@ def set_node_id(ip, new_id, timeout=2.0):
 # Flashing
 # ---------------------------------------------------------------------------
 
+def is_wsl():
+    """Check if running inside Windows Subsystem for Linux."""
+    return "microsoft" in os.uname().release.lower() or os.path.exists("/proc/sys/fs/binfmt_misc/WSLInterop")
+
+
+def get_windows_wifi_ip():
+    """Get Windows host WiFi IP from inside WSL."""
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-Command",
+             "(Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.InterfaceAlias -like '*Wi-Fi*' -or $_.InterfaceAlias -like '*Wireless*' -or $_.InterfaceAlias -like '*WLAN*' }).IPAddress"],
+            capture_output=True, text=True, timeout=5
+        )
+        ip = result.stdout.strip().split("\n")[0].strip()
+        if ip:
+            print(f"[WSL] Detected Windows WiFi IP: {ip}")
+            return ip
+    except Exception as e:
+        print(f"[WSL] Could not auto-detect Windows WiFi IP: {e}")
+    return None
+
+
+def find_espota():
+    """Find the espota.py script inside PlatformIO packages."""
+    pio_packages = Path.home() / ".platformio" / "packages"
+    for framework in pio_packages.glob("framework-arduinoespressif*"):
+        candidate = framework / "tools" / "espota.py"
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
 def flash_node(ip, bin_path):
     """Run PlatformIO upload to a single IP via espota."""
-    cmd = [
-        "pio", "run", "-e", "esp32s3-ota", "-t", "upload",
-        f"--upload-port={ip}",
-    ]
     env = os.environ.copy()
     env["PLATFORMIO_BUILD_DIR"] = str(PROJECT_ROOT / ".pio")
-    print(f"  [FLASH] Starting {ip} ...")
+
+    # WSL fix: espota binds to WSL's virtual IP, but the ESP32 is on the
+    # Windows WiFi network and can't reach it. We must call espota.py
+    # directly with --host_ip instead of going through 'pio run'.
+    if is_wsl():
+        host_ip = get_windows_wifi_ip()
+        espota_path = find_espota()
+        if host_ip and espota_path:
+            cmd = [
+                "python", espota_path,
+                "-i", ip,
+                "-I", host_ip,
+                "-a", OTA_PASSWORD,
+                "-f", str(bin_path),
+                "-r",  # show progress
+                "-d",  # debug output
+            ]
+            print(f"  [FLASH] Starting {ip} via espota.py (WSL fix) ...")
+        else:
+            print("[WSL] WARNING: Could not detect Windows WiFi IP or find espota.py.")
+            print("[WSL] OTA may fail. Try running from Windows PowerShell instead.")
+            cmd = [
+                "pio", "run", "-e", "esp32s3-ota", "-t", "upload",
+                f"--upload-port={ip}",
+            ]
+    else:
+        cmd = [
+            "pio", "run", "-e", "esp32s3-ota", "-t", "upload",
+            f"--upload-port={ip}",
+        ]
+
     result = subprocess.run(cmd, cwd=PROJECT_ROOT, capture_output=True, text=True, env=env)
     if result.returncode == 0:
         print(f"  [FLASH] {ip} SUCCESS")
