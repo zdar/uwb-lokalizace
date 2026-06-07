@@ -3,7 +3,7 @@ For ESP32S3 UWB AT Demo - MERGED FIRMWARE
 Identical binary on all nodes. Behavior set by provisioning:
 - System Role: ANL (AP) or NODE (STA)
 - UWB Role:    TAG (0) or ANCHOR (1) via AT+ROLE or EEPROM
-- UWB_INDEX:   0..7 (must be UNIQUE per node, ANL can be any index)
+- UWB_INDEX:   0..9 (must be UNIQUE per node, ANL can be any index)
 
 Auto-calibration sequence (ANL only):
 1. Picks next unfixed node, sends ROLE,0 -> becomes temp Tag.
@@ -24,11 +24,11 @@ Use 2.5.7    Adafruit_SSD1306
 */
 
 //!!!!! DEFAULT INDEX FOR FIRST BOOT !!!!!
-// ANY index can be the ANL. Just pick unique numbers 0..7!
-#define UWB_INDEX_DEFAULT 0
+// ANY index can be the ANL. Just pick unique numbers 0..9!
+#define UWB_INDEX_DEFAULT 8
 //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
-#define UWB_TAG_COUNT 8
+#define UWB_TAG_COUNT 10
 #define MAX_CAL_SAMPLES 5
 
 #define BUTTON_PIN 0
@@ -159,8 +159,8 @@ struct {
     uint8_t phase;             // 0=idle, 1=wait reboot, 2=collecting, 3=wait revert
     unsigned long timer;
     IPAddress targetIp;        // IP at the time ROLE,0 was sent (fallback)
-    float samples[8][MAX_CAL_SAMPLES];
-    uint8_t sampleCount[8];
+    float samples[10][MAX_CAL_SAMPLES];
+    uint8_t sampleCount[10];
 } cal = { 255, 0, 0, IPAddress(), {{0}}, {0} };
 // ============================================================
 
@@ -335,11 +335,11 @@ void autoCalibrateLoop()
         case 2: {
             if (millis() - cal.timer < COLLECT_TIME) return;
 
-            float vr[8];
-            uint8_t va[8];
+            float vr[10];
+            uint8_t va[10];
             int vc = 0;
 
-            for (int a = 0; a < 8; a++) {
+            for (int a = 0; a < 10; a++) {
                 if (cal.sampleCount[a] == 0) continue;
                 float r = medianSample((uint8_t)a);
                 if (r <= 0.0f) continue;
@@ -350,7 +350,7 @@ void autoCalibrateLoop()
                         break;
                     }
                 }
-                if (fixed && vc < 8) {
+                if (fixed && vc < 10) {
                     va[vc] = (uint8_t)a;
                     vr[vc] = r;
                     vc++;
@@ -516,7 +516,7 @@ void loop()
 {
     // ==========================================
     // BOOT BUTTON: short press = toggle reporting (anchors only)
-    //              long hold 2.5s = toggle TAG/ANCHOR and reboot
+    //              long hold 2.5s = toggle TAG/ANCHOR (no reboot)
     // ==========================================
     static bool btnWasDown = false;
     static unsigned long btnDownT = 0;
@@ -535,19 +535,18 @@ void loop()
             unsigned long held = millis() - btnDownT;
             if (!roleToggleDone && held >= 2500) {
                 roleToggleDone = true;
-                uint8_t newRole = (currentRole == 0) ? 1 : 0;
-                saveRole(newRole);
+                currentRole = (currentRole == 0) ? 1 : 0;
                 display.clearDisplay();
                 display.setTextSize(2);
                 display.setTextColor(SSD1306_WHITE);
                 display.setCursor(0, 18);
-                display.println(newRole == 1 ? F("ANCHOR") : F("TAG"));
+                display.println(currentRole == 1 ? F("ANCHOR") : F("TAG"));
                 display.setCursor(0, 42);
                 display.setTextSize(1);
-                display.println(F("Rebooting..."));
+                display.println(F("Configuring..."));
                 display.display();
-                delay(800);
-                ESP.restart();
+                configureUWB();
+                displayReadyScreen();
             }
         } else {
             unsigned long held = millis() - btnDownT;
@@ -797,10 +796,8 @@ uint8_t loadRole()
 
 void saveRole(uint8_t role)
 {
-    if (role == 0 || role == 1) {
-        EEPROM.write(ROLE_ADDRESS, role);
-        EEPROM.commit();
-    }
+    // EEPROM writes disabled to preserve flash lifetime.
+    (void)role;
 }
 
 uint8_t loadSystemRole()
@@ -812,10 +809,8 @@ uint8_t loadSystemRole()
 
 void saveSystemRole(uint8_t role)
 {
-    if (role == 0 || role == 1) {
-        EEPROM.write(SYSTEM_ROLE_ADDRESS, role);
-        EEPROM.commit();
-    }
+    // EEPROM writes disabled to preserve flash lifetime.
+    (void)role;
 }
 
 uint16_t loadNetworkId()
@@ -829,25 +824,21 @@ uint16_t loadNetworkId()
 
 void saveNetworkId(uint16_t netId)
 {
-    if (netId < 1000) netId = DEFAULT_NETID;
-    EEPROM.write(NETID_ADDRESS, netId & 0xFF);
-    EEPROM.write(NETID_ADDRESS + 1, (netId >> 8) & 0xFF);
-    EEPROM.commit();
+    // EEPROM writes disabled to preserve flash lifetime.
+    (void)netId;
 }
 
 uint8_t loadIndex()
 {
     uint8_t idx = EEPROM.read(INDEX_ADDRESS);
-    if (idx > 7) return UWB_INDEX_DEFAULT;
+    if (idx > 9) return UWB_INDEX_DEFAULT;
     return idx;
 }
 
 void saveIndex(uint8_t idx)
 {
-    if (idx <= 7) {
-        EEPROM.write(INDEX_ADDRESS, idx);
-        EEPROM.commit();
-    }
+    // EEPROM writes disabled to preserve flash lifetime.
+    (void)idx;
 }
 
 bool loadHomeWifiFlag()
@@ -862,10 +853,8 @@ bool loadHomeWifiFlag()
 
 void saveHomeWifiFlag(bool flag)
 {
-#if ENABLE_HOME_WIFI
-    EEPROM.write(HOME_WIFI_FLAG_ADDRESS, flag ? 1 : 0);
-    EEPROM.commit();
-#endif
+    // EEPROM writes disabled to preserve flash lifetime.
+    (void)flag;
 }
 
 void setupOTA()
@@ -1134,11 +1123,11 @@ void handleIncomingUdp()
         if (!p) return;
         p += 7;
 
-        float ranges[8] = {0};
+        float ranges[10] = {0};
         int rc = 0;
         char tmp[12];
         int ti = 0;
-        while (*p && rc < 8) {
+        while (*p && rc < 10) {
             if (*p == '-' || (*p >= '0' && *p <= '9')) {
                 if (ti < 11) tmp[ti++] = *p;
             } else if (*p == ',' || *p == ')') {
@@ -1156,10 +1145,10 @@ void handleIncomingUdp()
         if (!p) return;
         p += 7;
 
-        int ancids[8] = {-1};
+        int ancids[10] = {-1};
         int ac = 0;
         ti = 0;
-        while (*p && ac < 8) {
+        while (*p && ac < 10) {
             if (*p == '-' || (*p >= '0' && *p <= '9')) {
                 if (ti < 11) tmp[ti++] = *p;
             } else if (*p == ',' || *p == ')') {
@@ -1189,7 +1178,7 @@ registerNode(remoteIp, (uint8_t)tid, knownRole);
             
             int pairs = (rc < ac) ? rc : ac;
             for (int j = 0; j < pairs; j++) {
-                if (ancids[j] >= 0 && ancids[j] < 8) {
+                if (ancids[j] >= 0 && ancids[j] < 10) {
                     uint8_t a = (uint8_t)ancids[j];
                     if (cal.sampleCount[a] < MAX_CAL_SAMPLES) {
                         cal.samples[a][cal.sampleCount[a]++] = ranges[j];
@@ -1208,12 +1197,12 @@ registerNode(remoteIp, (uint8_t)tid, knownRole);
 
         // ---------- Option C: solve position on ANL and broadcast ----------
         {
-            float vr[8];
-            uint8_t va[8];
+            float vr[10];
+            uint8_t va[10];
             int vc = 0;
             int pairs = (rc < ac) ? rc : ac;
             for (int j = 0; j < pairs; j++) {
-                if (ancids[j] >= 0 && ancids[j] < 8 && ranges[j] > 0) {
+                if (ancids[j] >= 0 && ancids[j] < 10 && ranges[j] > 0) {
                     uint8_t a = (uint8_t)ancids[j];
                     bool fixed = false;
                     for (int ri = 0; ri < registryCount; ri++) {
@@ -1222,7 +1211,7 @@ registerNode(remoteIp, (uint8_t)tid, knownRole);
                             break;
                         }
                     }
-                    if (fixed && vc < 8) {
+                    if (fixed && vc < 10) {
                         va[vc] = a;
                         vr[vc] = ranges[j];
                         vc++;
@@ -1371,7 +1360,7 @@ registerNode(remoteIp, (uint8_t)tid, knownRole);
     // ---------- ID command (any node) ----------
     if (len >= 3 && strncmp(buf, "ID,", 3) == 0) {
         int newId = atoi(buf + 3);
-        if (newId >= 0 && newId <= 7) {
+        if (newId >= 0 && newId <= 9) {
             saveIndex((uint8_t)newId);
             uwbIndex = (uint8_t)newId;
             udp.beginPacket(remoteIp, remotePort);

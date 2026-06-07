@@ -151,7 +151,10 @@ def set_node_id(ip, new_id, timeout=2.0):
 
 def is_wsl():
     """Check if running inside Windows Subsystem for Linux."""
-    return "microsoft" in os.uname().release.lower() or os.path.exists("/proc/sys/fs/binfmt_misc/WSLInterop")
+    try:
+        return "microsoft" in os.uname().release.lower() or os.path.exists("/proc/sys/fs/binfmt_misc/WSLInterop")
+    except AttributeError:
+        return False
 
 
 def get_windows_wifi_ip():
@@ -194,7 +197,7 @@ def flash_node(ip, bin_path):
         espota_path = find_espota()
         if host_ip and espota_path:
             cmd = [
-                "python", espota_path,
+                sys.executable, espota_path,
                 "-i", ip,
                 "-I", host_ip,
                 "-a", OTA_PASSWORD,
@@ -207,14 +210,28 @@ def flash_node(ip, bin_path):
             print("[WSL] WARNING: Could not detect Windows WiFi IP or find espota.py.")
             print("[WSL] OTA may fail. Try running from Windows PowerShell instead.")
             cmd = [
-                "pio", "run", "-e", "esp32s3-ota", "-t", "upload",
+                sys.executable, "-m", "platformio", "run", "-e", "esp32s3-ota", "-t", "upload",
                 f"--upload-port={ip}",
             ]
     else:
-        cmd = [
-            "pio", "run", "-e", "esp32s3-ota", "-t", "upload",
-            f"--upload-port={ip}",
-        ]
+        # Native Windows / Linux — use espota.py directly to avoid parallel build
+        # collisions in the shared .pio directory when flashing multiple nodes.
+        espota_path = find_espota()
+        if espota_path:
+            cmd = [
+                sys.executable, espota_path,
+                "-i", ip,
+                "-a", OTA_PASSWORD,
+                "-f", str(bin_path),
+                "-r",  # show progress
+            ]
+            print(f"  [FLASH] Starting {ip} via espota.py ...")
+        else:
+            print("[WARN] Could not find espota.py; falling back to 'pio run' (may collide in parallel)")
+            cmd = [
+                sys.executable, "-m", "platformio", "run", "-e", "esp32s3-ota", "-t", "upload",
+                f"--upload-port={ip}",
+            ]
 
     result = subprocess.run(cmd, cwd=PROJECT_ROOT, capture_output=True, text=True, env=env)
     if result.returncode == 0:
@@ -230,7 +247,7 @@ def flash_node(ip, bin_path):
 def build_firmware():
     """Build the esp32s3-ota environment to produce firmware.bin."""
     print("[BUILD] Building firmware ...")
-    cmd = ["pio", "run", "-e", "esp32s3-ota"]
+    cmd = [sys.executable, "-m", "platformio", "run", "-e", "esp32s3-ota"]
     result = subprocess.run(cmd, cwd=PROJECT_ROOT, capture_output=True, text=True)
     if result.returncode != 0:
         print("[BUILD] FAILED")
@@ -254,6 +271,7 @@ def main():
     parser.add_argument("--id", type=int, help="Set UWB index for --ip target")
     parser.add_argument("--skip-build", action="store_true", help="Skip PlatformIO build")
     parser.add_argument("--skip-discover", action="store_true", help="Skip discovery (use --ip)")
+    parser.add_argument("--auto-id", action="store_true", help="Automatically assign IDs 0..N-1 (default: disabled to protect EEPROM)")
     args = parser.parse_args()
 
     if not args.skip_build:
@@ -273,7 +291,7 @@ def main():
         print("[ERR] Need --ip or allow discovery")
         sys.exit(1)
 
-    # --- Optional ID configuration ---
+    # --- Optional ID configuration (manual single node) ---
     if args.id is not None and args.ip and len(args.ip) == 1:
         ip = args.ip[0]
         print(f"[ID] Setting {ip} to ID={args.id}")
@@ -282,6 +300,30 @@ def main():
             sys.exit(0)
         else:
             sys.exit(1)
+
+    # --- Automatic ID assignment (0 .. N-1) ---
+    if args.auto_id and not args.id:
+        sorted_ips = sorted(nodes.keys(), key=lambda ip: [int(x) for x in ip.split(".")])
+        print(f"[AUTO-ID] Assigning IDs 0..{len(sorted_ips)-1} to {len(sorted_ips)} node(s) ...")
+        for new_id, ip in enumerate(sorted_ips):
+            set_node_id(ip, new_id)
+            time.sleep(0.2)
+        print("[AUTO-ID] Waiting 40s for nodes to reboot ...")
+        time.sleep(40)
+        print("[AUTO-ID] Rediscovering after reboot ...")
+        nodes = discover_nodes()
+        if len(nodes) < len(sorted_ips):
+            print(f"[AUTO-ID] Only found {len(nodes)}/{len(sorted_ips)}. Retrying in 15s ...")
+            time.sleep(15)
+            nodes = discover_nodes()
+        # If user explicitly passed --ip, rediscovery may have pulled in the
+        # whole network via broadcast. Keep only the targeted IPs.
+        if args.ip:
+            nodes = {ip: info for ip, info in nodes.items() if ip in args.ip}
+        if not nodes:
+            print("[AUTO-ID] No nodes found after reboot. Abort.")
+            sys.exit(1)
+        print(f"[AUTO-ID] Found {len(nodes)} node(s) after reboot")
 
     # --- Enable OTA on all nodes ---
     print("[OTA] Opening windows ...")
