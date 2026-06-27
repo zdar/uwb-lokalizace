@@ -62,7 +62,27 @@ The ANL will create a WiFi AP named `RTLS-NET-<NNNN>`. Anchors will join it auto
 
 ## 4. Fully automatic 3D calibration
 
-The ANL does everything. It picks one anchor at a time, switches it to TAG mode, collects ranges to the anchors that are already fixed, solves its 3D position, and switches it back.
+> **Experimental.** The ANL does everything, but role switching can be unreliable on some modules (slow reboots, stuck in TAG mode, missed packets). It is now **disabled by default**. Enable it only when you want to test it.
+
+The ANL picks one anchor at a time, switches it to TAG mode, collects ranges to the anchors that are already fixed, solves its 3D position, and switches it back.
+
+### Enable/disable automatic calibration
+
+Send a UDP command to the ANL:
+
+```powershell
+# Enable
+python -c "import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.sendto(b'AUTO,1',('192.168.4.1',50000))"
+
+# Disable
+python -c "import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.sendto(b'AUTO,0',('192.168.4.1',50000))"
+```
+
+You can also change the compile-time default in `src/main.cpp`:
+
+```cpp
+#define AUTO_CALIBRATION_DEFAULT false
+```
 
 ### Coordinate frame the ANL builds
 
@@ -90,11 +110,22 @@ The ANL serial log will show:
 
 Then it moves to the next anchor. The whole network can be calibrated without any PC interaction.
 
+### Manually trigger one anchor
+
+If you prefer to control exactly which anchor is calibrated and when, send:
+
+```powershell
+python -c "import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.sendto(b'CALAUTO,2',('192.168.4.1',50000))"
+```
+
+This tells the ANL to switch anchor `2` to TAG mode, collect ranges, solve, and switch it back. You can do this one anchor at a time from a phone/laptop UDP client.
+
 ### Limitations
 
 - Fully automatic 3D calibration is sensitive to order. The first two anchors define the coordinate frame.
 - If an anchor cannot range to enough already-fixed anchors, it will be skipped and tried again later.
 - For best 3D accuracy, place anchors so that later ones have a non-zero Z component relative to the first two.
+- Some modules take longer than 60 seconds to reboot and reconfigure. If role switching is unreliable, use **Mode B** or manual `CALAUTO,<id>` triggers.
 
 ---
 
