@@ -35,6 +35,10 @@ Use 2.5.7    Adafruit_SSD1306
 #define MAX_CAL3D_SAMPLES 8
 #define CAL3D_COLLECT_MS  15000UL
 
+// Set to true to let the ANL auto-calibrate anchors on startup.
+// false means you switch anchors to TAG manually (or via UDP) and use CAL commands.
+#define AUTO_CALIBRATION_DEFAULT false
+
 #define BUTTON_PIN 0
 
 #define EEPROM_SIZE 512
@@ -145,6 +149,7 @@ bool otaEnabled = false;
 unsigned long otaEnableTime = 0;
 const unsigned long OTA_TIMEOUT_MS = 120000; // 2 minutes
 bool useHomeWifi = false;  // Flag to use home WiFi instead of ANL network
+bool autoCalibrationEnabled = AUTO_CALIBRATION_DEFAULT;
 
 WiFiUDP udp;
 unsigned long lastHeartbeatTime = 0;
@@ -629,6 +634,8 @@ void autoCalibrateLoop()
     const unsigned long COLLECT_TIME      = 20000; // 20s: gather multiple samples
 
     if (systemRole != 1) return;
+    // Auto-pick next candidate only when enabled. Manual triggers (phase != 0) still run.
+    if (!autoCalibrationEnabled && cal.phase == 0) return;
 
     switch (cal.phase) {
         case 0: {
@@ -955,6 +962,8 @@ void setup()
 
         SERIAL_LOG.print(F("ANL registered at (0.00, 0.00, 0.00) with ID "));
         SERIAL_LOG.println(uwbIndex);
+        SERIAL_LOG.print(F("Auto-calibration: "));
+        SERIAL_LOG.println(autoCalibrationEnabled ? F("ENABLED") : F("DISABLED (send AUTO,1 to enable or use CALAUTO,<id>)"));
     }
 
     displayReadyScreen();
@@ -1903,6 +1912,54 @@ registerNode(remoteIp, (uint8_t)tid, knownRole);
         }
 
         replyText("ERR,CAL,UNKNOWN");
+        return;
+    }
+
+    // ---------- AUTO: enable/disable automatic anchor calibration ----------
+    if (systemRole == 1 && len >= 5 && strncmp(buf, "AUTO,", 5) == 0) {
+        int en = atoi(buf + 5);
+        autoCalibrationEnabled = (en != 0);
+        SERIAL_LOG.print(F("[AUTO] automatic calibration "));
+        SERIAL_LOG.println(autoCalibrationEnabled ? F("ENABLED") : F("DISABLED"));
+        udp.beginPacket(remoteIp, remotePort);
+        udp.print("ACK,AUTO,");
+        udp.println(autoCalibrationEnabled ? 1 : 0);
+        udp.endPacket();
+        return;
+    }
+
+    // ---------- CALAUTO: manually trigger sequential calibration of one anchor ----------
+    if (systemRole == 1 && len >= 8 && strncmp(buf, "CALAUTO,", 8) == 0) {
+        int target = atoi(buf + 8);
+        if (target >= 0 && target <= 9 && target != (int)uwbIndex) {
+            cal.targetId = (uint8_t)target;
+            cal.phase = 1;
+            cal.timer = millis();
+            memset(cal.sampleCount, 0, sizeof(cal.sampleCount));
+            memset(cal.samples, 0, sizeof(cal.samples));
+
+            IPAddress ip = getNodeIp((uint8_t)target);
+            cal.targetIp = ip;
+            if (ip != IPAddress()) {
+                udp.beginPacket(ip, WIFI_PORT);
+                udp.print("ROLE,0");
+                udp.endPacket();
+                SERIAL_LOG.print(F("[CALAUTO] Sent ROLE,0 to ID "));
+                SERIAL_LOG.println(target);
+            } else {
+                SERIAL_LOG.print(F("[CALAUTO] No IP yet for ID "));
+                SERIAL_LOG.println(target);
+            }
+
+            udp.beginPacket(remoteIp, remotePort);
+            udp.print("ACK,CALAUTO,");
+            udp.println(target);
+            udp.endPacket();
+        } else {
+            udp.beginPacket(remoteIp, remotePort);
+            udp.print("ERR,CALAUTO,RANGE");
+            udp.endPacket();
+        }
         return;
     }
 
