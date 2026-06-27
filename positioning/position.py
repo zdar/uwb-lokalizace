@@ -53,16 +53,17 @@ import sys
 # Anchor coordinates in centimetres.
 # IDs must match the UWB_INDEX set on each anchor node.
 # Update these to match your physical deployment.
+# Each entry is (x, y, z); for 2D layouts set z = 0.
 ANCHORS = {
-    0: (0.00,    0.00),
-    1: (94.00,   0.00),
-    2: (24.87,   96.86),
-    3: (-73.22,  83.43),
+    0: (0.00,    0.00,   0.00),
+    1: (94.00,   0.00,   0.00),
+    2: (24.87,   96.86,  0.00),
+    3: (-73.22,  83.43,  0.00),
     # Example alternative layout (from dist_comp.py):
-    # 0: (0.00,    0.00),
-    # 2: (41.54,  -84.33),
-    # 3: (-0.32,   96.00),
-    # 4: (70.00,   0.00),
+    # 0: (0.00,    0.00,   0.00),
+    # 2: (41.54,  -84.33,  0.00),
+    # 3: (-0.32,   96.00,   0.00),
+    # 4: (70.00,   0.00,   0.00),
 }
 
 # "serial" -> USB cable to TAG (or ANL if you added RPTLINE output)
@@ -124,9 +125,9 @@ def trilaterate(ranges, anchors_coords):
             for k in range(j + 1, n):
                 a0, a1, a2 = ids[i], ids[j], ids[k]
                 r0, r1, r2 = ranges[a0], ranges[a1], ranges[a2]
-                x0, y0 = anchors_coords[a0]
-                x1, y1 = anchors_coords[a1]
-                x2, y2 = anchors_coords[a2]
+                x0, y0 = anchors_coords[a0][:2]
+                x1, y1 = anchors_coords[a1][:2]
+                x2, y2 = anchors_coords[a2][:2]
 
                 pts = circle_intersections(x0, y0, r0, x1, y1, r1)
                 if pts is None:
@@ -144,6 +145,58 @@ def trilaterate(ranges, anchors_coords):
     return (avg_x, avg_y)
 
 
+def _solve_linear_3x3(A, b):
+    """Solve A*x = b for a 3x3 matrix using Gaussian elimination."""
+    M = [row[:] + [bi] for row, bi in zip(A, b)]
+    for col in range(3):
+        pivot = max(range(col, 3), key=lambda r: abs(M[r][col]))
+        if abs(M[pivot][col]) < 1e-9:
+            return None
+        M[col], M[pivot] = M[pivot], M[col]
+        piv = M[col][col]
+        for k in range(col, 4):
+            M[col][k] /= piv
+        for row in range(3):
+            if row == col:
+                continue
+            factor = M[row][col]
+            if abs(factor) < 1e-12:
+                continue
+            for k in range(col, 4):
+                M[row][k] -= factor * M[col][k]
+    return [M[0][3], M[1][3], M[2][3]]
+
+
+def trilaterate_3d(ranges, anchors_coords):
+    """
+    ranges         – dict {anchor_id: distance}
+    anchors_coords – dict {anchor_id: (x, y, z)}
+    Returns (x, y, z) or None.
+    Uses linear least-squares (first equation subtracted).
+    """
+    valid = [(aid, r, anchors_coords[aid])
+             for aid, r in ranges.items()
+             if r > 0.0 and aid in anchors_coords]
+    if len(valid) < 4:
+        return None
+
+    # Use the first valid anchor as the reference equation.
+    ref_id, ref_r, (x0, y0, z0) = valid[0]
+    p0sq = x0*x0 + y0*y0 + z0*z0
+
+    A = []
+    b = []
+    for aid, r, (x, y, z) in valid[1:]:
+        A.append([2*(x - x0), 2*(y - y0), 2*(z - z0)])
+        pisq = x*x + y*y + z*z
+        b.append((pisq - r*r) - (p0sq - ref_r*ref_r))
+
+    sol = _solve_linear_3x3(A, b)
+    if sol is None:
+        return None
+    return tuple(sol)
+
+
 # ==================== UWB OBJECT ====================
 
 class UWB:
@@ -152,13 +205,15 @@ class UWB:
         self.typ = typ                 # 0 = anchor, 1 = tag
         self.x = 0.0
         self.y = 0.0
+        self.z = 0.0
         self.status = False
         self.ranges = {}               # anchor_id -> distance
         self.color = RED if typ == 1 else BLACK
 
-    def set_loc(self, x, y):
+    def set_loc(self, x, y, z=0.0):
         self.x = float(x)
         self.y = float(y)
+        self.z = float(z)
         self.status = True
 
     def update_range(self, anchor_id, distance):
@@ -175,13 +230,21 @@ class UWB:
             print(f"[{self.name}] need >=3 anchors, have {len(valid)}")
             return False
 
-        result = trilaterate(valid, ANCHORS)
-        if result is None:
-            print(f"[{self.name}] trilateration failed (geometry/noise)")
-            return False
-
-        self.set_loc(*result)
-        print(f"[{self.name}] solved at ({self.x:.2f}, {self.y:.2f})")
+        # Use 3D whenever at least 4 anchors are available.
+        if len(valid) >= 4:
+            result = trilaterate_3d(valid, ANCHORS)
+            if result is None:
+                print(f"[{self.name}] 3D trilateration failed (geometry/noise)")
+                return False
+            self.set_loc(*result)
+            print(f"[{self.name}] solved at ({self.x:.2f}, {self.y:.2f}, {self.z:.2f})")
+        else:
+            result = trilaterate(valid, ANCHORS)
+            if result is None:
+                print(f"[{self.name}] trilateration failed (geometry/noise)")
+                return False
+            self.set_loc(*result)
+            print(f"[{self.name}] solved at ({self.x:.2f}, {self.y:.2f})")
         return True
 
 
@@ -258,39 +321,41 @@ def parse_rpt_udp(data):
 
 def parse_sol_udp(data):
     """
-    UDP packet:  b"SOL,0,123.45,67.89"
-    Returns (tag_id, x, y) or None.
+    UDP packet:  b"SOL,0,123.45,67.89,0.00"
+    Returns (tag_id, x, y, z) or None.
     """
     text = data.decode("utf-8", errors="ignore").strip()
     if not text.startswith("SOL,"):
         return None
     try:
         parts = text.split(",")
-        if len(parts) != 4:
+        if len(parts) != 5:
             return None
         tid = int(parts[1])
         x = float(parts[2])
         y = float(parts[3])
-        return tid, x, y
+        z = float(parts[4])
+        return tid, x, y, z
     except Exception:
         return None
 
 
 def parse_sol_line(line):
     """
-    Serial line:  "SOL,0,123.45,67.89"
-    Returns (tag_id, x, y) or None.
+    Serial line:  "SOL,0,123.45,67.89,0.00"
+    Returns (tag_id, x, y, z) or None.
     """
     if not line.startswith("SOL,"):
         return None
     try:
         parts = line.split(",")
-        if len(parts) != 4:
+        if len(parts) != 5:
             return None
         tid = int(parts[1])
         x = float(parts[2])
         y = float(parts[3])
-        return tid, x, y
+        z = float(parts[4])
+        return tid, x, y, z
     except Exception:
         return None
 
@@ -320,7 +385,13 @@ def draw_item(screen, it, cm2p, xoff, yoff):
     color = GREEN if it.typ == 0 else it.color
     pygame.draw.circle(screen, color, (px, py), radius, 0)
 
-    label = f"{it.name} ({it.x:.1f},{it.y:.1f})" if it.status else it.name
+    if it.status:
+        if it.z != 0.0 or it.typ == 1:
+            label = f"{it.name} ({it.x:.1f},{it.y:.1f},{it.z:.1f})"
+        else:
+            label = f"{it.name} ({it.x:.1f},{it.y:.1f})"
+    else:
+        label = it.name
     font = pygame.font.SysFont("Consola", 16)
     txt = font.render(label, True, it.color)
     screen.blit(txt, (px + 10, py - 10))
@@ -425,10 +496,10 @@ def main():
                 if line.startswith("SOL,"):
                     parsed = parse_sol_line(line)
                     if parsed:
-                        tid, x, y = parsed
-                        print(f"  SOL from serial: tid={tid} x={x:.2f} y={y:.2f}")
+                        tid, x, y, z = parsed
+                        print(f"  SOL from serial: tid={tid} x={x:.2f} y={y:.2f} z={z:.2f}")
                         if 0 <= tid < len(tags):
-                            tags[tid].set_loc(x, y)
+                            tags[tid].set_loc(x, y, z)
                     continue
 
                 if "AT+RANGE" not in line:
@@ -463,10 +534,10 @@ def main():
                 elif MODE == "sol":
                     parsed = parse_sol_udp(data)
                     if parsed:
-                        tid, x, y = parsed
-                        print(f"  SOL from {addr}: tid={tid} x={x:.2f} y={y:.2f}")
+                        tid, x, y, z = parsed
+                        print(f"  SOL from {addr}: tid={tid} x={x:.2f} y={y:.2f} z={z:.2f}")
                         if 0 <= tid < len(tags):
-                            tags[tid].set_loc(x, y)
+                            tags[tid].set_loc(x, y, z)
             except BlockingIOError:
                 pass
             except Exception as e:

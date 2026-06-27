@@ -31,6 +31,10 @@ Use 2.5.7    Adafruit_SSD1306
 #define UWB_TAG_COUNT 10
 #define MAX_CAL_SAMPLES 5
 
+#define MAX_CAL3D_POINTS  8
+#define MAX_CAL3D_SAMPLES 10
+#define CAL3D_COLLECT_MS  15000UL
+
 #define BUTTON_PIN 0
 
 #define EEPROM_SIZE 512
@@ -54,6 +58,7 @@ Use 2.5.7    Adafruit_SSD1306
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <math.h>
+#include <string.h>
 #include <ArduinoOTA.h>
 #include "wifi_secrets.h"
 
@@ -93,7 +98,7 @@ void sendHeartbeat();
 void relayUwbLine(const char* line);
 void handleIncomingUdp();
 void autoCalibrateLoop();
-void setNodePosition(IPAddress from, float x, float y);
+void setNodePosition(IPAddress from, float x, float y, float z = 0.0f);
 void registerNode(IPAddress from, uint8_t nodeId, uint8_t nodeRole = 1);
 String ssidForNetId(uint16_t netId);
 String netIdString(uint16_t netId);
@@ -111,6 +116,20 @@ bool getAnchorPos(uint8_t anchorId, float &x, float &y);
 bool solveTrilateration2D(float r0, float r1, float r2,
                           uint8_t a0, uint8_t a1, uint8_t a2,
                           float &outX, float &outY);
+bool solveLinear3x3(float A[3][3], float b[3], float x[3]);
+bool trilaterate3D(const float points[][3], const float radii[], int n,
+                   float out[3], bool refine);
+bool solveTagPosition3D(const float ranges[], const uint8_t anchorIds[], int count,
+                        float &outX, float &outY, float &outZ);
+bool solveAnchorPosition3D(const float tagPoints[][3], const float ranges[], int count,
+                           float &outX, float &outY, float &outZ);
+void anchorCalibration3DLoop();
+bool startCal3DPoint(uint8_t tagId, float x, float y, float z);
+void finishCal3DPoint();
+bool finishCal3DAndSolve();
+void cancelCal3D();
+float medianOfSamples(const float samples[], uint8_t count);
+void setAnchorPosition(uint8_t id, float x, float y, float z);
 void setupOTA();
 void handleOTA();
 // --------------------------------------------
@@ -138,6 +157,7 @@ struct NodeInfo {
     unsigned long lastSeen;
     float x = 0.0f;
     float y = 0.0f;
+    float z = 0.0f;
     bool hasPos = false;
     uint8_t id = 255;
     uint8_t role = 1;
@@ -164,16 +184,39 @@ struct {
 } cal = { 255, 0, 0, IPAddress(), {{0}}, {0} };
 // ============================================================
 
-bool getAnchorPos(uint8_t anchorId, float &x, float &y)
+// ================== 3D ANCHOR CALIBRATION STATE =============
+struct {
+    bool active = false;
+    uint8_t state = 0;            // 0=idle, 1=collecting
+    uint8_t tagId = 255;
+    uint8_t pointCount = 0;
+    uint8_t currentPoint = 0;
+    unsigned long timer = 0;
+    float ptX[MAX_CAL3D_POINTS];
+    float ptY[MAX_CAL3D_POINTS];
+    float ptZ[MAX_CAL3D_POINTS];
+    float samples[MAX_CAL3D_POINTS][10][MAX_CAL3D_SAMPLES];
+    uint8_t sampleCount[MAX_CAL3D_POINTS][10];
+} cal3d;
+// ============================================================
+
+bool getAnchorPos3D(uint8_t anchorId, float &x, float &y, float &z)
 {
     for (int i = 0; i < registryCount; i++) {
         if (registry[i].id == anchorId && registry[i].hasPos) {
             x = registry[i].x;
             y = registry[i].y;
+            z = registry[i].z;
             return true;
         }
     }
     return false;
+}
+
+bool getAnchorPos(uint8_t anchorId, float &x, float &y)
+{
+    float z;
+    return getAnchorPos3D(anchorId, x, y, z);
 }
 
 bool solveTrilateration2D(float r0, float r1, float r2,
@@ -215,6 +258,208 @@ bool solveTrilateration2D(float r0, float r1, float r2,
 }
 
 // ==============================================================
+// 3D LEAST-SQUARES TRILATERATION HELPERS
+// ==============================================================
+
+static inline float dist3D(float x, float y, float z,
+                           float px, float py, float pz)
+{
+    float dx = x - px;
+    float dy = y - py;
+    float dz = z - pz;
+    return sqrt(dx*dx + dy*dy + dz*dz);
+}
+
+bool solveLinear3x3(float A[3][3], float b[3], float x[3])
+{
+    // Gaussian elimination with partial pivoting.
+    float M[3][4];
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) M[i][j] = A[i][j];
+        M[i][3] = b[i];
+    }
+
+    for (int col = 0; col < 3; col++) {
+        int pivot = col;
+        float maxAbs = fabs(M[col][col]);
+        for (int row = col + 1; row < 3; row++) {
+            float v = fabs(M[row][col]);
+            if (v > maxAbs) {
+                maxAbs = v;
+                pivot = row;
+            }
+        }
+        if (maxAbs < 1e-6f) return false;
+        if (pivot != col) {
+            for (int k = 0; k < 4; k++) {
+                float tmp = M[col][k];
+                M[col][k] = M[pivot][k];
+                M[pivot][k] = tmp;
+            }
+        }
+        float piv = M[col][col];
+        for (int k = col; k < 4; k++) M[col][k] /= piv;
+        for (int row = 0; row < 3; row++) {
+            if (row == col) continue;
+            float factor = M[row][col];
+            if (fabs(factor) < 1e-6f) continue;
+            for (int k = col; k < 4; k++) {
+                M[row][k] -= factor * M[col][k];
+            }
+        }
+    }
+    x[0] = M[0][3];
+    x[1] = M[1][3];
+    x[2] = M[2][3];
+    return true;
+}
+
+bool trilaterate3D(const float P[][3], const float r[], int n,
+                   float out[3], bool refine)
+{
+    if (n < 4) return false;
+
+    // Linear least-squares initial guess (subtract first equation).
+    float A[9][3] = {{0}};
+    float b[9] = {0};
+    int m = 0;
+    float p0sq = P[0][0]*P[0][0] + P[0][1]*P[0][1] + P[0][2]*P[0][2];
+    for (int i = 1; i < n && m < 9; i++) {
+        A[m][0] = 2.0f * (P[i][0] - P[0][0]);
+        A[m][1] = 2.0f * (P[i][1] - P[0][1]);
+        A[m][2] = 2.0f * (P[i][2] - P[0][2]);
+        float pisq = P[i][0]*P[i][0] + P[i][1]*P[i][1] + P[i][2]*P[i][2];
+        b[m] = (pisq - r[i]*r[i]) - (p0sq - r[0]*r[0]);
+        m++;
+    }
+    if (m < 3) return false;
+
+    float AtA[3][3] = {{0}};
+    float Atb[3] = {0};
+    for (int i = 0; i < m; i++) {
+        for (int j = 0; j < 3; j++) {
+            for (int k = 0; k < 3; k++) {
+                AtA[j][k] += A[i][j] * A[i][k];
+            }
+            Atb[j] += A[i][j] * b[i];
+        }
+    }
+    if (!solveLinear3x3(AtA, Atb, out)) return false;
+
+    if (!refine) return true;
+
+    // Gauss-Newton refinement.
+    for (int iter = 0; iter < 30; iter++) {
+        float JtJ[3][3] = {{0}};
+        float Jtr[3] = {0};
+        float stepLen2 = 0.0f;
+        for (int i = 0; i < n; i++) {
+            float d = dist3D(out[0], out[1], out[2], P[i][0], P[i][1], P[i][2]);
+            if (d < 1e-6f) continue;
+            float res = d - r[i];
+            float jac[3] = { (out[0] - P[i][0]) / d,
+                             (out[1] - P[i][1]) / d,
+                             (out[2] - P[i][2]) / d };
+            for (int j = 0; j < 3; j++) {
+                for (int k = 0; k < 3; k++) {
+                    JtJ[j][k] += jac[j] * jac[k];
+                }
+                Jtr[j] += jac[j] * res;
+            }
+        }
+        float negJtr[3] = { -Jtr[0], -Jtr[1], -Jtr[2] };
+        float delta[3];
+        if (!solveLinear3x3(JtJ, negJtr, delta)) break;
+        for (int j = 0; j < 3; j++) {
+            out[j] += delta[j];
+            stepLen2 += delta[j] * delta[j];
+        }
+        if (sqrt(stepLen2) < 1e-4f) return true;
+    }
+    return true;
+}
+
+bool solveTagPosition3D(const float ranges[], const uint8_t anchorIds[], int count,
+                        float &outX, float &outY, float &outZ)
+{
+    float points[10][3];
+    float radii[10];
+    int n = 0;
+    for (int i = 0; i < count && n < 10; i++) {
+        float x, y, z;
+        if (!getAnchorPos3D(anchorIds[i], x, y, z)) continue;
+        if (ranges[i] <= 0.0f) continue;
+        points[n][0] = x;
+        points[n][1] = y;
+        points[n][2] = z;
+        radii[n] = ranges[i];
+        n++;
+    }
+    if (n < 4) return false;
+    float sol[3];
+    if (!trilaterate3D(points, radii, n, sol, true)) return false;
+    outX = sol[0];
+    outY = sol[1];
+    outZ = sol[2];
+    return true;
+}
+
+bool solveAnchorPosition3D(const float tagPoints[][3], const float ranges[], int count,
+                           float &outX, float &outY, float &outZ)
+{
+    if (count < 4) return false;
+    float sol[3];
+    if (!trilaterate3D(tagPoints, ranges, count, sol, true)) return false;
+    outX = sol[0];
+    outY = sol[1];
+    outZ = sol[2];
+    return true;
+}
+
+float medianOfSamples(const float samples[], uint8_t count)
+{
+    if (count == 0) return -1.0f;
+    if (count == 1) return samples[0];
+    float s[MAX_CAL3D_SAMPLES];
+    memcpy(s, samples, count * sizeof(float));
+    for (uint8_t i = 1; i < count; i++) {
+        float key = s[i];
+        int j = (int)i - 1;
+        while (j >= 0 && s[j] > key) {
+            s[j + 1] = s[j];
+            j--;
+        }
+        s[j + 1] = key;
+    }
+    if (count % 2 == 1) return s[count / 2];
+    return (s[count / 2 - 1] + s[count / 2]) / 2.0f;
+}
+
+void setAnchorPosition(uint8_t id, float x, float y, float z)
+{
+    for (int i = 0; i < registryCount; i++) {
+        if (registry[i].id == id) {
+            registry[i].x = x;
+            registry[i].y = y;
+            registry[i].z = z;
+            registry[i].hasPos = true;
+            SERIAL_LOG.print(F("[CAL3D] Anchor "));
+            SERIAL_LOG.print(id);
+            SERIAL_LOG.print(F(" fixed at "));
+            SERIAL_LOG.print(x, 2);
+            SERIAL_LOG.print(F(", "));
+            SERIAL_LOG.print(y, 2);
+            SERIAL_LOG.print(F(", "));
+            SERIAL_LOG.println(z, 2);
+            return;
+        }
+    }
+    SERIAL_LOG.print(F("[CAL3D] Anchor "));
+    SERIAL_LOG.print(id);
+    SERIAL_LOG.println(F(" not in registry; skipping"));
+}
+
+// ==============================================================
 // AUTO-CALIBRATION STATE MACHINE (runs only on ANL)
 // ==============================================================
 bool isNodeAlive(uint8_t nodeId)
@@ -247,13 +492,16 @@ void commitCalibrationResult(uint8_t targetId, float x, float y)
     }
     registry[idx].x = x;
     registry[idx].y = y;
+    registry[idx].z = 0.0f;
     registry[idx].hasPos = true;
     SERIAL_LOG.print(F("[AUTO] Node ID "));
     SERIAL_LOG.print(targetId);
     SERIAL_LOG.print(F(" fixed at "));
     SERIAL_LOG.print(x, 2);
     SERIAL_LOG.print(F(", "));
-    SERIAL_LOG.println(y, 2);
+    SERIAL_LOG.print(y, 2);
+    SERIAL_LOG.print(F(", 0.00"));
+    SERIAL_LOG.println();
 }
 
 float medianSample(uint8_t anchor)
@@ -429,6 +677,140 @@ void autoCalibrateLoop()
     }
 }
 
+// ==============================================================
+// 3D ANCHOR CALIBRATION (Option B: tag at known 3D points)
+// ==============================================================
+
+bool startCal3DPoint(uint8_t tagId, float x, float y, float z)
+{
+    if (cal3d.pointCount >= MAX_CAL3D_POINTS) return false;
+
+    // If a previous point is still collecting, finalise it first.
+    if (cal3d.state == 1) {
+        finishCal3DPoint();
+    }
+
+    cal3d.tagId = tagId;
+    cal3d.currentPoint = cal3d.pointCount;
+    cal3d.ptX[cal3d.currentPoint] = x;
+    cal3d.ptY[cal3d.currentPoint] = y;
+    cal3d.ptZ[cal3d.currentPoint] = z;
+    memset(cal3d.samples[cal3d.currentPoint], 0, sizeof(cal3d.samples[cal3d.currentPoint]));
+    memset(cal3d.sampleCount[cal3d.currentPoint], 0, sizeof(cal3d.sampleCount[cal3d.currentPoint]));
+    cal3d.state = 1;
+    cal3d.timer = millis();
+
+    SERIAL_LOG.print(F("[CAL3D] Point "));
+    SERIAL_LOG.print(cal3d.currentPoint);
+    SERIAL_LOG.print(F(" tag="));
+    SERIAL_LOG.print(tagId);
+    SERIAL_LOG.print(F(" pos="));
+    SERIAL_LOG.print(x, 2);
+    SERIAL_LOG.print(F(","));
+    SERIAL_LOG.print(y, 2);
+    SERIAL_LOG.print(F(","));
+    SERIAL_LOG.println(z, 2);
+    return true;
+}
+
+void finishCal3DPoint()
+{
+    if (!cal3d.active || cal3d.state != 1) return;
+
+    uint8_t pt = cal3d.currentPoint;
+    int total = 0;
+    for (int a = 0; a < 10; a++) {
+        total += cal3d.sampleCount[pt][a];
+    }
+
+    SERIAL_LOG.print(F("[CAL3D] Point "));
+    SERIAL_LOG.print(pt);
+    SERIAL_LOG.print(F(" stored with "));
+    SERIAL_LOG.print(total);
+    SERIAL_LOG.println(F(" samples"));
+
+    cal3d.pointCount++;
+    cal3d.state = 0;
+    cal3d.timer = 0;
+}
+
+void cancelCal3D()
+{
+    cal3d.active = false;
+    cal3d.state = 0;
+    cal3d.tagId = 255;
+    cal3d.pointCount = 0;
+    cal3d.currentPoint = 0;
+    cal3d.timer = 0;
+    memset(cal3d.samples, 0, sizeof(cal3d.samples));
+    memset(cal3d.sampleCount, 0, sizeof(cal3d.sampleCount));
+    SERIAL_LOG.println(F("[CAL3D] Cancelled / reset"));
+}
+
+bool finishCal3DAndSolve()
+{
+    if (!cal3d.active || cal3d.pointCount < 4) {
+        SERIAL_LOG.println(F("[CAL3D] Need >=4 points to solve in 3D"));
+        return false;
+    }
+
+    SERIAL_LOG.println(F("[CAL3D] Solving anchor positions ..."));
+
+    bool anySolved = false;
+    for (int a = 0; a < 10; a++) {
+        if (a == (int)uwbIndex) continue; // ANL origin is fixed at (0,0,0)
+
+        float tagPts[MAX_CAL3D_POINTS][3];
+        float ranges[MAX_CAL3D_POINTS];
+        int n = 0;
+        for (int p = 0; p < cal3d.pointCount && n < MAX_CAL3D_POINTS; p++) {
+            if (cal3d.sampleCount[p][a] == 0) continue;
+            float r = medianOfSamples(cal3d.samples[p][a], cal3d.sampleCount[p][a]);
+            if (r <= 0.0f) continue;
+            tagPts[n][0] = cal3d.ptX[p];
+            tagPts[n][1] = cal3d.ptY[p];
+            tagPts[n][2] = cal3d.ptZ[p];
+            ranges[n] = r;
+            n++;
+        }
+
+        if (n < 4) {
+            SERIAL_LOG.print(F("[CAL3D] Anchor "));
+            SERIAL_LOG.print(a);
+            SERIAL_LOG.print(F(" skipped (only "));
+            SERIAL_LOG.print(n);
+            SERIAL_LOG.println(F(" valid points)"));
+            continue;
+        }
+
+        float x, y, z;
+        if (solveAnchorPosition3D(tagPts, ranges, n, x, y, z)) {
+            setAnchorPosition((uint8_t)a, x, y, z);
+            anySolved = true;
+        } else {
+            SERIAL_LOG.print(F("[CAL3D] Anchor "));
+            SERIAL_LOG.print(a);
+            SERIAL_LOG.println(F(" solve failed"));
+        }
+    }
+
+    cal3d.active = false;
+    cal3d.state = 0;
+    cal3d.tagId = 255;
+    cal3d.timer = 0;
+    return anySolved;
+}
+
+void anchorCalibration3DLoop()
+{
+    if (systemRole != 1) return;
+    if (!cal3d.active || cal3d.state != 1) return;
+    if (millis() - cal3d.timer < CAL3D_COLLECT_MS) return;
+
+    finishCal3DPoint();
+    SERIAL_LOG.println(F("[CAL3D] Point collection complete. Send next POINT or SOLVE."));
+}
+
 void setup()
 {
     EEPROM.begin(EEPROM_SIZE);
@@ -489,11 +871,12 @@ void setup()
         registry[0].lastSeen = millis();
         registry[0].x = 0.0f;
         registry[0].y = 0.0f;
+        registry[0].z = 0.0f;
         registry[0].hasPos = true;
         registry[0].id = (uint8_t)uwbIndex;
         registryCount = 1;
 
-        SERIAL_LOG.print(F("ANL registered at (0.00, 0.00) with ID "));
+        SERIAL_LOG.print(F("ANL registered at (0.00, 0.00, 0.00) with ID "));
         SERIAL_LOG.println(uwbIndex);
     }
 
@@ -622,6 +1005,7 @@ void loop()
 
     udpLoop();
     autoCalibrateLoop();
+    anchorCalibration3DLoop();
     monitorWifiHealth();
     printRegistryTable();
     handleOTA();
@@ -1187,6 +1571,20 @@ registerNode(remoteIp, (uint8_t)tid, knownRole);
             }
         }
 
+        // Store samples for 3D anchor calibration
+        if (cal3d.active && cal3d.state == 1 && (uint8_t)tid == cal3d.tagId) {
+            int pairs = (rc < ac) ? rc : ac;
+            uint8_t pt = cal3d.currentPoint;
+            for (int j = 0; j < pairs; j++) {
+                if (ancids[j] >= 0 && ancids[j] < 10) {
+                    uint8_t a = (uint8_t)ancids[j];
+                    if (cal3d.sampleCount[pt][a] < MAX_CAL3D_SAMPLES) {
+                        cal3d.samples[pt][a][cal3d.sampleCount[pt][a]++] = ranges[j];
+                    }
+                }
+            }
+        }
+
         // (RPT logging disabled to keep serial clean)
         // SERIAL_LOG.print(F("[RPT] tid="));
         // SERIAL_LOG.print(tid);
@@ -1219,7 +1617,28 @@ registerNode(remoteIp, (uint8_t)tid, knownRole);
                 }
             }
 
-            if (vc >= 3) {
+            // Prefer 3D trilateration when >=4 anchors are fixed.
+            if (vc >= 4) {
+                float sx, sy, sz;
+                if (solveTagPosition3D(vr, va, vc, sx, sy, sz)) {
+                    SERIAL_LOG.print(F("[SOL] tid="));
+                    SERIAL_LOG.print(tid);
+                    SERIAL_LOG.print(F(" x="));
+                    SERIAL_LOG.print(sx, 2);
+                    SERIAL_LOG.print(F(" y="));
+                    SERIAL_LOG.print(sy, 2);
+                    SERIAL_LOG.print(F(" z="));
+                    SERIAL_LOG.println(sz, 2);
+
+                    char solPkt[80];
+                    snprintf(solPkt, sizeof(solPkt), "SOL,%d,%.2f,%.2f,%.2f", tid, sx, sy, sz);
+                    udp.beginPacket(IPAddress(255, 255, 255, 255), WIFI_PORT);
+                    udp.write((const uint8_t*)solPkt, strlen(solPkt));
+                    udp.endPacket();
+                    SERIAL_LOG.println(solPkt);
+                }
+            } else if (vc >= 3) {
+                // Fallback to 2D (z stays 0).
                 float sx, sy;
                 if (solveTrilateration2D(vr[0], vr[1], vr[2],
                                          va[0], va[1], va[2],
@@ -1232,12 +1651,10 @@ registerNode(remoteIp, (uint8_t)tid, knownRole);
                     SERIAL_LOG.println(sy, 2);
 
                     char solPkt[64];
-                    snprintf(solPkt, sizeof(solPkt), "SOL,%d,%.2f,%.2f", tid, sx, sy);
+                    snprintf(solPkt, sizeof(solPkt), "SOL,%d,%.2f,%.2f,0.00", tid, sx, sy);
                     udp.beginPacket(IPAddress(255, 255, 255, 255), WIFI_PORT);
                     udp.write((const uint8_t*)solPkt, strlen(solPkt));
                     udp.endPacket();
-
-                    // Also echo over serial so a PC connected via USB can read it
                     SERIAL_LOG.println(solPkt);
                 }
             }
@@ -1253,6 +1670,7 @@ registerNode(remoteIp, (uint8_t)tid, knownRole);
         char* tok1 = strtok(p, ",");
         char* tok2 = strtok(NULL, ",");
         char* tok3 = strtok(NULL, ",");
+        char* tok4 = strtok(NULL, ",");
 
         if (!tok1 || !tok2) {
             udp.beginPacket(remoteIp, remotePort);
@@ -1264,8 +1682,10 @@ registerNode(remoteIp, (uint8_t)tid, knownRole);
         IPAddress targetIp = remoteIp;
         float x = 0;
         float y = 0;
+        float z = 0;
 
         if (strchr(tok1, '.')) {
+            // POS,<ip>,<x>,<y>[,<z>]
             if (!tok3 || !targetIp.fromString(tok1)) {
                 udp.beginPacket(remoteIp, remotePort);
                 udp.print("ERR,ip");
@@ -1274,12 +1694,15 @@ registerNode(remoteIp, (uint8_t)tid, knownRole);
             }
             x = atof(tok2);
             y = atof(tok3);
+            if (tok4) z = atof(tok4);
         } else {
+            // POS,<x>,<y>[,<z>]
             x = atof(tok1);
             y = atof(tok2);
+            if (tok3) z = atof(tok3);
         }
 
-        setNodePosition(targetIp, x, y);
+        setNodePosition(targetIp, x, y, z);
 
         display.fillRect(0, 48, 128, 16, SSD1306_BLACK);
         display.setCursor(0, 50);
@@ -1291,8 +1714,95 @@ registerNode(remoteIp, (uint8_t)tid, knownRole);
         udp.print("ACK,POS_OK,");
         udp.print(x, 2);
         udp.print(",");
-        udp.println(y, 2);
+        udp.print(y, 2);
+        udp.print(",");
+        udp.println(z, 2);
         udp.endPacket();
+        return;
+    }
+
+    // ---------- CAL: 3D anchor calibration (ANL only) ----------
+    if (systemRole == 1 && len >= 4 && strncmp(buf, "CAL,", 4) == 0) {
+        char* p = buf + 4;
+        char* action = strtok(p, ",");
+
+        auto replyText = [&](const char* txt) {
+            udp.beginPacket(remoteIp, remotePort);
+            udp.print(txt);
+            udp.endPacket();
+        };
+
+        if (!action) {
+            replyText("ERR,CAL,ACTION");
+            return;
+        }
+
+        if (strcmp(action, "START") == 0) {
+            cancelCal3D();
+            cal3d.active = true;
+            cal3d.state = 0;
+            cal3d.pointCount = 0;
+            cal3d.tagId = 255;
+            memset(cal3d.samples, 0, sizeof(cal3d.samples));
+            memset(cal3d.sampleCount, 0, sizeof(cal3d.sampleCount));
+            SERIAL_LOG.println(F("[CAL3D] Started"));
+            replyText("ACK,CAL,START");
+            return;
+        }
+
+        if (strcmp(action, "POINT") == 0) {
+            char* tidTok = strtok(NULL, ",");
+            char* xTok  = strtok(NULL, ",");
+            char* yTok  = strtok(NULL, ",");
+            char* zTok  = strtok(NULL, ",");
+            if (!tidTok || !xTok || !yTok || !zTok) {
+                replyText("ERR,CAL,ARGS");
+                return;
+            }
+            uint8_t tid = (uint8_t)atoi(tidTok);
+            float x = atof(xTok);
+            float y = atof(yTok);
+            float z = atof(zTok);
+            if (!cal3d.active) {
+                cancelCal3D();
+                cal3d.active = true;
+            }
+            if (startCal3DPoint(tid, x, y, z)) {
+                char ack[80];
+                snprintf(ack, sizeof(ack), "ACK,CAL,POINT,%d,%.2f,%.2f,%.2f",
+                         cal3d.currentPoint, x, y, z);
+                replyText(ack);
+            } else {
+                replyText("ERR,CAL,FULL");
+            }
+            return;
+        }
+
+        if (strcmp(action, "SOLVE") == 0) {
+            if (finishCal3DAndSolve()) {
+                replyText("ACK,CAL,SOLVED");
+            } else {
+                replyText("ERR,CAL,SOLVE");
+            }
+            return;
+        }
+
+        if (strcmp(action, "CANCEL") == 0) {
+            cancelCal3D();
+            replyText("ACK,CAL,CANCEL");
+            return;
+        }
+
+        if (strcmp(action, "STATUS") == 0) {
+            char status[128];
+            snprintf(status, sizeof(status),
+                     "ACK,CAL,STATUS,%d,%d,%d",
+                     cal3d.active ? 1 : 0, cal3d.state, cal3d.pointCount);
+            replyText(status);
+            return;
+        }
+
+        replyText("ERR,CAL,UNKNOWN");
         return;
     }
 
@@ -1406,19 +1916,22 @@ registerNode(remoteIp, (uint8_t)tid, knownRole);
     }
 }
 
-void setNodePosition(IPAddress from, float x, float y)
+void setNodePosition(IPAddress from, float x, float y, float z)
 {
     for (int i = 0; i < registryCount; i++) {
         if (registry[i].ip == from) {
             registry[i].x = x;
             registry[i].y = y;
+            registry[i].z = z;
             registry[i].hasPos = true;
             SERIAL_LOG.print(F("Node "));
             SERIAL_LOG.print(i);
             SERIAL_LOG.print(F(" position set: "));
             SERIAL_LOG.print(x, 2);
             SERIAL_LOG.print(F(", "));
-            SERIAL_LOG.println(y, 2);
+            SERIAL_LOG.print(y, 2);
+            SERIAL_LOG.print(F(", "));
+            SERIAL_LOG.println(z, 2);
             return;
         }
     }
@@ -1427,13 +1940,16 @@ void setNodePosition(IPAddress from, float x, float y)
         registry[registryCount].lastSeen = millis();
         registry[registryCount].x = x;
         registry[registryCount].y = y;
+        registry[registryCount].z = z;
         registry[registryCount].hasPos = true;
         SERIAL_LOG.print(F("Registered node "));
         SERIAL_LOG.print(registryCount);
         SERIAL_LOG.print(F(" and set position: "));
         SERIAL_LOG.print(x, 2);
         SERIAL_LOG.print(F(", "));
-        SERIAL_LOG.println(y, 2);
+        SERIAL_LOG.print(y, 2);
+        SERIAL_LOG.print(F(", "));
+        SERIAL_LOG.println(z, 2);
         registryCount++;
     }
 }
@@ -1875,6 +2391,8 @@ void printRegistryTable()
             SERIAL_LOG.print(registry[i].x, 2);
             SERIAL_LOG.print(F(","));
             SERIAL_LOG.print(registry[i].y, 2);
+            SERIAL_LOG.print(F(","));
+            SERIAL_LOG.print(registry[i].z, 2);
         } else {
             SERIAL_LOG.print(F(" | Pos: unset"));
         }
