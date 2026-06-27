@@ -1,6 +1,11 @@
 # 3D Anchor Auto-Calibration & Operation Guide
 
-This guide covers option B: calibrating anchor positions by moving a single tag to known 3D points. Once anchors are fixed, the ANL solves tag positions in 3D and broadcasts them.
+This guide covers two ways to calibrate anchor positions and then operate the system in 3D.
+
+- **Mode A — fully automatic:** The ANL switches each anchor to TAG mode, measures anchor-to-anchor distances, and solves positions without any manually measured points.
+- **Mode B — known reference points:** You move a single tag to measured 3D points and run the PC wizard.
+
+Once anchors are fixed, the ANL solves tag positions in 3D and broadcasts them.
 
 ---
 
@@ -8,11 +13,10 @@ This guide covers option B: calibrating anchor positions by moving a single tag 
 
 - One MAUWBS3CA1 module configured as **ANL** (Active Network Leader).
 - At least **three** other modules configured as **anchors** (four or more recommended for 3D).
-- One module configured as a **temporary calibration tag**.
-- A PC connected to the RTLS WiFi network.
-- Tape measure / marked points in the tunnel.
+- For Mode B only: one module configured as a **temporary calibration tag** and a tape measure.
+- A PC connected to the RTLS WiFi network (for Mode B and for viewing positions).
 
-> The ANL defines the coordinate-system origin `(0, 0, 0)`. All known tag positions must be measured relative to the ANL.
+> The ANL defines the coordinate-system origin `(0, 0, 0)`. In Mode A the ANL is the origin and the first solved anchor is forced onto the +X axis; the second is forced into the XY plane. In Mode B you measure all points relative to the ANL.
 
 ---
 
@@ -52,11 +56,53 @@ python scripts/ota_flash_all.py --ip 192.168.4.2
    - Set the same **Network ID** on all devices.
 4. Assign a **unique UWB index** (`0..9`) to every node. The ANL can be any index, but keep track of which one it is.
 
-The ANL will create a WiFi AP named `RTLS-NET-<NNNN>`. Anchors and the calibration tag will join it automatically.
+The ANL will create a WiFi AP named `RTLS-NET-<NNNN>`. Anchors will join it automatically.
 
 ---
 
-## 4. Prepare the calibration tag
+## 4. Fully automatic 3D calibration
+
+The ANL does everything. It picks one anchor at a time, switches it to TAG mode, collects ranges to the anchors that are already fixed, solves its 3D position, and switches it back.
+
+### Coordinate frame the ANL builds
+
+1. **ANL** = `(0, 0, 0)`.
+2. **First anchor** solved = placed on the **+X axis** at the measured distance from the ANL.
+3. **Second anchor** solved = placed in the **XY plane** on the +Y side of the X axis.
+4. **Third and later anchors** solved in full 3D using the anchors fixed so far.
+
+Because of this, the first two anchors effectively define your X axis and XY plane. Choose the deployment order so this matches your tunnel coordinate system, or rotate/transform the coordinates in your downstream software.
+
+### What you do
+
+1. Make sure all anchors and the ANL are powered and joined to the network.
+2. Wait. The ANL automatically starts the sequence.
+
+The ANL serial log will show:
+
+```
+[CAL] Target node ID 1 IP 192.168.4.2
+[CAL] Sent ROLE,0 (Tag)
+[CAL] Window open, collecting RPT...
+[AUTO] Node ID 1 fixed at 194.87, 0.00, 0.00
+[CAL] Sent ROLE,1 (Anchor)
+```
+
+Then it moves to the next anchor. The whole network can be calibrated without any PC interaction.
+
+### Limitations
+
+- Fully automatic 3D calibration is sensitive to order. The first two anchors define the coordinate frame.
+- If an anchor cannot range to enough already-fixed anchors, it will be skipped and tried again later.
+- For best 3D accuracy, place anchors so that later ones have a non-zero Z component relative to the first two.
+
+---
+
+## 5. Calibration with a tag at known 3D points
+
+Use this when you have surveyed reference points and want a precise global coordinate frame.
+
+### 5.1 Prepare the calibration tag
 
 Put the calibration tag into **TAG mode** using the button menu or by sending:
 
@@ -68,17 +114,15 @@ python scripts/ota_flash_all.py --ip <tag-ip> --id <tag-index>
 
 The tag will start sending `AT+RANGE` reports to the ANL.
 
----
+### 5.2 Define known 3D points
 
-## 5. Define known 3D points
-
-Choose at least **4** distinct points in the tunnel. Measure each point relative to the ANL origin:
+Choose at least **4** distinct points. Measure each point relative to the ANL origin:
 
 - `x`: forward/back distance in cm
 - `y`: left/right distance in cm
 - `z`: height distance in cm
 
-Write them down, for example:
+Example:
 
 ```
 P0: (  0,   0, 100)
@@ -88,17 +132,11 @@ P3: (  0, 100, 100)
 P4: (100,  50,  50)
 ```
 
-> Use more than 4 points and spread them in 3D space (not all on the same plane) for the most accurate anchor positions.
+> Spread points in 3D (not coplanar) for the most accurate anchor positions.
 
----
-
-## 6. Run the calibration wizard
+### 5.3 Run the calibration wizard
 
 Connect your PC to the `RTLS-NET-<NNNN>` WiFi, then run:
-
-```powershell
-python scripts/calibrate_anchors.py --tag <tag-id>
-```
 
 Example for calibration tag `0`:
 
@@ -131,7 +169,7 @@ For each anchor, the ANL builds a list of `(known tag position, median range)` p
 
 ---
 
-## 7. Verify the result
+## 6. Verify the result
 
 Open the ANL's serial monitor or read the registry table printed every 5 seconds:
 
@@ -147,7 +185,7 @@ The ANL itself stays at `(0, 0, 0)`. All other anchors should now have realistic
 
 ---
 
-## 8. Normal operation
+## 7. Normal operation
 
 After calibration, the ANL automatically solves any tag's 3D position from the ranges it receives:
 
@@ -178,7 +216,7 @@ A window will show anchors in green and tags in red, with `x, y, z` coordinates.
 
 ---
 
-## 9. Manual calibration commands (optional)
+## 8. Manual calibration commands (optional)
 
 You can also drive calibration manually without the wizard:
 
@@ -203,7 +241,7 @@ Wait ~15 seconds between each `--point` and before `--solve` so the ANL can coll
 
 ---
 
-## 10. Troubleshooting
+## 9. Troubleshooting
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
@@ -216,7 +254,7 @@ Wait ~15 seconds between each `--point` and before `--solve` so the ANL can coll
 
 ---
 
-## 11. Notes
+## 10. Notes
 
 - The ANL is fixed at `(0, 0, 0)`. If you want a different global origin, measure all tag points relative to the ANL and then offset the solved coordinates mentally or in your downstream software.
 - `POS` packets now accept an optional `z`: `POS,<x>,<y>,<z>` or `POS,<ip>,<x>,<y>,<z>`.
