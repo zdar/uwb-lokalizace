@@ -14,8 +14,8 @@ Usage
     # Or flash a specific node only:
     python scripts/ota_flash_all.py --ip 192.168.4.2
 
-    # Use a different build environment (e.g. PC-ANL prototype):
-    python scripts/ota_flash_all.py --env esp32s3-pc-anl-ota
+    # Use a different build environment (default is esp32s3-ota):
+    python scripts/ota_flash_all.py --env esp32s3
 
 Dependencies
 ------------

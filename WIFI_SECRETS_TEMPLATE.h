@@ -49,21 +49,23 @@
  * 3. PROVISIONING:
  *    - On startup, hold the button for 2+ seconds to enter provisioning menu
  *    - Stage 1: Select System Role (ANL or NODE)
- *    - Stage 2: 
- *      - If NODE with HOME_WIFI enabled: Choose WiFi source (HOME or ANL)
- *      - If ANL: Set Network ID (1000-9999)
+ *    - Stage 2 (when HOME_WIFI enabled): Choose WiFi source (HOME or ANL)
+ *    - Stage 3 (ANL in ANL mode only): Set Network ID (1000-9999)
  * 
  * 4. TYPICAL SCENARIOS:
  * 
- *    Scenario A - Home network only (no ANL):
- *    - ENABLE_HOME_WIFI = 0
- *    - Use provisioning to make one node ANL, others NODE
- *    - Nodes connect to your home WiFi automatically
+ *    Scenario A - Home network only (ESP ANL or PC ANL):
+ *    - ENABLE_HOME_WIFI = 1
+ *    - Use provisioning to make one node ANL + HOME, others NODE + HOME
+ *    - All devices join your home WiFi; the ANL does not create an AP
+ *    - Or set all devices to NODE + HOME and run scripts/pc_anl.py on a PC
  * 
  *    Scenario B - Flexible home and ANL network:
  *    - ENABLE_HOME_WIFI = 1
  *    - Configure home WiFi credentials
- *    - Use provisioning to toggle between HOME and ANL networks per node
+ *    - Use provisioning to toggle between HOME and ANL per device
+ *    - ANL + HOME joins your home WiFi as a station (no AP)
+ *    - ANL + ANL creates the RTLS-NET AP as before
  *    - Great for testing and portable deployments
  * 
  *    Scenario C - ANL network only (original behavior):

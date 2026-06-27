@@ -42,12 +42,6 @@ Or flash a specific node:
 python scripts/ota_flash_all.py --ip 192.168.4.2
 ```
 
-For the **PC-as-ANL / home WiFi prototype**, use:
-
-```powershell
-python -m platformio run -e esp32s3-pc-anl -t upload
-```
-
 > The default environment is `esp32s3-ota`. If you want USB upload by default, switch `default_envs` in `platformio.ini`.
 
 ---
@@ -66,35 +60,41 @@ The ANL will create a WiFi AP named `RTLS-NET-<NNNN>`. Anchors will join it auto
 
 ---
 
-## 4. PC-as-ANL prototype over home WiFi
+## 4. Home WiFi / PC-as-ANL development mode
 
-If you want to avoid the RTLS-NET AP and the ESP32 ANL entirely for prototyping, flash the **PC-ANL** firmware and let your PC do the registry, calibration, and position solving.
+The same firmware works on the **ANL** or on a **NODE**. For development you can let all modules (including the ANL) join your **home WiFi** instead of creating the `RTLS-NET-XXXX` AP.
 
-### Flash all modules as PC-ANL nodes
+### Flash all modules with the unified firmware
 
 ```powershell
-python -m platformio run -e esp32s3-pc-anl -t upload
+python -m platformio run -e esp32s3 -t upload
 ```
 
 Or OTA after the first flash:
 
 ```powershell
-python -m platformio run -e esp32s3-pc-anl-ota -t upload --upload-port <IP>
+python -m platformio run -e esp32s3-ota -t upload --upload-port <IP>
 ```
-
-In this mode:
-- Every module joins your **home WiFi**.
-- No module creates the `RTLS-NET-XXXX` AP.
-- All nodes broadcast heartbeats and range reports to the PC.
-- You control everything from a browser GUI.
 
 ### Configure roles and IDs
 
-1. Set every module to **NODE** system role (not ANL).
+1. **Provision** each module during the 3-second boot window (hold the button):
+   - Set one device to **ANL** (or use a PC running `scripts/pc_anl.py` as the ANL).
+   - Set the others to **NODE**.
+   - In stage 2 choose **HOME** WiFi for every device that should join your home network.
+   - An ANL set to **HOME** joins your home WiFi as a station (no AP); an ANL set to **ANL** creates the `RTLS-NET-XXXX` AP as usual.
 2. Give every module a **unique UWB index** (`0..9`).
-3. The modules will automatically join the home WiFi from `src/wifi_secrets.h`.
+3. Make sure `src/wifi_secrets.h` has `ENABLE_HOME_WIFI 1` and the correct `HOME_WIFI_SSID` / `HOME_WIFI_PASSWORD`.
 
-### Run the PC ANL
+### Behavior in home WiFi mode
+
+- Every module joins your **home WiFi**.
+- No module creates the `RTLS-NET-XXXX` AP.
+- All modules broadcast **heartbeats** and tags broadcast **RPT** range reports to the local network broadcast address.
+- An ESP32 ANL receives the broadcasts, calibrates anchors, and solves tag positions exactly as it does on `RTLS-NET`.
+- A PC on the same home WiFi can run `scripts/pc_anl.py` as an optional GUI for development.
+
+### Run the PC ANL GUI (optional)
 
 ```powershell
 pip install flask
@@ -109,7 +109,11 @@ The web GUI lets you:
 - **Set anchor positions** manually or calibrate them with known tag points.
 - **View live tag positions** as `SOL` would normally show.
 
-### Calibrate in PC-ANL mode
+### What the PC ANL GUI does not do
+
+The GUI is a development helper. It does **not** implement fully automatic anchor calibration (Mode A). For that, use an ESP32 ANL and send `AUTO,1` over UDP, or trigger anchors one-by-one with `CALAUTO,<id>`.
+
+### Calibrate with the PC ANL GUI
 
 1. Use the GUI to switch one module to TAG.
 2. Place it at a measured point and click **Start 15s collection**.

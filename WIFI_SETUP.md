@@ -48,14 +48,12 @@ platformio run --target upload
    - Press button to toggle
    - Hold button to proceed to next stage
 
-2. **Stage 2 - WiFi/Network Configuration:**
-
-   **If NODE + Home WiFi enabled:**
-   - Choose WiFi source: HOME or ANL
+2. **Stage 2 - WiFi/Network Configuration (when Home WiFi is enabled):**
+   - Choose WiFi source: **HOME** or **ANL**
    - Press button to toggle
-   - Hold button to save and reboot
+   - Hold button to proceed
 
-   **If ANL:**
+3. **Stage 3 - Network ID (ANL in ANL mode only):**
    - Set Network ID (1000-9999)
    - Press button to increment
    - Hold button to save and reboot
@@ -73,9 +71,10 @@ Use your home WiFi for all devices:
 ```
 
 **Provisioning:**
-- Make one device: ANL role, Node mode
-- Make others: NODE role, use HOME WiFi
+- Make one device: **ANL** role, use **HOME** WiFi
+- Make others: **NODE** role, use **HOME** WiFi
 - All devices connect to your home WiFi
+- The ANL joins the home network as a station and does not create an AP
 
 ### Scenario 2: Flexible Home + ANL Network
 
@@ -88,8 +87,9 @@ Switch between networks per device:
 ```
 
 **Provisioning:**
-- Each NODE device can choose: HOME or ANL
-- Toggle during provisioning stage 2
+- Each device can choose: HOME or ANL during provisioning stage 2
+- ANL devices in HOME mode join your home WiFi as a station (no AP)
+- ANL devices in ANL mode create the `RTLS-NET-XXXX` AP
 - Perfect for testing and portable setups
 
 ### Scenario 3: ANL Network Only (Original)
@@ -108,10 +108,14 @@ Keep the original ANL-only network:
 ## Device Behavior
 
 ### When ANL Role (systemRole = 1)
-- Creates WiFi Access Point
-- SSID: `RTLS-NET-<NETWORKID>` (e.g., `RTLS-NET-1234`)
-- Acts as central node for calibration
-- Receives heartbeats and position reports
+- **ANL mode (default):** Creates WiFi Access Point
+  - SSID: `RTLS-NET-<NETWORKID>` (e.g., `RTLS-NET-1234`)
+  - Acts as central node for calibration
+  - Receives heartbeats and position reports
+- **Home WiFi mode:** Joins your home WiFi as a station (no AP created)
+  - Receives broadcast heartbeats and RPT range reports
+  - Calibrates anchors and solves tag positions exactly as on `RTLS-NET`
+  - Useful for development with `scripts/pc_anl.py`
 
 ### When NODE Role (systemRole = 0)
 - Connects to WiFi network

@@ -1,7 +1,8 @@
 /*
 For ESP32S3 UWB AT Demo - MERGED FIRMWARE
 Identical binary on all nodes. Behavior set by provisioning:
-- System Role: ANL (AP) or NODE (STA)
+- System Role: ANL or NODE
+- WiFi Source: RTLS-NET AP (ANL creates it, nodes join) or home WiFi STA (all join)
 - UWB Role:    TAG (0) or ANCHOR (1) via AT+ROLE or EEPROM
 - UWB_INDEX:   0..9 (must be UNIQUE per node, ANL can be any index)
 
@@ -38,12 +39,6 @@ Use 2.5.7    Adafruit_SSD1306
 // Set to true to let the ANL auto-calibrate anchors on startup.
 // false means you switch anchors to TAG manually (or via UDP) and use CAL commands.
 #define AUTO_CALIBRATION_DEFAULT false
-
-// Prototype mode: ANL runs on the PC. All modules join your home WiFi and
-// broadcast heartbeats / RPT packets to the PC. No RTLS-NET AP is created.
-#ifndef PC_ANL_MODE
-#define PC_ANL_MODE 0
-#endif
 
 #define BUTTON_PIN 0
 
@@ -118,6 +113,7 @@ void maybeEnterProvisioning();
 void provisioningMenu();
 int waitForButtonEvent(unsigned long timeout);
 void showProvisioningScreen(uint8_t stage);
+void saveProvisioningAndReboot();
 void monitorWifiHealth();
 void updateWifiStatusDisplay();
 void drawAnlDashboard();
@@ -154,7 +150,7 @@ uint8_t uwbIndex = UWB_INDEX_DEFAULT;
 bool otaEnabled = false;
 unsigned long otaEnableTime = 0;
 const unsigned long OTA_TIMEOUT_MS = 120000; // 2 minutes
-bool useHomeWifi = false;  // Flag to use home WiFi instead of ANL network
+bool useHomeWifi = false;  // Flag to use home WiFi instead of creating/joining RTLS-NET
 bool autoCalibrationEnabled = AUTO_CALIBRATION_DEFAULT;
 
 WiFiUDP udp;
@@ -930,12 +926,6 @@ void setup()
     uwbIndex = loadIndex();
     useHomeWifi = loadHomeWifiFlag();
 
-#if PC_ANL_MODE
-    // In prototype mode the PC is the ANL. Every module is just a node.
-    systemRole = 0;
-    useHomeWifi = true;
-#endif
-
     // Let currentRole stay exactly as saved in EEPROM.
     // If EEPROM is blank, loadRole defaults to 1 (Anchor) for safety.
 
@@ -963,7 +953,7 @@ void setup()
     setupOTA();
 
     if (systemRole == 1) {
-        registry[0].ip = WiFi.softAPIP();
+        registry[0].ip = useHomeWifi ? WiFi.localIP() : WiFi.softAPIP();
         registry[0].lastSeen = millis();
         registry[0].x = 0.0f;
         registry[0].y = 0.0f;
@@ -1212,11 +1202,24 @@ void displayReadyScreen()
     }
     display.setCursor(0, 38);
     if (systemRole == 1) {
-        display.print(F("ANL AP: "));
+#if ENABLE_HOME_WIFI
+        if (useHomeWifi) {
+            display.print(F("HOME ANL: "));
+            display.println(HOME_WIFI_SSID);
+        } else
+#endif
+        {
+            display.print(F("ANL AP: "));
+            display.println(ssidForNetId(networkId));
+        }
     } else {
         display.print(F("JOIN NET: "));
+#if ENABLE_HOME_WIFI
+        display.println(useHomeWifi ? HOME_WIFI_SSID : ssidForNetId(networkId));
+#else
+        display.println(ssidForNetId(networkId));
+#endif
     }
-    display.println(ssidForNetId(networkId));
     display.setCursor(0, 52);
     display.print(F("WiFi: "));
     if (systemRole == 1 || WiFi.status() == WL_CONNECTED) {
@@ -1278,7 +1281,9 @@ uint8_t loadRole()
 
 void saveRole(uint8_t role)
 {
-    // EEPROM writes disabled to preserve flash lifetime.
+    // EEPROM writes disabled intentionally: values are loaded from EEPROM but
+    // runtime changes are not persisted. Role switching reconfigures the UWB
+    // module on the fly via configureUWB() without rebooting the ESP32.
     (void)role;
 }
 
@@ -1291,7 +1296,8 @@ uint8_t loadSystemRole()
 
 void saveSystemRole(uint8_t role)
 {
-    // EEPROM writes disabled to preserve flash lifetime.
+    // EEPROM writes disabled intentionally: provisioning values are loaded from
+    // EEPROM but runtime changes are not persisted.
     (void)role;
 }
 
@@ -1306,7 +1312,8 @@ uint16_t loadNetworkId()
 
 void saveNetworkId(uint16_t netId)
 {
-    // EEPROM writes disabled to preserve flash lifetime.
+    // EEPROM writes disabled intentionally: provisioning values are loaded from
+    // EEPROM but runtime changes are not persisted.
     (void)netId;
 }
 
@@ -1319,7 +1326,8 @@ uint8_t loadIndex()
 
 void saveIndex(uint8_t idx)
 {
-    // EEPROM writes disabled to preserve flash lifetime.
+    // EEPROM writes disabled intentionally: provisioning values are loaded from
+    // EEPROM but runtime changes are not persisted.
     (void)idx;
 }
 
@@ -1335,7 +1343,8 @@ bool loadHomeWifiFlag()
 
 void saveHomeWifiFlag(bool flag)
 {
-    // EEPROM writes disabled to preserve flash lifetime.
+    // EEPROM writes disabled intentionally: provisioning values are loaded from
+    // EEPROM but runtime changes are not persisted.
     (void)flag;
 }
 
@@ -1435,7 +1444,7 @@ void configureUWB()
 
 void wifiSetup()
 {
-    if (systemRole == 1) {
+    if (systemRole == 1 && !useHomeWifi) {
         String ssid = ssidForNetId(networkId);
         SERIAL_LOG.print(F("Starting ANL AP: "));
         SERIAL_LOG.println(ssid);
@@ -1550,7 +1559,7 @@ void udpLoop()
 {
     handleIncomingUdp();
 
-    if (systemRole == 0 && WiFi.status() == WL_CONNECTED) {
+    if (WiFi.status() == WL_CONNECTED && (systemRole == 0 || useHomeWifi)) {
         if (millis() - lastHeartbeatTime >= HEARTBEAT_INTERVAL) {
             sendHeartbeat();
             lastHeartbeatTime = millis();
@@ -1571,12 +1580,8 @@ static IPAddress getBroadcastAddress()
 
 static IPAddress getRptDestination()
 {
-#if PC_ANL_MODE
-    return getBroadcastAddress();
-#else
     if (useHomeWifi) return getBroadcastAddress();
     return IPAddress(192, 168, 4, 1);
-#endif
 }
 
 void sendHeartbeat()
@@ -2018,13 +2023,24 @@ registerNode(remoteIp, (uint8_t)tid, knownRole);
     if (systemRole == 0 && len >= 5 && strncmp(buf, "ROLE,", 5) == 0) {
         int newRole = atoi(buf + 5);
         if (newRole == 0 || newRole == 1) {
-            saveRole((uint8_t)newRole);
-            udp.beginPacket(remoteIp, remotePort);
-            udp.print("ACK,ROLE,");
-            udp.println(newRole);
-            udp.endPacket();
-            delay(500);
-            ESP.restart();
+            if (newRole != currentRole) {
+                currentRole = (uint8_t)newRole;
+                saveRole(currentRole);
+                udp.beginPacket(remoteIp, remotePort);
+                udp.print("ACK,ROLE,");
+                udp.println(newRole);
+                udp.endPacket();
+                SERIAL_LOG.print(F("[ROLE] Switched to "));
+                SERIAL_LOG.println(newRole == 0 ? F("TAG") : F("ANCHOR"));
+                displayRoleScreen(currentRole);
+                configureUWB();
+                displayReadyScreen();
+            } else {
+                udp.beginPacket(remoteIp, remotePort);
+                udp.print("ACK,ROLE,");
+                udp.println(newRole);
+                udp.endPacket();
+            }
         }
         return;
     }
@@ -2226,6 +2242,41 @@ void maybeEnterProvisioning()
     }
 }
 
+void saveProvisioningAndReboot()
+{
+    saveSystemRole(systemRole);
+    saveNetworkId(networkId);
+    saveHomeWifiFlag(useHomeWifi);
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 10);
+    display.println(F("PROVISION SAVED"));
+    display.setCursor(0, 22);
+    display.print(F("ROLE: "));
+    display.println(systemRole == 1 ? F("ANL") : F("NODE"));
+#if ENABLE_HOME_WIFI
+    if (systemRole == 0 || useHomeWifi) {
+        display.setCursor(0, 34);
+        display.print(F("WiFi: "));
+        display.println(useHomeWifi ? F("HOME") : F("ANL"));
+    } else {
+        display.setCursor(0, 34);
+        display.print(F("NETID: "));
+        display.println(netIdString(networkId));
+    }
+#else
+    display.setCursor(0, 34);
+    display.print(F("NETID: "));
+    display.println(netIdString(networkId));
+#endif
+    display.setCursor(0, 50);
+    display.println(F("Rebooting..."));
+    display.display();
+    delay(2000);
+    ESP.restart();
+}
+
 void provisioningMenu()
 {
     uint8_t stage = 0;
@@ -2240,52 +2291,33 @@ void provisioningMenu()
                 systemRole = (systemRole == 1) ? 0 : 1;
             } else if (stage == 1) {
 #if ENABLE_HOME_WIFI
-                if (systemRole == 0) {
-                    useHomeWifi = !useHomeWifi;
-                } else {
-                    networkId++;
-                    if (networkId > 9999) networkId = 1000;
-                }
+                useHomeWifi = !useHomeWifi;
 #else
                 networkId++;
                 if (networkId > 9999) networkId = 1000;
 #endif
+            } else if (stage == 2) {
+                networkId++;
+                if (networkId > 9999) networkId = 1000;
             }
         } else if (event == 2) {
             if (stage == 0) {
                 stage = 1;
-            } else {
-                saveSystemRole(systemRole);
-                saveNetworkId(networkId);
-                saveHomeWifiFlag(useHomeWifi);
-                display.clearDisplay();
-                display.setTextSize(1);
-                display.setTextColor(SSD1306_WHITE);
-                display.setCursor(0, 10);
-                display.println(F("PROVISION SAVED"));
-                display.setCursor(0, 22);
-                display.print(F("ROLE: "));
-                display.println(systemRole == 1 ? F("ANL") : F("NODE"));
+            } else if (stage == 1) {
 #if ENABLE_HOME_WIFI
-                if (systemRole == 0) {
-                    display.setCursor(0, 34);
-                    display.print(F("WiFi: "));
-                    display.println(useHomeWifi ? F("HOME") : F("ANL"));
+                // ANL in AP mode still needs a network ID; everything else can save now.
+                if (systemRole == 1 && !useHomeWifi) {
+                    stage = 2;
                 } else {
-                    display.setCursor(0, 34);
-                    display.print(F("NETID: "));
-                    display.println(netIdString(networkId));
+                    saveProvisioningAndReboot();
+                    done = true;
                 }
 #else
-                display.setCursor(0, 34);
-                display.print(F("NETID: "));
-                display.println(netIdString(networkId));
+                saveProvisioningAndReboot();
+                done = true;
 #endif
-                display.setCursor(0, 50);
-                display.println(F("Rebooting..."));
-                display.display();
-                delay(2000);
-                ESP.restart();
+            } else {
+                saveProvisioningAndReboot();
                 done = true;
             }
         }
@@ -2331,31 +2363,18 @@ void showProvisioningScreen(uint8_t stage)
         display.println(F("HOLD TO NEXT"));
     } else if (stage == 1) {
 #if ENABLE_HOME_WIFI
-        if (systemRole == 0) {
-            // NODE mode - show WiFi source selection
-            display.println(F("SELECT WIFI"));
-            display.setCursor(0, 12);
-            display.println(F("SOURCE:"));
-            display.setCursor(0, 28);
-            display.setTextSize(2);
-            display.println(useHomeWifi ? F("HOME") : F("ANL"));
-            display.setTextSize(1);
-            display.setCursor(0, 50);
-            display.println(F("PRESS: TOGGLE"));
-            display.setCursor(0, 58);
-            display.println(F("HOLD: SAVE"));
-        } else {
-            // ANL mode - show Network ID
-            display.println(F("SET NETWORK ID"));
-            display.setCursor(0, 22);
-            display.setTextSize(2);
-            display.println(netIdString(networkId));
-            display.setTextSize(1);
-            display.setCursor(0, 50);
-            display.println(F("PRESS: +1"));
-            display.setCursor(0, 58);
-            display.println(F("HOLD: SAVE"));
-        }
+        // WiFi source selection applies to both ANL and NODE roles.
+        display.println(F("SELECT WIFI"));
+        display.setCursor(0, 12);
+        display.println(F("SOURCE:"));
+        display.setCursor(0, 28);
+        display.setTextSize(2);
+        display.println(useHomeWifi ? F("HOME") : F("ANL"));
+        display.setTextSize(1);
+        display.setCursor(0, 50);
+        display.println(F("PRESS: TOGGLE"));
+        display.setCursor(0, 58);
+        display.println(systemRole == 1 && !useHomeWifi ? F("HOLD: NEXT") : F("HOLD: SAVE"));
 #else
         display.println(F("SET NETWORK ID"));
         display.setCursor(0, 22);
@@ -2367,6 +2386,16 @@ void showProvisioningScreen(uint8_t stage)
         display.setCursor(0, 58);
         display.println(F("HOLD TO SAVE"));
 #endif
+    } else if (stage == 2) {
+        display.println(F("SET NETWORK ID"));
+        display.setCursor(0, 22);
+        display.setTextSize(2);
+        display.println(netIdString(networkId));
+        display.setTextSize(1);
+        display.setCursor(0, 50);
+        display.println(F("PRESS: +1"));
+        display.setCursor(0, 58);
+        display.println(F("HOLD: SAVE"));
     }
     display.display();
 }
@@ -2404,11 +2433,10 @@ void processATCommand(String command)
                 currentRole = newRole;
                 saveRole(currentRole);
 
-                SERIAL_LOG.println(F("Role saved. Please restart the device."));
+                SERIAL_LOG.println(F("Role saved. Reconfiguring UWB..."));
                 displayRoleScreen(currentRole);
-                delay(2000);
-                SERIAL_LOG.println(F("Auto-restarting..."));
-                ESP.restart();
+                configureUWB();
+                displayReadyScreen();
             } else {
                 SERIAL_LOG.println(F("Already in this mode."));
             }
@@ -2423,7 +2451,7 @@ void processATCommand(String command)
 
 void monitorWifiHealth()
 {
-    if (systemRole == 1) return;
+    if (systemRole == 1 && !useHomeWifi) return;
 
     unsigned long now = millis();
     if (now - lastWifiCheckTime < WIFI_CHECK_INTERVAL) return;
