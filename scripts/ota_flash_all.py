@@ -14,6 +14,9 @@ Usage
     # Or flash a specific node only:
     python scripts/ota_flash_all.py --ip 192.168.4.2
 
+    # Use a different build environment (e.g. PC-ANL prototype):
+    python scripts/ota_flash_all.py --env esp32s3-pc-anl-ota
+
 Dependencies
 ------------
     pip install platformio
@@ -61,7 +64,7 @@ def get_broadcast_address():
 BROADCAST = get_broadcast_address()
 OTA_WINDOW_S = 120  # must match OTA_TIMEOUT_MS in firmware
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
-FIRMWARE_BIN = PROJECT_ROOT / ".pio" / "build" / "esp32s3-ota" / "firmware.bin"
+DEFAULT_ENV = "esp32s3-ota"
 
 # ---------------------------------------------------------------------------
 # Discovery
@@ -184,10 +187,10 @@ def find_espota():
     return None
 
 
-def flash_node(ip, bin_path):
+def flash_node(ip, bin_path, env):
     """Run PlatformIO upload to a single IP via espota."""
-    env = os.environ.copy()
-    env["PLATFORMIO_BUILD_DIR"] = str(PROJECT_ROOT / ".pio")
+    env_vars = os.environ.copy()
+    env_vars["PLATFORMIO_BUILD_DIR"] = str(PROJECT_ROOT / ".pio")
 
     # WSL fix: espota binds to WSL's virtual IP, but the ESP32 is on the
     # Windows WiFi network and can't reach it. We must call espota.py
@@ -210,7 +213,7 @@ def flash_node(ip, bin_path):
             print("[WSL] WARNING: Could not detect Windows WiFi IP or find espota.py.")
             print("[WSL] OTA may fail. Try running from Windows PowerShell instead.")
             cmd = [
-                sys.executable, "-m", "platformio", "run", "-e", "esp32s3-ota", "-t", "upload",
+                sys.executable, "-m", "platformio", "run", "-e", env, "-t", "upload",
                 f"--upload-port={ip}",
             ]
     else:
@@ -229,11 +232,11 @@ def flash_node(ip, bin_path):
         else:
             print("[WARN] Could not find espota.py; falling back to 'pio run' (may collide in parallel)")
             cmd = [
-                sys.executable, "-m", "platformio", "run", "-e", "esp32s3-ota", "-t", "upload",
+                sys.executable, "-m", "platformio", "run", "-e", env, "-t", "upload",
                 f"--upload-port={ip}",
             ]
 
-    result = subprocess.run(cmd, cwd=PROJECT_ROOT, capture_output=True, text=True, env=env)
+    result = subprocess.run(cmd, cwd=PROJECT_ROOT, capture_output=True, text=True, env=env_vars)
     if result.returncode == 0:
         print(f"  [FLASH] {ip} SUCCESS")
         return True
@@ -244,10 +247,10 @@ def flash_node(ip, bin_path):
         return False
 
 
-def build_firmware():
-    """Build the esp32s3-ota environment to produce firmware.bin."""
-    print("[BUILD] Building firmware ...")
-    cmd = [sys.executable, "-m", "platformio", "run", "-e", "esp32s3-ota"]
+def build_firmware(env):
+    """Build the requested environment to produce firmware.bin."""
+    print(f"[BUILD] Building firmware for env={env} ...")
+    cmd = [sys.executable, "-m", "platformio", "run", "-e", env]
     result = subprocess.run(cmd, cwd=PROJECT_ROOT, capture_output=True, text=True)
     if result.returncode != 0:
         print("[BUILD] FAILED")
@@ -255,10 +258,6 @@ def build_firmware():
         print(result.stderr[-600:] if len(result.stderr) > 600 else result.stderr)
         sys.exit(1)
     print("[BUILD] OK")
-    if not FIRMWARE_BIN.exists():
-        print(f"[BUILD] Binary not found at {FIRMWARE_BIN}")
-        sys.exit(1)
-    print(f"[BUILD] Binary: {FIRMWARE_BIN}")
 
 
 # ---------------------------------------------------------------------------
@@ -269,13 +268,20 @@ def main():
     parser = argparse.ArgumentParser(description="Flash all RTLS nodes over WiFi")
     parser.add_argument("--ip", action="append", help="Flash specific IP(s) only")
     parser.add_argument("--id", type=int, help="Set UWB index for --ip target")
+    parser.add_argument("--env", default=DEFAULT_ENV, help=f"PlatformIO environment (default: {DEFAULT_ENV})")
     parser.add_argument("--skip-build", action="store_true", help="Skip PlatformIO build")
     parser.add_argument("--skip-discover", action="store_true", help="Skip discovery (use --ip)")
     parser.add_argument("--auto-id", action="store_true", help="Automatically assign IDs 0..N-1 (default: disabled to protect EEPROM)")
     args = parser.parse_args()
 
+    firmware_bin = PROJECT_ROOT / ".pio" / "build" / args.env / "firmware.bin"
+
     if not args.skip_build:
-        build_firmware()
+        build_firmware(args.env)
+        if not firmware_bin.exists():
+            print(f"[BUILD] Binary not found at {firmware_bin}")
+            sys.exit(1)
+        print(f"[BUILD] Binary: {firmware_bin}")
 
     # --- Discovery ---
     if args.ip:
@@ -284,7 +290,7 @@ def main():
         print("[DISC] Scanning network ...")
         nodes = discover_nodes()
         if not nodes:
-            print("[DISC] No nodes found. Are you on the RTLS-NET WiFi?")
+            print("[DISC] No nodes found. Are the modules on the same network?")
             sys.exit(1)
         print(f"[DISC] Found {len(nodes)} node(s)")
     else:
@@ -345,7 +351,7 @@ def main():
     threads = []
 
     def worker(ip):
-        results[ip] = flash_node(ip, FIRMWARE_BIN)
+        results[ip] = flash_node(ip, firmware_bin, args.env)
 
     for ip in ready:
         t = threading.Thread(target=worker, args=(ip,))
