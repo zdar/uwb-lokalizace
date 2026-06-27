@@ -123,6 +123,8 @@ bool solveTagPosition3D(const float ranges[], const uint8_t anchorIds[], int cou
                         float &outX, float &outY, float &outZ);
 bool solveAnchorPosition3D(const float tagPoints[][3], const float ranges[], int count,
                            float &outX, float &outY, float &outZ);
+bool solveSequentialAnchor3D(const float ranges[], const uint8_t anchorIds[], int count,
+                             float &outX, float &outY, float &outZ);
 void anchorCalibration3DLoop();
 bool startCal3DPoint(uint8_t tagId, float x, float y, float z);
 void finishCal3DPoint();
@@ -413,6 +415,95 @@ bool solveAnchorPosition3D(const float tagPoints[][3], const float ranges[], int
     return true;
 }
 
+static bool anchorsAreCoplanarXY(const uint8_t anchorIds[], int count)
+{
+    for (int i = 0; i < count; i++) {
+        float x, y, z;
+        if (!getAnchorPos3D(anchorIds[i], x, y, z)) return false;
+        if (fabs(z) > 1e-3f) return false;
+    }
+    return true;
+}
+
+bool solveSequentialAnchor3D(const float ranges[], const uint8_t anchorIds[], int count,
+                             float &outX, float &outY, float &outZ)
+{
+    if (count >= 3) {
+        bool planar = anchorsAreCoplanarXY(anchorIds, count);
+        if (planar) {
+            // All fixed anchors are in the XY plane. Solve in 2D and pick +Z.
+            float x2, y2;
+            if (!solveTrilateration2D(ranges[0], ranges[1], ranges[2],
+                                      anchorIds[0], anchorIds[1], anchorIds[2],
+                                      x2, y2)) {
+                return false;
+            }
+            float x0, y0, z0;
+            if (!getAnchorPos3D(anchorIds[0], x0, y0, z0)) return false;
+            float dx = x2 - x0;
+            float dy = y2 - y0;
+            float horiz2 = dx*dx + dy*dy;
+            float h2 = ranges[0]*ranges[0] - horiz2;
+            outX = x2;
+            outY = y2;
+            outZ = (h2 > 0.0f) ? sqrt(h2) : 0.0f;
+            return true;
+        }
+        if (count >= 4) {
+            return solveTagPosition3D(ranges, anchorIds, count, outX, outY, outZ);
+        }
+        return false;
+    }
+
+    if (count == 2) {
+        float x0, y0, z0, x1, y1, z1;
+        if (!getAnchorPos3D(anchorIds[0], x0, y0, z0)) return false;
+        if (!getAnchorPos3D(anchorIds[1], x1, y1, z1)) return false;
+        float dx = x1 - x0;
+        float dy = y1 - y0;
+        float dz = z1 - z0;
+        float d = sqrt(dx*dx + dy*dy + dz*dz);
+        float r0 = ranges[0];
+        float r1 = ranges[1];
+        if (d <= 0.0f || d > r0 + r1 || d < fabs(r0 - r1)) return false;
+
+        float a = (r0*r0 - r1*r1 + d*d) / (2.0f * d);
+        float h = sqrt(max(r0*r0 - a*a, 0.0f));
+
+        float xm = x0 + a * dx / d;
+        float ym = y0 + a * dy / d;
+        float zm = z0 + a * dz / d;
+
+        // Perpendicular in the XY plane (anchors are conventionally in XY).
+        float ux = -dy;
+        float uy =  dx;
+        float uz = 0.0f;
+        float ul = sqrt(ux*ux + uy*uy + uz*uz);
+        if (ul < 1e-6f) {
+            ux = 1.0f; uy = 0.0f; uz = 0.0f;
+        } else {
+            ux /= ul; uy /= ul;
+        }
+
+        outX = xm + ux * h;
+        outY = ym + uy * h;
+        outZ = zm + uz * h;
+        return true;
+    }
+
+    if (count == 1) {
+        float x0, y0, z0;
+        if (!getAnchorPos3D(anchorIds[0], x0, y0, z0)) return false;
+        // Place the first solved anchor on the +X axis relative to the reference anchor.
+        outX = x0 + ranges[0];
+        outY = y0;
+        outZ = z0;
+        return true;
+    }
+
+    return false;
+}
+
 static float computeMedianFloats(float* sortedBuf, const float samples[], uint8_t count)
 {
     if (count == 0) return -1.0f;
@@ -501,7 +592,7 @@ IPAddress getNodeIp(uint8_t nodeId)
     return IPAddress();
 }
 
-void commitCalibrationResult(uint8_t targetId, float x, float y)
+void commitCalibrationResult(uint8_t targetId, float x, float y, float z)
 {
     int idx = -1;
     for (int i = 0; i < registryCount; i++) {
@@ -513,7 +604,7 @@ void commitCalibrationResult(uint8_t targetId, float x, float y)
     }
     registry[idx].x = x;
     registry[idx].y = y;
-    registry[idx].z = 0.0f;
+    registry[idx].z = z;
     registry[idx].hasPos = true;
     SERIAL_LOG.print(F("[AUTO] Node ID "));
     SERIAL_LOG.print(targetId);
@@ -521,8 +612,8 @@ void commitCalibrationResult(uint8_t targetId, float x, float y)
     SERIAL_LOG.print(x, 2);
     SERIAL_LOG.print(F(", "));
     SERIAL_LOG.print(y, 2);
-    SERIAL_LOG.print(F(", 0.00"));
-    SERIAL_LOG.println();
+    SERIAL_LOG.print(F(", "));
+    SERIAL_LOG.println(z, 2);
 }
 
 float medianSample(uint8_t anchor)
@@ -617,41 +708,11 @@ void autoCalibrateLoop()
             SERIAL_LOG.print(vc);
             SERIAL_LOG.println(F(" fixed anchors"));
 
-            bool solved = false;
-            float sx = 0, sy = 0;
-
-            if (vc >= 3) {
-                solved = solveTrilateration2D(vr[0], vr[1], vr[2],
-                                              va[0], va[1], va[2],
-                                              sx, sy);
-            } else if (vc == 2) {
-                float x0, y0, x1, y1;
-                if (getAnchorPos(va[0], x0, y0) && getAnchorPos(va[1], x1, y1)) {
-                    float dx = x1 - x0;
-                    float dy = y1 - y0;
-                    float d  = sqrt(dx*dx + dy*dy);
-                    if (d > 0 && d < vr[0] + vr[1] && d > fabs(vr[0] - vr[1])) {
-                        float a = (vr[0]*vr[0] - vr[1]*vr[1] + d*d) / (2.0f * d);
-                        float h = sqrt(max(vr[0]*vr[0] - a*a, 0.0f));
-                        float xm = x0 + a * dx / d;
-                        float ym = y0 + a * dy / d;
-                        float rx = -dy * (h / d);
-                        float ry =  dx * (h / d);
-                        float xa = xm + rx, ya = ym + ry;
-                        float xb = xm - rx, yb = ym - ry;
-                        sx = (ya >= yb) ? xa : xb;
-                        sy = (ya >= yb) ? ya : yb;
-                        solved = true;
-                    }
-                }
-            } else if (vc == 1) {
-                sx = vr[0];
-                sy = 0.0f;
-                solved = true;
-            }
+            float sx = 0.0f, sy = 0.0f, sz = 0.0f;
+            bool solved = solveSequentialAnchor3D(vr, va, vc, sx, sy, sz);
 
             if (solved) {
-                commitCalibrationResult(cal.targetId, sx, sy);
+                commitCalibrationResult(cal.targetId, sx, sy, sz);
             } else {
                 SERIAL_LOG.println(F("[AUTO] Solve failed (geometry/noise)"));
             }
