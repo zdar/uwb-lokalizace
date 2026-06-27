@@ -167,6 +167,20 @@ def _solve_linear_3x3(A, b):
     return [M[0][3], M[1][3], M[2][3]]
 
 
+def _solve_least_squares_3d(A, b):
+    """Solve the over-determined linear system A*x = b in the least-squares sense.
+    A is a list of rows (each length 3). Builds normal equations A^T A x = A^T b.
+    """
+    AtA = [[0.0]*3 for _ in range(3)]
+    Atb = [0.0]*3
+    for row, bi in zip(A, b):
+        for i in range(3):
+            for j in range(3):
+                AtA[i][j] += row[i] * row[j]
+            Atb[i] += row[i] * bi
+    return _solve_linear_3x3(AtA, Atb)
+
+
 def trilaterate_3d(ranges, anchors_coords):
     """
     ranges         – dict {anchor_id: distance}
@@ -181,7 +195,7 @@ def trilaterate_3d(ranges, anchors_coords):
         return None
 
     # Use the first valid anchor as the reference equation.
-    ref_id, ref_r, (x0, y0, z0) = valid[0]
+    _, ref_r, (x0, y0, z0) = valid[0]
     p0sq = x0*x0 + y0*y0 + z0*z0
 
     A = []
@@ -191,7 +205,7 @@ def trilaterate_3d(ranges, anchors_coords):
         pisq = x*x + y*y + z*z
         b.append((pisq - r*r) - (p0sq - ref_r*ref_r))
 
-    sol = _solve_linear_3x3(A, b)
+    sol = _solve_least_squares_3d(A, b)
     if sol is None:
         return None
     return tuple(sol)
@@ -230,21 +244,21 @@ class UWB:
             print(f"[{self.name}] need >=3 anchors, have {len(valid)}")
             return False
 
-        # Use 3D whenever at least 4 anchors are available.
+        # Use 3D whenever at least 4 anchors are available, but fall back to 2D.
         if len(valid) >= 4:
             result = trilaterate_3d(valid, ANCHORS)
-            if result is None:
-                print(f"[{self.name}] 3D trilateration failed (geometry/noise)")
-                return False
-            self.set_loc(*result)
-            print(f"[{self.name}] solved at ({self.x:.2f}, {self.y:.2f}, {self.z:.2f})")
-        else:
-            result = trilaterate(valid, ANCHORS)
-            if result is None:
-                print(f"[{self.name}] trilateration failed (geometry/noise)")
-                return False
-            self.set_loc(*result)
-            print(f"[{self.name}] solved at ({self.x:.2f}, {self.y:.2f})")
+            if result is not None:
+                self.set_loc(*result)
+                print(f"[{self.name}] solved at ({self.x:.2f}, {self.y:.2f}, {self.z:.2f})")
+                return True
+            print(f"[{self.name}] 3D trilateration failed, trying 2D fallback")
+
+        result = trilaterate(valid, ANCHORS)
+        if result is None:
+            print(f"[{self.name}] trilateration failed (geometry/noise)")
+            return False
+        self.set_loc(*result)
+        print(f"[{self.name}] solved at ({self.x:.2f}, {self.y:.2f})")
         return True
 
 
@@ -319,45 +333,47 @@ def parse_rpt_udp(data):
     return None
 
 
+def _parse_sol_parts(parts):
+    """Parse the comma-separated fields of a SOL packet.
+    Accepts both legacy 4-field (x,y) and new 5-field (x,y,z) formats.
+    Returns (tag_id, x, y, z) or None.
+    """
+    try:
+        if len(parts) == 4:
+            tid = int(parts[1])
+            x = float(parts[2])
+            y = float(parts[3])
+            return tid, x, y, 0.0
+        if len(parts) == 5:
+            tid = int(parts[1])
+            x = float(parts[2])
+            y = float(parts[3])
+            z = float(parts[4])
+            return tid, x, y, z
+    except Exception:
+        pass
+    return None
+
+
 def parse_sol_udp(data):
     """
-    UDP packet:  b"SOL,0,123.45,67.89,0.00"
+    UDP packet:  b"SOL,0,123.45,67.89,0.00"  or legacy b"SOL,0,123.45,67.89"
     Returns (tag_id, x, y, z) or None.
     """
     text = data.decode("utf-8", errors="ignore").strip()
     if not text.startswith("SOL,"):
         return None
-    try:
-        parts = text.split(",")
-        if len(parts) != 5:
-            return None
-        tid = int(parts[1])
-        x = float(parts[2])
-        y = float(parts[3])
-        z = float(parts[4])
-        return tid, x, y, z
-    except Exception:
-        return None
+    return _parse_sol_parts(text.split(","))
 
 
 def parse_sol_line(line):
     """
-    Serial line:  "SOL,0,123.45,67.89,0.00"
+    Serial line:  "SOL,0,123.45,67.89,0.00"  or legacy "SOL,0,123.45,67.89"
     Returns (tag_id, x, y, z) or None.
     """
     if not line.startswith("SOL,"):
         return None
-    try:
-        parts = line.split(",")
-        if len(parts) != 5:
-            return None
-        tid = int(parts[1])
-        x = float(parts[2])
-        y = float(parts[3])
-        z = float(parts[4])
-        return tid, x, y, z
-    except Exception:
-        return None
+    return _parse_sol_parts(line.split(","))
 
 
 # ==================== DISPLAY ====================

@@ -30,6 +30,7 @@ import time
 
 ANL_IP = "192.168.4.1"
 UDP_PORT = 50000
+CAL3D_COLLECT_MS = 15000  # must match the ANL's CAL3D_COLLECT_MS
 
 
 def send_cmd(ip, port, cmd, timeout=2.5):
@@ -82,17 +83,24 @@ def interactive(ip, port, tag_id=None):
         cmd = f"CAL,POINT,{tag_id},{x:.2f},{y:.2f},{z:.2f}"
         print(f"  -> {cmd}")
         reply, _ = send_cmd(ip, port, cmd)
-        print(f"  {reply or '(no reply - collecting anyway)'}")
+        print(f"  {reply or '(no reply)'}")
+        if not reply or not reply.startswith("ACK,CAL,POINT"):
+            print("  Point was not accepted by the ANL; not counting it.")
+            continue
+
         points.append((x, y, z))
-        if reply and reply.startswith("ACK,CAL,POINT"):
-            # The ANL collects for CAL3D_COLLECT_MS (default 15s).
-            print("  Wait for the collection window to finish before moving the tag.")
+        # The ANL collects for CAL3D_COLLECT_MS (default 15s).
+        print("  Wait for the collection window to finish before moving the tag.")
 
     if len(points) < 4:
         print(f"\nNeed at least 4 points for 3D solving; got {len(points)}.")
         print("Cancelling calibration on ANL.")
         send_cmd(ip, port, "CAL,CANCEL")
         sys.exit(1)
+
+    # Make sure the last point's collection window has closed before solving.
+    print(f"\nWaiting {CAL3D_COLLECT_MS}ms for the last point's collection window ...")
+    time.sleep(CAL3D_COLLECT_MS / 1000.0)
 
     print("\nSending CAL,SOLVE ...")
     reply, _ = send_cmd(ip, port, "CAL,SOLVE")
