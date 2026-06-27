@@ -42,6 +42,12 @@ Or flash a specific node:
 python scripts/ota_flash_all.py --ip 192.168.4.2
 ```
 
+For the **PC-as-ANL / home WiFi prototype**, use:
+
+```powershell
+python -m platformio run -e esp32s3-pc-anl -t upload
+```
+
 > The default environment is `esp32s3-ota`. If you want USB upload by default, switch `default_envs` in `platformio.ini`.
 
 ---
@@ -60,7 +66,61 @@ The ANL will create a WiFi AP named `RTLS-NET-<NNNN>`. Anchors will join it auto
 
 ---
 
-## 4. Fully automatic 3D calibration
+## 4. PC-as-ANL prototype over home WiFi
+
+If you want to avoid the RTLS-NET AP and the ESP32 ANL entirely for prototyping, flash the **PC-ANL** firmware and let your PC do the registry, calibration, and position solving.
+
+### Flash all modules as PC-ANL nodes
+
+```powershell
+python -m platformio run -e esp32s3-pc-anl -t upload
+```
+
+Or OTA after the first flash:
+
+```powershell
+python -m platformio run -e esp32s3-pc-anl-ota -t upload --upload-port <IP>
+```
+
+In this mode:
+- Every module joins your **home WiFi**.
+- No module creates the `RTLS-NET-XXXX` AP.
+- All nodes broadcast heartbeats and range reports to the PC.
+- You control everything from a browser GUI.
+
+### Configure roles and IDs
+
+1. Set every module to **NODE** system role (not ANL).
+2. Give every module a **unique UWB index** (`0..9`).
+3. The modules will automatically join the home WiFi from `src/wifi_secrets.h`.
+
+### Run the PC ANL
+
+```powershell
+pip install flask
+python scripts/pc_anl.py
+```
+
+Open the URL it prints, e.g. `http://192.168.1.42:5000`.
+
+The web GUI lets you:
+- **Discover** all nodes on the home WiFi.
+- **Switch roles** between TAG and ANCHOR with a button click.
+- **Set anchor positions** manually or calibrate them with known tag points.
+- **View live tag positions** as `SOL` would normally show.
+
+### Calibrate in PC-ANL mode
+
+1. Use the GUI to switch one module to TAG.
+2. Place it at a measured point and click **Start 15s collection**.
+3. Move it to at least 4 different points and repeat.
+4. Click **Solve anchors**.
+5. Switch the module back to ANCHOR.
+6. Done — the PC now knows all anchor positions and solves tag positions live.
+
+---
+
+## 6. Fully automatic 3D calibration
 
 > **Experimental.** The ANL does everything, but role switching can be unreliable on some modules (slow reboots, stuck in TAG mode, missed packets). It is now **disabled by default**. Enable it only when you want to test it.
 
@@ -129,11 +189,11 @@ This tells the ANL to switch anchor `2` to TAG mode, collect ranges, solve, and 
 
 ---
 
-## 5. Calibration with a tag at known 3D points
+## 7. Calibration with a tag at known 3D points
 
 Use this when you have surveyed reference points and want a precise global coordinate frame.
 
-### 5.1 Prepare the calibration tag
+### 7.1 Prepare the calibration tag
 
 Put the calibration tag into **TAG mode** using the button menu or by sending:
 
@@ -145,7 +205,7 @@ python scripts/ota_flash_all.py --ip <tag-ip> --id <tag-index>
 
 The tag will start sending `AT+RANGE` reports to the ANL.
 
-### 5.2 Define known 3D points
+### 7.2 Define known 3D points
 
 Choose at least **4** distinct points. Measure each point relative to the ANL origin:
 
@@ -165,7 +225,7 @@ P4: (100,  50,  50)
 
 > Spread points in 3D (not coplanar) for the most accurate anchor positions.
 
-### 5.3 Run the calibration wizard
+### 7.3 Run the calibration wizard
 
 Connect your PC to the `RTLS-NET-<NNNN>` WiFi, then run:
 
@@ -200,7 +260,7 @@ For each anchor, the ANL builds a list of `(known tag position, median range)` p
 
 ---
 
-## 6. Verify the result
+## 8. Verify the result
 
 Open the ANL's serial monitor or read the registry table printed every 5 seconds:
 
@@ -216,7 +276,7 @@ The ANL itself stays at `(0, 0, 0)`. All other anchors should now have realistic
 
 ---
 
-## 7. Normal operation
+## 9. Normal operation
 
 After calibration, the ANL automatically solves any tag's 3D position from the ranges it receives:
 
@@ -247,7 +307,7 @@ A window will show anchors in green and tags in red, with `x, y, z` coordinates.
 
 ---
 
-## 8. Manual calibration commands (optional)
+## 10. Manual calibration commands (optional)
 
 You can also drive calibration manually without the wizard:
 
@@ -272,7 +332,7 @@ Wait ~15 seconds between each `--point` and before `--solve` so the ANL can coll
 
 ---
 
-## 9. Troubleshooting
+## 11. Troubleshooting
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
@@ -285,7 +345,7 @@ Wait ~15 seconds between each `--point` and before `--solve` so the ANL can coll
 
 ---
 
-## 10. Notes
+## 12. Notes
 
 - The ANL is fixed at `(0, 0, 0)`. If you want a different global origin, measure all tag points relative to the ANL and then offset the solved coordinates mentally or in your downstream software.
 - `POS` packets now accept an optional `z`: `POS,<x>,<y>,<z>` or `POS,<ip>,<x>,<y>,<z>`.

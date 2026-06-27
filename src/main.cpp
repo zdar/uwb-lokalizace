@@ -39,6 +39,12 @@ Use 2.5.7    Adafruit_SSD1306
 // false means you switch anchors to TAG manually (or via UDP) and use CAL commands.
 #define AUTO_CALIBRATION_DEFAULT false
 
+// Prototype mode: ANL runs on the PC. All modules join your home WiFi and
+// broadcast heartbeats / RPT packets to the PC. No RTLS-NET AP is created.
+#ifndef PC_ANL_MODE
+#define PC_ANL_MODE 0
+#endif
+
 #define BUTTON_PIN 0
 
 #define EEPROM_SIZE 512
@@ -924,6 +930,12 @@ void setup()
     uwbIndex = loadIndex();
     useHomeWifi = loadHomeWifiFlag();
 
+#if PC_ANL_MODE
+    // In prototype mode the PC is the ANL. Every module is just a node.
+    systemRole = 0;
+    useHomeWifi = true;
+#endif
+
     // Let currentRole stay exactly as saved in EEPROM.
     // If EEPROM is blank, loadRole defaults to 1 (Anchor) for safety.
 
@@ -1546,10 +1558,31 @@ void udpLoop()
     }
 }
 
+static IPAddress getBroadcastAddress()
+{
+    IPAddress ip = WiFi.localIP();
+    IPAddress mask = WiFi.subnetMask();
+    IPAddress bc;
+    for (int i = 0; i < 4; i++) {
+        bc[i] = ip[i] | ((uint8_t)(~mask[i]) & 0xFF);
+    }
+    return bc;
+}
+
+static IPAddress getRptDestination()
+{
+#if PC_ANL_MODE
+    return getBroadcastAddress();
+#else
+    if (useHomeWifi) return getBroadcastAddress();
+    return IPAddress(192, 168, 4, 1);
+#endif
+}
+
 void sendHeartbeat()
 {
     String payload = String("HB,") + uwbIndex + "," + currentRole + "," + networkId;
-    udp.beginPacket("192.168.4.1", WIFI_PORT);
+    udp.beginPacket(getBroadcastAddress(), WIFI_PORT);
     udp.write((const uint8_t *)payload.c_str(), payload.length());
     udp.endPacket();
     SERIAL_LOG.print(F("Heartbeat sent: "));
@@ -1563,7 +1596,7 @@ void relayUwbLine(const char* line)
     char pkt[280];
     snprintf(pkt, sizeof(pkt), "RPT,%s", line);
 
-    udp.beginPacket("192.168.4.1", WIFI_PORT);
+    udp.beginPacket(getRptDestination(), WIFI_PORT);
     udp.write((const uint8_t*)pkt, strlen(pkt));
     udp.endPacket();
 }
