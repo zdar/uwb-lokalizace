@@ -24,7 +24,8 @@ Stručně:
 | `specifikace.md` | Původní specifikace |
 | `architektura.md` | Finální architektonické rozhodnutí |
 | `anchors.json` | Runtime uložení pozic kotev (neposílej do gitu) |
-| `data/scans/scans_*.jsonl` | Uložené skeny (neposílej do gitu) |
+| `data/scans/scans_raw_*.csv` | Raw RPT vzorky (neposílej do gitu) |
+| `data/scans/scans_computed_*.csv` | Vypočtené pozice skenů (neposílej do gitu) |
 
 ## Rychlý start
 
@@ -51,4 +52,4 @@ Spusť skener:
 .venv\Scripts\python.exe esp-cam\qr_scanner.py
 ```
 
-Skeny se ukládají do `data/scans_YYYYMMDD.jsonl`.
+Skeny se ukládají do `data/scans/scans_raw_YYYYMMDD.csv` (raw RPT vzorky) a `data/scans/scans_computed_YYYYMMDD.csv` (vypočtené pozice).

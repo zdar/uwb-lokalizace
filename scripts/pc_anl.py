@@ -39,6 +39,7 @@ from positioning.position import (
 )
 
 UDP_PORT = 50000
+RAW_RPT_FORWARD_PORT = 50001   # forward raw RPT packets for qr_scanner.py
 HEARTBEAT_TIMEOUT_MS = 15000
 CAL3D_COLLECT_MS = 15000
 
@@ -112,6 +113,18 @@ def save_anchors():
         log(f"Saved {len(anchors)} anchor(s) to {ANCHORS_FILE}")
     except Exception as e:
         log(f"Failed to save anchors: {e}")
+
+
+# UDP socket for forwarding raw RPT packets to qr_scanner.py.
+_forward_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+
+def forward_raw_rpt(text):
+    """Forward the raw RPT line to qr_scanner.py on localhost."""
+    try:
+        _forward_sock.sendto(text.encode(), ("127.0.0.1", RAW_RPT_FORWARD_PORT))
+    except Exception:
+        pass
 
 
 def log(msg):
@@ -397,6 +410,7 @@ def udp_listener():
                     "has_pos": False,
                 }
         elif text.startswith("RPT,"):
+            forward_raw_rpt(text)
             handle_rpt(text[4:])
 
 

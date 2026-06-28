@@ -1,14 +1,14 @@
-import cv2
-import json
+import csv
 import os
+import socket
 import time
 import random
 import winsound
 import threading
-import statistics
 from datetime import datetime, timezone
-from collections import defaultdict
+from collections import defaultdict, deque
 
+import cv2
 import numpy as np
 import requests
 from pyzbar.pyzbar import decode
@@ -16,16 +16,22 @@ from pyzbar.pyzbar import decode
 # --- KONFIGURACE -----------------------------------------------------------
 ESP32_CAM_STREAM = "http://192.168.0.159:81/stream"
 PC_ANL_URL = "http://localhost:5000/state"
+RAW_RPT_PORT = 50001
 TAG_ID = None                                 # None = prvni aktivni tag; jinak cislo
 
 # Jak dlouho po detekci QR sbirame vzorky pro median (ms).
 SAMPLE_WINDOW_MS = 500
-# Cooldown mezi dvema ruznymi QR kody (ms).
-QR_COOLDOWN_MS = 1500
+# Cooldown mezi dvema skeny (ms).
+SCAN_COOLDOWN_MS = 1500
+# Maximalni pocet nedavnych RPT paketu drzenych v pameti.
+RPT_HISTORY_LEN = 200
 
-# Kam se ukladaji scan soubory.
-OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "scans")
+OUTPUT_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "scans"
+)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+ANCHOR_COUNT = 10
 
 
 # --- SDILENY STAV ----------------------------------------------------------
@@ -33,28 +39,59 @@ class SharedState:
     def __init__(self):
         self.lock = threading.Lock()
         self.frame = None
-        self.uwb_state = None       # posledni /state odpoved z PC ANL
-        self.last_save_info = None  # (qr, x, y, z, source, cas)
+        self.uwb_state = None
+        self.latest_rpt = None           # posledni RPT paket
+        self.rpt_history = deque(maxlen=RPT_HISTORY_LEN)
+        self.last_save_info = None
         self.running = True
 
 
 state = SharedState()
 
 
-# --- ULOZISTE --------------------------------------------------------------
-def output_filename():
+# --- ULOZISTE CSV ----------------------------------------------------------
+def output_filenames():
     today = datetime.now(timezone.utc).strftime("%Y%m%d")
-    return os.path.join(OUTPUT_DIR, f"scans_{today}.jsonl")
+    raw = os.path.join(OUTPUT_DIR, f"scans_raw_{today}.csv")
+    computed = os.path.join(OUTPUT_DIR, f"scans_computed_{today}.csv")
+    return raw, computed
 
 
-def save_scan(record: dict):
-    path = output_filename()
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
-    print(f"[ULOZENO] {path}: QR={record['qr_raw']}")
+def init_csv_files():
+    raw, computed = output_filenames()
+    if not os.path.exists(raw):
+        with open(raw, "w", newline="", encoding="utf-8") as f:
+            header = [
+                "timestamp", "scan_id", "qr_raw", "tag_id",
+                *[f"range_{i}" for i in range(ANCHOR_COUNT)],
+                "pos_x", "pos_y", "pos_z", "pos_source", "rpt_age_ms"
+            ]
+            csv.writer(f).writerow(header)
+    if not os.path.exists(computed):
+        with open(computed, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow([
+                "timestamp", "scan_id", "qr_raw", "x", "y", "z",
+                "source", "samples_count"
+            ])
+    return raw, computed
 
 
-# --- UWB POZICE A RAW DATA -------------------------------------------------
+def append_raw_rows(rows):
+    raw, _ = output_filenames()
+    init_csv_files()
+    with open(raw, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerows(rows)
+
+
+def append_computed_row(row):
+    _, computed = output_filenames()
+    init_csv_files()
+    with open(computed, "a", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow(row)
+
+
+# --- UWB / PC ANL ----------------------------------------------------------
 def normalize_pos(pos):
     if not pos:
         return None
@@ -78,13 +115,11 @@ def pick_tag_data(data):
     tags = data.get("tags", {}) if data else {}
     if not tags:
         return None
-
     if TAG_ID is not None:
         tid = str(TAG_ID)
         if tid in tags and tags[tid].get("pos"):
             return tags[tid]
         return None
-
     for tid, t in tags.items():
         if t.get("pos"):
             return t
@@ -97,6 +132,64 @@ def uwb_poller_thread():
         with state.lock:
             state.uwb_state = uwb
         time.sleep(0.15)
+
+
+# --- RAW RPT UDP LISTENER --------------------------------------------------
+def parse_rpt(text):
+    """RPT,8:0=389,1=480,... -> (tag_id, {aid: dist})"""
+    try:
+        text = text[4:]  # odstran 'RPT,'
+        tid_str, rest = text.split(":", 1)
+        tid = int(tid_str)
+        ranges = {}
+        for pair in rest.split(","):
+            if "=" not in pair:
+                continue
+            aid, dist = pair.split("=", 1)
+            ranges[int(aid)] = float(dist)
+        return tid, ranges
+    except Exception:
+        return None, None
+
+
+def rpt_listener_thread():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind(("0.0.0.0", RAW_RPT_PORT))
+    except OSError as e:
+        print(f"[RPT] nelze bindnout port {RAW_RPT_PORT}: {e}")
+        state.running = False
+        return
+    sock.settimeout(0.5)
+    print(f"[RPT] nasloucham na portu {RAW_RPT_PORT}")
+
+    while state.running:
+        try:
+            data, addr = sock.recvfrom(1024)
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+
+        text = data.decode("utf-8", errors="ignore").strip()
+        if not text.startswith("RPT,"):
+            continue
+
+        tid, ranges = parse_rpt(text)
+        if tid is None:
+            continue
+
+        now_ms = int(time.time() * 1000)
+        packet = {
+            "timestamp": now_ms,
+            "tag_id": tid,
+            "ranges": ranges,
+        }
+        with state.lock:
+            state.latest_rpt = packet
+            state.rpt_history.append(packet)
+    sock.close()
 
 
 # --- KAMERA ----------------------------------------------------------------
@@ -116,28 +209,29 @@ def capture_thread():
     cap.release()
 
 
-# --- QR S OVERSAMPLINGEM ---------------------------------------------------
 def decode_latest_qr(frame):
     codes = decode(frame)
     if not codes:
         return None
-    # Vezmeme prvni uspesne rozpoznany kod.
     return codes[0].data.decode("utf-8")
 
 
+# --- QR S OVERSAMPLINGEM ---------------------------------------------------
 def median_3d(points):
     if not points:
         return None
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    zs = [p[2] for p in points]
     return (
-        statistics.median([p[0] for p in points]),
-        statistics.median([p[1] for p in points]),
-        statistics.median([p[2] for p in points]),
+        sum(xs) / len(xs),
+        sum(ys) / len(ys),
+        sum(zs) / len(zs),
     )
 
 
-def qr_oversample_thread():
-    last_qr_time = 0
-    last_qr_text = None
+def qr_scan_thread():
+    init_csv_files()
     cooldown_until = 0
 
     while state.running:
@@ -145,7 +239,6 @@ def qr_oversample_thread():
 
         with state.lock:
             frame = state.frame
-            uwb_data = state.uwb_state
 
         if frame is None:
             time.sleep(0.02)
@@ -156,45 +249,58 @@ def qr_oversample_thread():
             time.sleep(0.05)
             continue
 
-        # Zacatek oversampling okna.
         print(f"[QR] detekovan '{qr}', sbiram vzorky {SAMPLE_WINDOW_MS}ms...")
+        scan_id = now_ms
+        window_end = now_ms + SAMPLE_WINDOW_MS
+
         samples = []
         qr_votes = defaultdict(int)
-        window_end = now_ms + SAMPLE_WINDOW_MS
+        collected_positions = []
 
         while int(time.time() * 1000) < window_end and state.running:
             with state.lock:
                 f = state.frame
+                latest_rpt = state.latest_rpt
                 uwb = state.uwb_state
 
             if f is not None:
                 q = decode_latest_qr(f)
                 if q:
                     qr_votes[q] += 1
+
+            if latest_rpt:
+                rpt_age = int(time.time() * 1000) - latest_rpt["timestamp"]
+                if rpt_age < 500:
+                    row_ranges = [latest_rpt["ranges"].get(i, "") for i in range(ANCHOR_COUNT)]
                     t_data = pick_tag_data(uwb)
-                    if t_data:
-                        pos = normalize_pos(t_data.get("pos"))
-                        if pos:
-                            samples.append({
-                                "timestamp": datetime.now(timezone.utc).isoformat(),
-                                "pos": pos,
-                                "ranges": {str(aid): float(r) for aid, r in t_data.get("ranges", {}).items()},
-                            })
+                    if t_data and t_data.get("pos"):
+                        pos = normalize_pos(t_data["pos"])
+                        pos_source = "UWB"
+                        collected_positions.append(pos)
+                    else:
+                        pos = None
+                        pos_source = "SIM"
+                    samples.append({
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "tag_id": latest_rpt["tag_id"],
+                        "ranges": row_ranges,
+                        "pos": pos,
+                        "pos_source": pos_source,
+                        "rpt_age_ms": rpt_age,
+                    })
+
             time.sleep(0.03)
 
         if not qr_votes:
             continue
 
-        # Vyber nejcastejsi QR kod v okne.
         winner = max(qr_votes, key=qr_votes.get)
         if winner != qr:
             print(f"[QR] zmena behem okna: '{qr}' -> '{winner}', ignoruji")
             continue
 
-        # Vypocti median pozice ze vzorku.
-        positions = [s["pos"] for s in samples if s.get("pos")]
-        if positions:
-            x, y, z = median_3d(positions)
+        if collected_positions:
+            x, y, z = median_3d(collected_positions)
             source = "UWB"
         else:
             x = max(0.0, min(100.0, 50.0 + random.uniform(-5.0, 5.0)))
@@ -202,28 +308,35 @@ def qr_oversample_thread():
             z = max(0.0, min(10.0, 5.0 + random.uniform(-1.0, 1.0)))
             source = "SIM"
 
-        record = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "qr_raw": winner,
-            "computed": {
-                "x": round(x, 2),
-                "y": round(y, 2),
-                "z": round(z, 2),
-                "source": source,
-                "samples_used": len(positions),
-            },
-            "raw_samples": samples,
-            "anchors": {str(aid): list(p) for aid, p in (uwb_data or {}).get("anchors", {}).items()},
-        }
+        ts = datetime.now(timezone.utc).isoformat()
 
-        save_scan(record)
+        # Raw CSV rows
+        raw_rows = []
+        for s in samples:
+            pos = s["pos"] or (None, None, None)
+            raw_rows.append([
+                s["timestamp"], scan_id, winner, s["tag_id"],
+                *s["ranges"],
+                pos[0] if pos[0] is not None else "",
+                pos[1] if pos[1] is not None else "",
+                pos[2] if pos[2] is not None else "",
+                s["pos_source"], s["rpt_age_ms"]
+            ])
+        append_raw_rows(raw_rows)
+
+        # Computed CSV row
+        append_computed_row([
+            ts, scan_id, winner, round(x, 2), round(y, 2), round(z, 2),
+            source, len(samples)
+        ])
+
+        print(f"[ULOZENO] QR={winner} X={x:.2f} Y={y:.2f} Z={z:.2f} ({source}) vzorku={len(samples)}")
 
         with state.lock:
             state.last_save_info = (winner, x, y, z, source, int(time.time() * 1000))
 
         winsound.Beep(1500, 150)
-        last_qr_text = winner
-        cooldown_until = int(time.time() * 1000) + QR_COOLDOWN_MS
+        cooldown_until = int(time.time() * 1000) + SCAN_COOLDOWN_MS
 
 
 # --- HUD -------------------------------------------------------------------
@@ -233,7 +346,6 @@ def draw_hud(display_frame, uwb_data, last_save):
     canvas = np.zeros((h + BAR_H, w, 3), dtype=np.uint8)
     canvas[BAR_H:, :] = display_frame
 
-    # Hlavni souradnice
     t_data = pick_tag_data(uwb_data)
     if t_data and t_data.get("pos"):
         x, y, z = normalize_pos(t_data["pos"])
@@ -262,13 +374,15 @@ def main():
     print("\n--- QR SKENER (ESP32-CAM + UWB) ---")
     print(f"Stream: {ESP32_CAM_STREAM}")
     print(f"UWB:    {PC_ANL_URL}")
+    print(f"RPT:    UDP {RAW_RPT_PORT}")
     print(f"Output: {OUTPUT_DIR}")
     print("[Q] - Ukoncit program\n")
 
     threads = [
         threading.Thread(target=capture_thread, daemon=True),
+        threading.Thread(target=rpt_listener_thread, daemon=True),
         threading.Thread(target=uwb_poller_thread, daemon=True),
-        threading.Thread(target=qr_oversample_thread, daemon=True),
+        threading.Thread(target=qr_scan_thread, daemon=True),
     ]
     for t in threads:
         t.start()

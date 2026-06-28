@@ -1,36 +1,41 @@
 # Architektura: UWB + QR skener pro sledování demontáže
 
-Tento dokument shrnuje finální přístup, na kterém jsme se dohodli po testování jednotlivých komponent. Nahrazuje prototypový směr (lokální QR dekódování na ESP32-CAM pomocí quirc) robustnějším řešením založeným na PC.
+Tento dokument shrnuje finální přístup, na kterém jsme se dohodli po testování jednotlivých komponent.
 
 ## 1. Základní rozhodnutí
 
 - **PC jako ANL**: Místo ESP32 ANL používáme `scripts/pc_anl.py` běžící na PC.
 - **Přenosný WiFi router**: V tunelu vytváří lokální síť pro všechna zařízení.
-- **ESP32-CAM jako síťová kamera**: Nepředává QR kódy sama, ale streamuje obraz do PC.
-- **QR dekódování na PC**: Používáme osvědčenou knihovnu `pyzbar` v Pythonu.
-- **UWB pozice z PC ANL**: QR skener čte aktuální pozici TAGu z `pc_anl.py` API.
+- **ESP32-CAM jako síťová kamera**: Streamuje MJPEG obraz do PC.
+- **QR dekódování na PC**: Používáme `pyzbar` v `esp-cam/qr_scanner.py`.
+- **Raw RPT data**: `qr_scanner.py` naslouchá na UDP 50001 a dostává přeposílané raw `RPT` pakety přímo z `pc_anl.py`.
+- **Ukládání do CSV**: Pro každý scan se uloží raw vzorky i vypočtená pozice pro snadné postprocessing.
 
 ## 2. Komponenty
 
 | Komponenta | Hardware/Software | Role |
 | :--- | :--- | :--- |
 | **UWB moduly** | MaUWB-ESP32S3 (Makerfabs) | 1× TAG + 9× ANCHOR pro trilateraci |
-| **PC ANL** | `scripts/pc_anl.py` | Sbírá vzdálenosti, řeší pozice, ukládá kotvy |
-| **QR skener** | `esp-cam/qr_scanner.py` | Čte QR z ESP32-CAM streamu a ukládá lokálně |
+| **PC ANL** | `scripts/pc_anl.py` | Sbírá vzdálenosti, řeší pozice, ukládá kotvy, forwarduje RPT |
+| **QR skener** | `esp-cam/qr_scanner.py` | Čte QR z ESP32-CAM streamu, sbírá raw RPT, ukládá CSV |
 | **Kamera** | AI-Thinker ESP32-CAM | Streamuje MJPEG přes WiFi (`CameraWebServer`) |
 | **Síť** | Přenosný WiFi router | Spojuje všechna zařízení v tunelu |
-| **Uložiště** | `data/scans/scans_YYYYMMDD.jsonl` | Ukládá `{qr_raw, pozice, raw samples, timestamp}` |
+| **Uložiště** | `data/scans/scans_raw_YYYYMMDD.csv` | Jedna řádka za každý raw RPT vzorek |
+| **Uložiště** | `data/scans/scans_computed_YYYYMMDD.csv` | Jedna řádka za každý uložený QR scan |
 
 ## 3. Tok dat
 
 ```
-ESP32-CAM  ──MJPEG stream──▶  PC (blueprint_esp.py)
+ESP32-CAM  ──MJPEG stream──▶  PC (qr_scanner.py)
                                    │
                                    ▼
-UWB TAG  ──RPT──▶  PC ANL (pc_anl.py)  ──HTTP /state──▶  QR skener
-                                   │                         │
-                                   ▼                         ▼
-                         data/scans_YYYYMMDD.jsonl  ◀──  {qr, x, y, z, raw}
+UWB TAG  ──RPT──▶  PC ANL (pc_anl.py)  ──forward UDP 50001──▶  qr_scanner.py
+                                   │                              │
+                                   │                              ▼
+                                   │                         raw RPT oversampling
+                                   │                              │
+                                   ▼                              ▼
+                         data/scans/scans_*.csv  ◀──  {qr, x, y, z, raw ranges}
 ```
 
 ## 4. Spuštění systému
@@ -55,45 +60,47 @@ Otevři v prohlížeči zobrazenou adresu, objev uzly, nastav nebo vykalibruj ko
    ```
    Camera Ready! Use 'http://192.168.x.y' to connect
    ```
-3. Zapiš ji do `esp-cam/blueprint_esp.py`:
+3. Zapiš ji do `esp-cam/qr_scanner.py`:
    ```python
    ESP32_CAM_STREAM = "http://192.168.x.y:81/stream"
    ```
 
 ### 4.4 QR skener
-Nastav IP ESP32-CAM v `esp-cam/qr_scanner.py`:
-```python
-ESP32_CAM_STREAM = "http://192.168.x.y:81/stream"
-```
-
-Spusť skener:
 ```powershell
+cd C:\Projects\uwb-lokalizace
 .venv\Scripts\python.exe esp-cam\qr_scanner.py
 ```
 
-Ukaž QR kód kameře. Skener provede **oversampling**: po detekci sbírá vzorky po dobu 500 ms, vybere nejčastější QR kód a uloží mediánovou pozici. Vše se zapisuje do `data/scans/scans_YYYYMMDD.jsonl` včetně raw UWB ranges a pozic kotev.
+Ukaž QR kód kameře. Skener provede **oversampling**:
+- Po detekci QR sbírá raw `RPT` vzorky po dobu 500 ms.
+- Vybere nejčastější QR kód v okně.
+- Uloží mediánovou pozici a všechny raw vzorky.
+
+Výstupní soubory:
+- `data/scans/scans_raw_YYYYMMDD.csv` — jedna řádka za každý RPT vzorek, `qr_raw` je opakováno pro každý vzorek.
+- `data/scans/scans_computed_YYYYMMDD.csv` — jedna řádka za finální scan s vypočtenou pozicí.
 
 ## 5. Ukládání pozic kotev
 
-Soubor `anchors.json` v kořenu projektu ukládá kalibrované pozice kotev mezi spuštěními `pc_anl.py`. Kotvy se ukládají automaticky při:
-- ručním nastavení pozice,
-- řešení kalibračních bodů,
-- úspěšném automatickém dokalibrání kotvy.
+Soubor `anchors.json` v kořenu projektu ukládá kalibrované pozice kotev mezi spuštěními `pc_anl.py`. Kotvy se ukládají automaticky při ručním nastavení, řešení kalibračních bodů nebo automatickém dokalibrání.
 
-V GUI jsou také tlačítka **Save anchors** a **Load anchors**.
+## 6. Formát raw CSV
 
-## 6. Proč tento přístup
+```csv
+timestamp,scan_id,qr_raw,tag_id,range_0,range_1,range_2,range_3,range_4,range_5,range_6,range_7,range_8,range_9,pos_x,pos_y,pos_z,pos_source,rpt_age_ms
+```
 
-| Problém | Původní přístup (quirc na ESP) | Finální přístup (PC pyzbar) |
+- Prázdné `range_N` znamená, že daná kotva nebyla v daném RPT paketu vidět.
+- `pos_x/y/z` je pozice z `pc_anl.py /state` v daném okamžiku (může být prázdná).
+- `rpt_age_ms` je stáří RPT paketu v době uložení.
+
+## 7. Proč tento přístup
+
+| Problém | Původní přístup (quirc na ESP) | Finální přístup (PC pyzbar + raw RPT) |
 | :--- | :--- | :--- |
 | **Spolehlivost QR** | quirc často nečte | pyzbar funguje spolehlivě |
 | **Paměť/stack** | stack overflow v loopTask | žádné omezení na PC |
 | **Tunel / router** | ESP ANL max ~10 klientů | PC ANL + router zvládne vše |
 | **Rychlost** | pomalé HTTP `/capture` | MJPEG `/stream` je plynulý |
+| **Raw data** | žádná | každý RPT paket uložen pro postprocessing |
 | **Vývoj** | těžko debugovatelné | stejné prostředí jako blueprint |
-
-## 7. Omezení
-
-- PC musí být v tunelu zapnutý a připojený k síti.
-- TAG musí být v dosahu alespoň 3–4 kotev pro řešení pozice (3 pro 2D, 4 pro 3D).
-- Pro spolehlivé 3D musí být kotvy nekomplanární (alespoň jedna v jiné výšce).
