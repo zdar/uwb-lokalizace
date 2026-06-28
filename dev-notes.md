@@ -8,7 +8,7 @@
 `data/scans/scans_raw_YYYYMMDD.csv` is created with the correct header, but no data rows are appended. The `scans_computed_YYYYMMDD.csv` file does get rows.
 
 ## Likely root cause
-In `esp-cam/qr_scanner.py`, `qr_scan_thread()` collects raw RPT samples by reading `state.latest_rpt` every 30 ms during the 500 ms oversampling window. It only keeps the single most recent packet.
+In `esp-cam/qr_scanner.py`, `qr_scan_thread()` collects raw RPT samples from `state.rpt_history` during the oversampling window. It should keep all unique packets received in the window.
 
 If the TAG sends RPT packets slower than the sample loop, or if the timing is unlucky, the `latest_rpt` seen during the window is either:
 - too old (`rpt_age >= 500 ms`), so it is skipped, or
@@ -19,25 +19,7 @@ The `rpt_listener_thread` already populates `state.rpt_history` (a deque), but `
 ## Suggested fix
 During the oversampling window, collect **all** RPT packets from `state.rpt_history` whose timestamp falls inside `[window_start, window_end]`.
 
-Rough sketch:
-```python
-window_start = now_ms
-window_end = now_ms + SAMPLE_WINDOW_MS
-seen_ids = set()
-
-while int(time.time() * 1000) < window_end and state.running:
-    with state.lock:
-        history = list(state.rpt_history)
-        uwb = state.uwb_state
-
-    for pkt in history:
-        if window_start <= pkt["timestamp"] <= window_end and id(pkt) not in seen_ids:
-            seen_ids.add(id(pkt))
-            # build raw row from pkt["ranges"], pkt["tag_id"], etc.
-    time.sleep(0.02)
-```
-
-Use packet content (timestamp + tag_id + ranges tuple) or a unique ID instead of `id(pkt)` if packet objects are recreated.
+Current implementation already uses `state.rpt_history` with a unique key per packet. Window duration is controlled by `SAMPLE_WINDOW_MS`.
 
 ## Other things to verify
 1. `pc_anl.py` is forwarding `RPT` packets to `127.0.0.1:50001`. Check `_forward_sock.sendto(...)` in `scripts/pc_anl.py`.

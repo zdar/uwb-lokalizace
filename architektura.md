@@ -73,7 +73,7 @@ cd C:\Projects\uwb-lokalizace
 
 Ukaž QR kód kameře. Skener běží **bez obrazového okna** (konsole-only):
 - Stahuje jen malé JPEG snímky (QVGA), žádné video okno.
-- Po detekci QR sbírá raw `RPT` vzorky po dobu 500 ms.
+- Po detekci QR sbírá raw `RPT` vzorky po dobu 5 s.
 - Vybere nejčastější QR kód v okně.
 - Uloží mediánovou pozici a všechny raw vzorky.
 

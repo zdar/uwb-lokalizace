@@ -20,7 +20,7 @@ RAW_RPT_PORT = 50001
 TAG_ID = None                                 # None = prvni aktivni tag; jinak cislo
 
 # Jak dlouho po detekci QR sbirame vzorky pro median (ms).
-SAMPLE_WINDOW_MS = 500
+SAMPLE_WINDOW_MS = 5000
 # Cooldown mezi dvema skeny (ms).
 SCAN_COOLDOWN_MS = 3000
 # Frekvence stahovani snimku z ESP32-CAM (s).
