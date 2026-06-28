@@ -18,6 +18,7 @@ Then open the displayed URL in your browser.
 
 import os
 import sys
+import json
 import socket
 import time
 import math
@@ -80,6 +81,37 @@ auto_cal = {
     "message": "",
 }
 auto_cal_lock = threading.Lock()
+
+# File used to persist anchor coordinates between sessions.
+ANCHORS_FILE = os.path.join(PROJECT_ROOT, "anchors.json")
+
+
+def load_anchors():
+    """Load anchor coordinates from anchors.json if it exists."""
+    if not os.path.exists(ANCHORS_FILE):
+        return
+    try:
+        with open(ANCHORS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for aid, pos in data.items():
+            try:
+                anchors[int(aid)] = (float(pos[0]), float(pos[1]), float(pos[2]))
+            except Exception:
+                continue
+        log(f"Loaded {len(anchors)} anchor(s) from {ANCHORS_FILE}")
+    except Exception as e:
+        log(f"Failed to load anchors: {e}")
+
+
+def save_anchors():
+    """Save current anchor coordinates to anchors.json."""
+    try:
+        data = {str(aid): [float(p[0]), float(p[1]), float(p[2])] for aid, p in anchors.items()}
+        with open(ANCHORS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        log(f"Saved {len(anchors)} anchor(s) to {ANCHORS_FILE}")
+    except Exception as e:
+        log(f"Failed to save anchors: {e}")
 
 
 def log(msg):
@@ -533,6 +565,7 @@ def auto_cal_loop():
                 anchors[current_id] = pos
                 with auto_cal_lock:
                     auto_cal["fixed"][current_id] = pos
+                save_anchors()
                 log(f"[AUTO] Anchor {current_id} fixed at ({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f})")
             else:
                 log(f"[AUTO] Failed to solve anchor {current_id}; switching back anyway")
@@ -553,23 +586,40 @@ def auto_cal_loop():
         if phase == "wait_anchor":
             # Wait until the heartbeat says this node is an anchor again.
             role_is_anchor = False
+            current_ip = None
             for ip, info in registry.items():
                 if info.get("id") == current_id and info.get("role") == 1:
                     role_is_anchor = True
+                    current_ip = ip
                     break
 
-            timed_out = now_ms >= deadline
-
-            if not role_is_anchor and not timed_out:
-                time.sleep(0.5)
+            if role_is_anchor:
+                log(f"[AUTO] Anchor {current_id} is back in ANCHOR role")
+                with auto_cal_lock:
+                    auto_cal["current_id"] = None
+                    auto_cal["phase"] = "wait_next"
                 continue
 
-            if not role_is_anchor and timed_out:
+            timed_out = now_ms >= deadline
+            if timed_out:
                 log(f"[AUTO] Timeout waiting for anchor {current_id} to return")
+                with auto_cal_lock:
+                    auto_cal["current_id"] = None
+                    auto_cal["phase"] = "wait_next"
+                continue
 
-            with auto_cal_lock:
-                auto_cal["current_id"] = None
-                auto_cal["phase"] = "wait_next"
+            # Retry switch command every 5 seconds until confirmed.
+            last_retry_key = f"last_retry_{current_id}"
+            last_retry = auto_cal.get(last_retry_key, 0)
+            if now_ms - last_retry >= 5000:
+                ip = get_node_ip_by_id(current_id)
+                if ip:
+                    send_role_udp(ip, 1)
+                    log(f"[AUTO] Retry ROLE,1 to anchor {current_id}")
+                with auto_cal_lock:
+                    auto_cal[last_retry_key] = now_ms
+
+            time.sleep(0.5)
             continue
 
         if phase == "wait_next":
@@ -649,6 +699,8 @@ HTML_PAGE = r"""
             Y: <input type="number" id="anchorY" style="width:80px">
             Z: <input type="number" id="anchorZ" style="width:80px">
             <button onclick="setAnchor()">Set anchor</button>
+            <button onclick="saveAnchors()">Save anchors</button>
+            <button onclick="loadAnchors()">Load anchors</button>
         </div>
         <div id="anchorList"></div>
     </div>
@@ -741,10 +793,10 @@ HTML_PAGE = r"""
             fetch('/switch_role', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ip: ip, role: roleNum})
+                body: JSON.stringify({ip: ip, role: roleNum, id: id})
             }).then(r => r.json()).then(data => {
                 alert(data.message || data.error);
-                discover();
+                refreshState();
             });
         }
 
@@ -761,6 +813,21 @@ HTML_PAGE = r"""
                 if (data.error) alert(data.error);
                 refreshState();
             });
+        }
+
+        function saveAnchors() {
+            fetch('/save_anchors', {method: 'POST'})
+                .then(r => r.json())
+                .then(data => { alert(`Saved ${data.count} anchor(s)`); });
+        }
+
+        function loadAnchors() {
+            fetch('/load_anchors', {method: 'POST'})
+                .then(r => r.json())
+                .then(data => {
+                    alert(`Loaded ${data.count} anchor(s)`);
+                    refreshState();
+                });
         }
 
         function addCalPoint() {
@@ -884,9 +951,10 @@ HTML_PAGE = r"""
                     const tDiv = document.getElementById('tagPositions');
                     let tHtml = '<table><tr><th>Tag ID</th><th>X</th><th>Y</th><th>Z</th><th>Age (s)</th></tr>';
                     for (const [id, t] of Object.entries(data.tags)) {
-                        const x = t.pos ? t.pos[0].toFixed(2) : '---';
-                        const y = t.pos ? t.pos[1].toFixed(2) : '---';
-                        const z = t.pos ? t.pos[2].toFixed(2) : '---';
+                        const pos = t.pos || [];
+                        const x = pos.length > 0 ? pos[0].toFixed(2) : '---';
+                        const y = pos.length > 1 ? pos[1].toFixed(2) : '---';
+                        const z = pos.length > 2 ? pos[2].toFixed(2) : '0.00';
                         tHtml += `<tr><td>${id}</td><td>${x}</td><td>${y}</td><td>${z}</td><td>${(t.age_ms / 1000).toFixed(1)}</td></tr>`;
                     }
                     tHtml += '</table>';
@@ -959,7 +1027,19 @@ def switch_role():
     sock.close()
 
     role_name = "TAG" if role == "0" else "ANCHOR"
-    return jsonify({"ok": True, "message": f"Sent ROLE,{role} ({role_name}) to {ip}. Device will reboot and rejoin."})
+    return jsonify({"ok": True, "message": f"Sent ROLE,{role} ({role_name}) to {ip}. Device will rejoin."})
+
+
+@app.route("/save_anchors", methods=["POST"])
+def save_anchors_route():
+    save_anchors()
+    return jsonify({"ok": True, "count": len(anchors)})
+
+
+@app.route("/load_anchors", methods=["POST"])
+def load_anchors_route():
+    load_anchors()
+    return jsonify({"ok": True, "count": len(anchors)})
 
 
 @app.route("/set_anchor", methods=["POST"])
@@ -973,6 +1053,7 @@ def set_anchor():
     except Exception:
         return jsonify({"error": "Bad anchor data"}), 400
     anchors[aid] = (x, y, z)
+    save_anchors()
     log(f"Anchor {aid} set to ({x:.2f}, {y:.2f}, {z:.2f})")
     return jsonify({"ok": True})
 
@@ -1056,6 +1137,9 @@ def cal_solve():
             solved += 1
         else:
             log(f"Anchor {aid} solve failed")
+
+    if solved > 0:
+        save_anchors()
 
     return jsonify({"ok": True, "message": f"Solved {solved} anchor(s)"})
 
@@ -1179,6 +1263,7 @@ def state():
 
 
 def main():
+    load_anchors()
     threading.Thread(target=udp_listener, daemon=True).start()
     ip = get_pc_ip()
     print("=" * 60)

@@ -28,3 +28,7 @@ Thumbs.db
 :USERPROFILE
 .continue
 src/wifi_secrets.h
+esp-cam/src/wifi_secrets.h
+
+# Runtime data
+anchors.json
