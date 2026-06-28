@@ -49,3 +49,18 @@ Use packet content (timestamp + tag_id + ranges tuple) or a unique ID instead of
 - `esp-cam/qr_scanner.py` — main fix here
 - `scripts/pc_anl.py` — RPT forwarder
 - `data/scans/scans_raw_*.csv` — output to verify
+
+## Small UI improvement (done 2026-06-28)
+Added fixed anchors count in `scripts/pc_anl.py` HTML:
+- `anchorCount` span showing `Object.keys(data.anchors).length`.
+
+## Future work (do not implement now, just planned)
+1. **Kalman filter** for UWB position smoothing.
+   - Current position is computed by `trilaterate_3d` / `trilaterate` in `scripts/pc_anl.py` and `positioning/position.py`.
+   - Add a Kalman filter per TAG to reduce noise and improve stability.
+   - Could live in `pc_anl.py` or in a shared `positioning/filter.py` module.
+
+2. **Gyroscopes / IMU fusion**.
+   - MaUWB-ESP32S3 board likely has no IMU, but the TAG module could be extended with an external IMU (e.g., MPU6050/MPU9250).
+   - Fuse UWB ranges with IMU acceleration/gyro for better motion tracking and outage handling.
+   - This is a hardware + firmware + math task.

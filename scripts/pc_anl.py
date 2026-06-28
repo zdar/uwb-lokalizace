@@ -716,6 +716,7 @@ HTML_PAGE = r"""
             <button onclick="saveAnchors()">Save anchors</button>
             <button onclick="loadAnchors()">Load anchors</button>
         </div>
+        <p><strong>Fixed anchors:</strong> <span id="anchorCount">0</span></p>
         <div id="anchorList"></div>
     </div>
 
@@ -954,9 +955,13 @@ HTML_PAGE = r"""
                 .then(r => r.json())
                 .then(data => {
                     renderNodes(data.nodes);
+                    const anchorIds = Object.keys(data.anchors);
+                    document.getElementById('anchorCount').textContent = anchorIds.length;
+
                     const aDiv = document.getElementById('anchorList');
                     let aHtml = '<table><tr><th>ID</th><th>X</th><th>Y</th><th>Z</th></tr>';
-                    for (const [id, p] of Object.entries(data.anchors)) {
+                    for (const id of anchorIds) {
+                        const p = data.anchors[id];
                         aHtml += `<tr><td>${id}</td><td>${p[0].toFixed(2)}</td><td>${p[1].toFixed(2)}</td><td>${p[2].toFixed(2)}</td></tr>`;
                     }
                     aHtml += '</table>';
