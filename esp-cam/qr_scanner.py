@@ -24,12 +24,8 @@ SAMPLE_WINDOW_MS = 500
 QR_COOLDOWN_MS = 1500
 
 # Kam se ukladaji scan soubory.
-OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "scans")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-# Jednoduche "sifrovani" QR obsahu pomoci XOR s klicem. Zmen klic v produkci,
-# nebo nahrad plnym sifrovanim ( Fernet z cryptography ).
-QR_XOR_KEY = 0x7A
 
 
 # --- SDILENY STAV ----------------------------------------------------------
@@ -46,11 +42,6 @@ state = SharedState()
 
 
 # --- ULOZISTE --------------------------------------------------------------
-def xor_encrypt(text: str, key: int) -> str:
-    """Jednoducha XOR maska pro citlivy obsah QR."""
-    return "".join(chr(ord(c) ^ key) for c in text)
-
-
 def output_filename():
     today = datetime.now(timezone.utc).strftime("%Y%m%d")
     return os.path.join(OUTPUT_DIR, f"scans_{today}.jsonl")
@@ -214,7 +205,6 @@ def qr_oversample_thread():
         record = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "qr_raw": winner,
-            "qr_encrypted": xor_encrypt(winner, QR_XOR_KEY),
             "computed": {
                 "x": round(x, 2),
                 "y": round(y, 2),

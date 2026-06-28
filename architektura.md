@@ -19,7 +19,7 @@ Tento dokument shrnuje finální přístup, na kterém jsme se dohodli po testov
 | **QR skener** | `esp-cam/qr_scanner.py` | Čte QR z ESP32-CAM streamu a ukládá lokálně |
 | **Kamera** | AI-Thinker ESP32-CAM | Streamuje MJPEG přes WiFi (`CameraWebServer`) |
 | **Síť** | Přenosný WiFi router | Spojuje všechna zařízení v tunelu |
-| **Uložiště** | `data/scans_YYYYMMDD.jsonl` | Ukládá `{qr, pozice, raw samples, timestamp}` |
+| **Uložiště** | `data/scans/scans_YYYYMMDD.jsonl` | Ukládá `{qr_raw, pozice, raw samples, timestamp}` |
 
 ## 3. Tok dat
 
@@ -71,7 +71,7 @@ Spusť skener:
 .venv\Scripts\python.exe esp-cam\qr_scanner.py
 ```
 
-Ukaž QR kód kameře. Skener provede **oversampling**: po detekci sbírá vzorky po dobu 500 ms, vybere nejčastější QR kód a uloží mediánovou pozici. Vše se zapisuje do `data/scans_YYYYMMDD.jsonl` včetně raw UWB ranges a pozic kotev.
+Ukaž QR kód kameře. Skener provede **oversampling**: po detekci sbírá vzorky po dobu 500 ms, vybere nejčastější QR kód a uloží mediánovou pozici. Vše se zapisuje do `data/scans/scans_YYYYMMDD.jsonl` včetně raw UWB ranges a pozic kotev.
 
 ## 5. Ukládání pozic kotev
 

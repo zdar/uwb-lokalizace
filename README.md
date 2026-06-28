@@ -24,7 +24,7 @@ Stručně:
 | `specifikace.md` | Původní specifikace |
 | `architektura.md` | Finální architektonické rozhodnutí |
 | `anchors.json` | Runtime uložení pozic kotev (neposílej do gitu) |
-| `data/scans_*.jsonl` | Uložené skeny (neposílej do gitu) |
+| `data/scans/scans_*.jsonl` | Uložené skeny (neposílej do gitu) |
 
 ## Rychlý start
 
