@@ -1511,10 +1511,13 @@ void configureUWB()
     sendData("AT?", 2000, 1);
     if (currentRole == 0) {
         SERIAL_LOG.println(F(">>> Configuring as TAG"));
-        sendData("AT+RESTORE", 5000, 1);
     } else {
         SERIAL_LOG.println(F(">>> Configuring as ANCHOR"));
     }
+    // Factory-reset the UWB module first. This avoids a "hybrid" state where
+    // the ESP thinks the role changed but the UWB chip is still running old
+    // settings (most commonly seen switching TAG -> ANCHOR without ESP reboot).
+    sendData("AT+RESTORE", 5000, 1);
     sendData(config_cmd(), 2000, 1);
     sendData(cap_cmd(), 2000, 1);
     sendData(String("AT+SETPAN=") + networkId, 2000, 1);
