@@ -6,7 +6,7 @@ Tento dokument shrnuje finální přístup, na kterém jsme se dohodli po testov
 
 - **PC jako ANL**: Místo ESP32 ANL používáme `scripts/pc_anl.py` běžící na PC.
 - **Přenosný WiFi router**: V tunelu vytváří lokální síť pro všechna zařízení.
-- **ESP32-CAM jako síťová kamera**: Streamuje MJPEG obraz do PC.
+- **ESP32-CAM jako síťová kamera**: Poskytuje JPEG snímky přes HTTP `/capture`.
 - **QR dekódování na PC**: Používáme `pyzbar` v `esp-cam/qr_scanner.py`.
 - **Raw RPT data**: `qr_scanner.py` naslouchá na UDP 50001 a dostává přeposílané raw `RPT` pakety přímo z `pc_anl.py`.
 - **Ukládání do CSV**: Pro každý scan se uloží raw vzorky i vypočtená pozice pro snadné postprocessing.
@@ -18,7 +18,7 @@ Tento dokument shrnuje finální přístup, na kterém jsme se dohodli po testov
 | **UWB moduly** | MaUWB-ESP32S3 (Makerfabs) | 1× TAG + 9× ANCHOR pro trilateraci |
 | **PC ANL** | `scripts/pc_anl.py` | Sbírá vzdálenosti, řeší pozice, ukládá kotvy, forwarduje RPT |
 | **QR skener** | `esp-cam/qr_scanner.py` | Čte QR z ESP32-CAM streamu, sbírá raw RPT, ukládá CSV |
-| **Kamera** | AI-Thinker ESP32-CAM | Streamuje MJPEG přes WiFi (`CameraWebServer`) |
+| **Kamera** | AI-Thinker ESP32-CAM | Poskytuje JPEG přes HTTP `/capture` (`CameraWebServer`) |
 | **Síť** | Přenosný WiFi router | Spojuje všechna zařízení v tunelu |
 | **Uložiště** | `data/scans/scans_raw_YYYYMMDD.csv` | Jedna řádka za každý raw RPT vzorek |
 | **Uložiště** | `data/scans/scans_computed_YYYYMMDD.csv` | Jedna řádka za každý uložený QR scan |
@@ -26,7 +26,7 @@ Tento dokument shrnuje finální přístup, na kterém jsme se dohodli po testov
 ## 3. Tok dat
 
 ```
-ESP32-CAM  ──MJPEG stream──▶  PC (qr_scanner.py)
+ESP32-CAM  ──HTTP /capture──▶  PC (qr_scanner.py)
                                    │
                                    ▼
 UWB TAG  ──RPT──▶  PC ANL (pc_anl.py)  ──forward UDP 50001──▶  qr_scanner.py
@@ -62,7 +62,7 @@ Otevři v prohlížeči zobrazenou adresu, objev uzly, nastav nebo vykalibruj ko
    ```
 3. Zapiš ji do `esp-cam/qr_scanner.py`:
    ```python
-   ESP32_CAM_STREAM = "http://192.168.x.y:81/stream"
+   ESP32_CAM_URL = "http://192.168.x.y/capture"
    ```
 
 ### 4.4 QR skener
@@ -101,6 +101,6 @@ timestamp,scan_id,qr_raw,tag_id,range_0,range_1,range_2,range_3,range_4,range_5,
 | **Spolehlivost QR** | quirc často nečte | pyzbar funguje spolehlivě |
 | **Paměť/stack** | stack overflow v loopTask | žádné omezení na PC |
 | **Tunel / router** | ESP ANL max ~10 klientů | PC ANL + router zvládne vše |
-| **Rychlost** | pomalé HTTP `/capture` | MJPEG `/stream` je plynulý |
+| **Rychlost** | pomalé HTTP `/capture` | Threaded `/capture` je plynulý |
 | **Raw data** | žádná | každý RPT paket uložen pro postprocessing |
 | **Vývoj** | těžko debugovatelné | stejné prostředí jako blueprint |

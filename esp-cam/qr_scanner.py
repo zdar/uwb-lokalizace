@@ -14,7 +14,7 @@ import requests
 from pyzbar.pyzbar import decode
 
 # --- KONFIGURACE -----------------------------------------------------------
-ESP32_CAM_STREAM = "http://192.168.0.159:81/stream"
+ESP32_CAM_URL = "http://192.168.0.159/capture"
 PC_ANL_URL = "http://localhost:5000/state"
 RAW_RPT_PORT = 50001
 TAG_ID = None                                 # None = prvni aktivni tag; jinak cislo
@@ -194,19 +194,19 @@ def rpt_listener_thread():
 
 # --- KAMERA ----------------------------------------------------------------
 def capture_thread():
-    cap = cv2.VideoCapture(ESP32_CAM_STREAM)
-    if not cap.isOpened():
-        print(f"[KAMERA] nelze otevrit stream {ESP32_CAM_STREAM}")
-        state.running = False
-        return
-    print(f"[KAMERA] stream pripojen: {ESP32_CAM_STREAM}")
-
+    print(f"[KAMERA] stahuji snimky z {ESP32_CAM_URL}")
     while state.running:
-        ret, frame = cap.read()
-        if ret and frame is not None:
-            with state.lock:
-                state.frame = frame
-    cap.release()
+        try:
+            response = requests.get(ESP32_CAM_URL, timeout=2)
+            if response.status_code == 200:
+                img_array = np.frombuffer(response.content, dtype=np.uint8)
+                frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+                if frame is not None:
+                    with state.lock:
+                        state.frame = frame
+        except Exception as e:
+            print(f"[KAMERA] chyba stazeni snimku: {e}")
+        time.sleep(0.05)  # ~20 FPS max
 
 
 def decode_latest_qr(frame):
@@ -372,7 +372,7 @@ def draw_hud(display_frame, uwb_data, last_save):
 # --- MAIN ------------------------------------------------------------------
 def main():
     print("\n--- QR SKENER (ESP32-CAM + UWB) ---")
-    print(f"Stream: {ESP32_CAM_STREAM}")
+    print(f"Kamera: {ESP32_CAM_URL}")
     print(f"UWB:    {PC_ANL_URL}")
     print(f"RPT:    UDP {RAW_RPT_PORT}")
     print(f"Output: {OUTPUT_DIR}")

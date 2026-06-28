@@ -8,9 +8,9 @@ Více viz [architektura.md](architektura.md).
 
 Stručně:
 - **UWB moduly** (MaUWB-ESP32S3) tvoří síť kotva + tag.
-- **PC jako ANL** běží `scripts/pc_anl.py`, řeší pozice a ukládá kotvy.
-- **ESP32-CAM** streamuje obraz do PC.
-- **QR skener** (`esp-cam/blueprint_esp.py`) čte QR z kamery, vezme aktuální UWB pozici z PC ANL a ukládá `{qr_kod, x, y, z}` do MySQL.
+- **PC jako ANL** běží `scripts/pc_anl.py`, řeší pozice, ukládá kotvy a forwarduje raw RPT pakety.
+- **ESP32-CAM** poskytuje JPEG snímky přes HTTP `/capture`.
+- **QR skener** (`esp-cam/qr_scanner.py`) čte QR z kamery, sbírá raw RPT data a ukládá je do CSV.
 - V tunelu se používá **přenosný WiFi router**, ke kterému se připojí všechna zařízení.
 
 ## Struktura repozitáře
@@ -18,9 +18,9 @@ Stručně:
 | Cesta | Popis |
 | :--- | :--- |
 | `src/` | Hlavní UWB firmware (ANL/NODE) |
-| `scripts/pc_anl.py` | PC ANL — discovery, kalibrace, řešení pozic |
+| `scripts/pc_anl.py` | PC ANL — discovery, kalibrace, řešení pozic, RPT forward |
 | `esp-cam/` | ESP32-CAM CameraWebServer firmware + QR skener |
-| `esp-cam/qr_scanner.py` | PC QR skener čtoucí MJPEG stream z ESP32-CAM |
+| `esp-cam/qr_scanner.py` | PC QR skener čtoucí JPEG z ESP32-CAM |
 | `specifikace.md` | Původní specifikace |
 | `architektura.md` | Finální architektonické rozhodnutí |
 | `anchors.json` | Runtime uložení pozic kotev (neposílej do gitu) |
@@ -44,7 +44,7 @@ Ve VS Code s projektem `esp-cam` stiskni **Upload**.
 ### 4. QR skener
 Nastav IP ESP32-CAM v `esp-cam/qr_scanner.py`:
 ```python
-ESP32_CAM_STREAM = "http://192.168.x.y:81/stream"
+ESP32_CAM_URL = "http://192.168.x.y/capture"
 ```
 
 Spusť skener:
