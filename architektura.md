@@ -6,7 +6,7 @@ Tento dokument shrnuje finální přístup, na kterém jsme se dohodli po testov
 
 - **PC jako ANL**: Místo ESP32 ANL používáme `scripts/pc_anl.py` běžící na PC.
 - **Přenosný WiFi router**: V tunelu vytváří lokální síť pro všechna zařízení.
-- **ESP32-CAM jako síťová kamera**: Poskytuje JPEG snímky přes HTTP `/capture`.
+- **ESP32-CAM jako síťová kamera**: Poskytuje malé JPEG snímky přes HTTP `/capture` (QVGA, nízká kvalita).
 - **QR dekódování na PC**: Používáme `pyzbar` v `esp-cam/qr_scanner.py`.
 - **Raw RPT data**: `qr_scanner.py` naslouchá na UDP 50001 a dostává přeposílané raw `RPT` pakety přímo z `pc_anl.py`.
 - **Ukládání do CSV**: Pro každý scan se uloží raw vzorky i vypočtená pozice pro snadné postprocessing.
@@ -18,7 +18,7 @@ Tento dokument shrnuje finální přístup, na kterém jsme se dohodli po testov
 | **UWB moduly** | MaUWB-ESP32S3 (Makerfabs) | 1× TAG + 9× ANCHOR pro trilateraci |
 | **PC ANL** | `scripts/pc_anl.py` | Sbírá vzdálenosti, řeší pozice, ukládá kotvy, forwarduje RPT |
 | **QR skener** | `esp-cam/qr_scanner.py` | Čte QR z ESP32-CAM streamu, sbírá raw RPT, ukládá CSV |
-| **Kamera** | AI-Thinker ESP32-CAM | Poskytuje JPEG přes HTTP `/capture` (`CameraWebServer`) |
+| **Kamera** | AI-Thinker ESP32-CAM | Poskytuje JPEG QVGA přes HTTP `/capture` (`CameraWebServer`) |
 | **Síť** | Přenosný WiFi router | Spojuje všechna zařízení v tunelu |
 | **Uložiště** | `data/scans/scans_raw_YYYYMMDD.csv` | Jedna řádka za každý raw RPT vzorek |
 | **Uložiště** | `data/scans/scans_computed_YYYYMMDD.csv` | Jedna řádka za každý uložený QR scan |
@@ -71,7 +71,8 @@ cd C:\Projects\uwb-lokalizace
 .venv\Scripts\python.exe esp-cam\qr_scanner.py
 ```
 
-Ukaž QR kód kameře. Skener provede **oversampling**:
+Ukaž QR kód kameře. Skener běží **bez obrazového okna** (konsole-only):
+- Stahuje jen malé JPEG snímky (QVGA), žádné video okno.
 - Po detekci QR sbírá raw `RPT` vzorky po dobu 500 ms.
 - Vybere nejčastější QR kód v okně.
 - Uloží mediánovou pozici a všechny raw vzorky.
@@ -101,6 +102,6 @@ timestamp,scan_id,qr_raw,tag_id,range_0,range_1,range_2,range_3,range_4,range_5,
 | **Spolehlivost QR** | quirc často nečte | pyzbar funguje spolehlivě |
 | **Paměť/stack** | stack overflow v loopTask | žádné omezení na PC |
 | **Tunel / router** | ESP ANL max ~10 klientů | PC ANL + router zvládne vše |
-| **Rychlost** | pomalé HTTP `/capture` | Threaded `/capture` je plynulý |
+| **Rychlost** | pomalé HTTP `/capture` | QVGA `/capture`, žádné video okno |
 | **Raw data** | žádná | každý RPT paket uložen pro postprocessing |
 | **Vývoj** | těžko debugovatelné | stejné prostředí jako blueprint |

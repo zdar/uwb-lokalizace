@@ -6,7 +6,7 @@ import random
 import winsound
 import threading
 from datetime import datetime, timezone
-from collections import defaultdict, deque
+from collections import defaultdict
 
 import cv2
 import numpy as np
@@ -23,8 +23,8 @@ TAG_ID = None                                 # None = prvni aktivni tag; jinak 
 SAMPLE_WINDOW_MS = 500
 # Cooldown mezi dvema skeny (ms).
 SCAN_COOLDOWN_MS = 1500
-# Maximalni pocet nedavnych RPT paketu drzenych v pameti.
-RPT_HISTORY_LEN = 200
+# Frekvence stahovani snimku z ESP32-CAM (s).
+CAPTURE_INTERVAL_S = 0.10
 
 OUTPUT_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "scans"
@@ -40,8 +40,7 @@ class SharedState:
         self.lock = threading.Lock()
         self.frame = None
         self.uwb_state = None
-        self.latest_rpt = None           # posledni RPT paket
-        self.rpt_history = deque(maxlen=RPT_HISTORY_LEN)
+        self.latest_rpt = None
         self.last_save_info = None
         self.running = True
 
@@ -136,9 +135,8 @@ def uwb_poller_thread():
 
 # --- RAW RPT UDP LISTENER --------------------------------------------------
 def parse_rpt(text):
-    """RPT,8:0=389,1=480,... -> (tag_id, {aid: dist})"""
     try:
-        text = text[4:]  # odstran 'RPT,'
+        text = text[4:]
         tid_str, rest = text.split(":", 1)
         tid = int(tid_str)
         ranges = {}
@@ -181,20 +179,18 @@ def rpt_listener_thread():
             continue
 
         now_ms = int(time.time() * 1000)
-        packet = {
-            "timestamp": now_ms,
-            "tag_id": tid,
-            "ranges": ranges,
-        }
         with state.lock:
-            state.latest_rpt = packet
-            state.rpt_history.append(packet)
+            state.latest_rpt = {
+                "timestamp": now_ms,
+                "tag_id": tid,
+                "ranges": ranges,
+            }
     sock.close()
 
 
 # --- KAMERA ----------------------------------------------------------------
 def capture_thread():
-    print(f"[KAMERA] stahuji snimky z {ESP32_CAM_URL}")
+    print(f"[KAMERA] stahuji snimky z {ESP32_CAM_URL} (QVGA, kazdych {CAPTURE_INTERVAL_S*1000:.0f} ms)")
     while state.running:
         try:
             response = requests.get(ESP32_CAM_URL, timeout=2)
@@ -205,8 +201,8 @@ def capture_thread():
                     with state.lock:
                         state.frame = frame
         except Exception as e:
-            print(f"[KAMERA] chyba stazeni snimku: {e}")
-        time.sleep(0.05)  # ~20 FPS max
+            print(f"[KAMERA] chyba: {e}")
+        time.sleep(CAPTURE_INTERVAL_S)
 
 
 def decode_latest_qr(frame):
@@ -230,9 +226,29 @@ def median_3d(points):
     )
 
 
+def print_status(uwb_data, last_save, fps):
+    t_data = pick_tag_data(uwb_data)
+    if t_data and t_data.get("pos"):
+        x, y, z = normalize_pos(t_data["pos"])
+        pos_line = f"UWB: X={x:.2f} Y={y:.2f} Z={z:.2f}"
+    else:
+        pos_line = "UWB: ---"
+
+    if last_save:
+        qr, x, y, z, src, ts = last_save
+        age_s = (int(time.time() * 1000) - ts) / 1000.0
+        save_line = f"| posledni: {qr} -> X={x:.2f} Y={y:.2f} Z={z:.2f} ({src}) pred {age_s:.1f}s"
+    else:
+        save_line = "| cekam na QR..."
+
+    print(f"\r[{fps:.1f} FPS] {pos_line} {save_line}", end="", flush=True)
+
+
 def qr_scan_thread():
     init_csv_files()
     cooldown_until = 0
+    frame_count = 0
+    last_fps_time = time.time()
 
     while state.running:
         now_ms = int(time.time() * 1000)
@@ -244,12 +260,21 @@ def qr_scan_thread():
             time.sleep(0.02)
             continue
 
+        frame_count += 1
+        if time.time() - last_fps_time >= 1.0:
+            fps = frame_count / (time.time() - last_fps_time)
+            frame_count = 0
+            last_fps_time = time.time()
+            with state.lock:
+                uwb = state.uwb_state
+                last_save = state.last_save_info
+            print_status(uwb, last_save, fps)
+
         qr = decode_latest_qr(frame)
         if qr is None or now_ms < cooldown_until:
-            time.sleep(0.05)
             continue
 
-        print(f"[QR] detekovan '{qr}', sbiram vzorky {SAMPLE_WINDOW_MS}ms...")
+        print(f"\n[QR] detekovan '{qr}', sbiram vzorky {SAMPLE_WINDOW_MS}ms...")
         scan_id = now_ms
         window_end = now_ms + SAMPLE_WINDOW_MS
 
@@ -310,7 +335,6 @@ def qr_scan_thread():
 
         ts = datetime.now(timezone.utc).isoformat()
 
-        # Raw CSV rows
         raw_rows = []
         for s in samples:
             pos = s["pos"] or (None, None, None)
@@ -324,7 +348,6 @@ def qr_scan_thread():
             ])
         append_raw_rows(raw_rows)
 
-        # Computed CSV row
         append_computed_row([
             ts, scan_id, winner, round(x, 2), round(y, 2), round(z, 2),
             source, len(samples)
@@ -339,36 +362,6 @@ def qr_scan_thread():
         cooldown_until = int(time.time() * 1000) + SCAN_COOLDOWN_MS
 
 
-# --- HUD -------------------------------------------------------------------
-def draw_hud(display_frame, uwb_data, last_save):
-    h, w = display_frame.shape[:2]
-    BAR_H = 120
-    canvas = np.zeros((h + BAR_H, w, 3), dtype=np.uint8)
-    canvas[BAR_H:, :] = display_frame
-
-    t_data = pick_tag_data(uwb_data)
-    if t_data and t_data.get("pos"):
-        x, y, z = normalize_pos(t_data["pos"])
-        line1 = f"UWB: X={x:.2f}  Y={y:.2f}  Z={z:.2f}"
-        color = (0, 255, 0)
-    else:
-        line1 = "UWB: ---  (SIM fallback)"
-        color = (0, 165, 255)
-    cv2.putText(canvas, line1, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-
-    if last_save:
-        qr, x, y, z, src, ts = last_save
-        age_s = (int(time.time() * 1000) - ts) / 1000.0
-        cv2.putText(canvas, f"POSLEDNI QR: {qr}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-        cv2.putText(canvas, f"ULOZENO: X={x:.2f} Y={y:.2f} Z={z:.2f} ({src}) pred {age_s:.1f}s",
-                    (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-    else:
-        cv2.putText(canvas, "UKAZ QR KOD...", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
-
-    cv2.putText(canvas, "[Q] konec", (w - 110, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
-    return canvas
-
-
 # --- MAIN ------------------------------------------------------------------
 def main():
     print("\n--- QR SKENER (ESP32-CAM + UWB) ---")
@@ -376,7 +369,7 @@ def main():
     print(f"UWB:    {PC_ANL_URL}")
     print(f"RPT:    UDP {RAW_RPT_PORT}")
     print(f"Output: {OUTPUT_DIR}")
-    print("[Q] - Ukoncit program\n")
+    print("[Ctrl+C] - Ukoncit program\n")
 
     threads = [
         threading.Thread(target=capture_thread, daemon=True),
@@ -387,38 +380,15 @@ def main():
     for t in threads:
         t.start()
 
-    timeout = time.time() + 10
-    while state.frame is None and time.time() < timeout and state.running:
-        time.sleep(0.05)
-
-    if state.frame is None:
-        print("[CHYBA] Nepodarilo se ziskat obraz.")
+    try:
+        while state.running:
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
         state.running = False
-        return
-
-    SCALE = 1.2
-    window_title = "QR Skener + UWB"
-    cv2.namedWindow(window_title, cv2.WINDOW_NORMAL)
-
-    while state.running:
-        with state.lock:
-            frame = state.frame.copy() if state.frame is not None else None
-            uwb = state.uwb_state
-            last_save = state.last_save_info
-
-        if frame is None:
-            time.sleep(0.01)
-            continue
-
-        display = cv2.resize(frame, None, fx=SCALE, fy=SCALE, interpolation=cv2.INTER_LINEAR)
-        canvas = draw_hud(display, uwb, last_save)
-        cv2.imshow(window_title, canvas)
-
-        if (cv2.waitKey(1) & 0xFF) == ord("q"):
-            state.running = False
-
-    cv2.destroyAllWindows()
-    print("\nUkoncuji...")
+        time.sleep(0.3)
+        print("\n\nUkoncuji...")
 
 
 if __name__ == "__main__":
