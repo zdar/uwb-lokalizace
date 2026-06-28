@@ -282,10 +282,12 @@ def qr_scan_thread():
         qr_votes = defaultdict(int)
         collected_positions = []
 
+        seen_rpt_keys = set()
+
         while int(time.time() * 1000) < window_end and state.running:
             with state.lock:
                 f = state.frame
-                latest_rpt = state.latest_rpt
+                history = list(state.rpt_history)
                 uwb = state.uwb_state
 
             if f is not None:
@@ -293,28 +295,35 @@ def qr_scan_thread():
                 if q:
                     qr_votes[q] += 1
 
-            if latest_rpt:
-                rpt_age = int(time.time() * 1000) - latest_rpt["timestamp"]
-                if rpt_age < 500:
-                    row_ranges = [latest_rpt["ranges"].get(i, "") for i in range(ANCHOR_COUNT)]
-                    t_data = pick_tag_data(uwb)
-                    if t_data and t_data.get("pos"):
-                        pos = normalize_pos(t_data["pos"])
-                        pos_source = "UWB"
-                        collected_positions.append(pos)
-                    else:
-                        pos = None
-                        pos_source = "SIM"
-                    samples.append({
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                        "tag_id": latest_rpt["tag_id"],
-                        "ranges": row_ranges,
-                        "pos": pos,
-                        "pos_source": pos_source,
-                        "rpt_age_ms": rpt_age,
-                    })
+            # Sbereme vsechny RPT pakety prijate behem okna.
+            for pkt in history:
+                if not (scan_id <= pkt["timestamp"] <= window_end):
+                    continue
+                key = (pkt["timestamp"], pkt["tag_id"], tuple(sorted(pkt["ranges"].items())))
+                if key in seen_rpt_keys:
+                    continue
+                seen_rpt_keys.add(key)
 
-            time.sleep(0.03)
+                row_ranges = [pkt["ranges"].get(i, "") for i in range(ANCHOR_COUNT)]
+                rpt_age = int(time.time() * 1000) - pkt["timestamp"]
+                t_data = pick_tag_data(uwb)
+                if t_data and t_data.get("pos"):
+                    pos = normalize_pos(t_data["pos"])
+                    pos_source = "UWB"
+                    collected_positions.append(pos)
+                else:
+                    pos = None
+                    pos_source = "SIM"
+                samples.append({
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "tag_id": pkt["tag_id"],
+                    "ranges": row_ranges,
+                    "pos": pos,
+                    "pos_source": pos_source,
+                    "rpt_age_ms": rpt_age,
+                })
+
+            time.sleep(0.02)
 
         if not qr_votes:
             continue
