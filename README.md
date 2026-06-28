@@ -20,10 +20,11 @@ Stručně:
 | `src/` | Hlavní UWB firmware (ANL/NODE) |
 | `scripts/pc_anl.py` | PC ANL — discovery, kalibrace, řešení pozic |
 | `esp-cam/` | ESP32-CAM CameraWebServer firmware + QR skener |
-| `esp-cam/blueprint_esp.py` | PC QR skener čtoucí MJPEG stream z ESP32-CAM |
+| `esp-cam/qr_scanner.py` | PC QR skener čtoucí MJPEG stream z ESP32-CAM |
 | `specifikace.md` | Původní specifikace |
 | `architektura.md` | Finální architektonické rozhodnutí |
 | `anchors.json` | Runtime uložení pozic kotev (neposílej do gitu) |
+| `data/scans_*.jsonl` | Uložené skeny (neposílej do gitu) |
 
 ## Rychlý start
 
@@ -40,12 +41,14 @@ cd C:\Projects\uwb-lokalizace
 Ve VS Code s projektem `esp-cam` stiskni **Upload**.
 
 ### 4. QR skener
-Nastav IP ESP32-CAM v `esp-cam/blueprint_esp.py`:
+Nastav IP ESP32-CAM v `esp-cam/qr_scanner.py`:
 ```python
 ESP32_CAM_STREAM = "http://192.168.x.y:81/stream"
 ```
 
 Spusť skener:
 ```powershell
-.venv\Scripts\python.exe esp-cam\blueprint_esp.py
+.venv\Scripts\python.exe esp-cam\qr_scanner.py
 ```
+
+Skeny se ukládají do `data/scans_YYYYMMDD.jsonl`.

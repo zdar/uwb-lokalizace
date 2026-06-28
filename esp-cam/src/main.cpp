@@ -85,9 +85,9 @@ void setup() {
     s->set_brightness(s, 1);   // up the brightness just a bit
     s->set_saturation(s, -2);  // lower the saturation
   }
-  // drop down frame size for higher initial frame rate
+  // Use VGA for a good balance between QR detection detail and frame rate.
   if (config.pixel_format == PIXFORMAT_JPEG) {
-    s->set_framesize(s, FRAMESIZE_QVGA);
+    s->set_framesize(s, FRAMESIZE_VGA);
   }
 
 #if defined(CAMERA_MODEL_M5STACK_WIDE) || defined(CAMERA_MODEL_M5STACK_ESP32CAM)

@@ -1252,6 +1252,7 @@ def state():
         if tid in active_tag_ids:
             tag_state[tid] = {
                 "pos": list(t["pos"]) if t["pos"] else None,
+                "ranges": {aid: float(r) for aid, r in t["ranges"].items() if r is not None and r > 0},
                 "age_ms": now - t["last_seen_ms"],
             }
     return jsonify({

@@ -16,10 +16,10 @@ Tento dokument shrnuje finální přístup, na kterém jsme se dohodli po testov
 | :--- | :--- | :--- |
 | **UWB moduly** | MaUWB-ESP32S3 (Makerfabs) | 1× TAG + 9× ANCHOR pro trilateraci |
 | **PC ANL** | `scripts/pc_anl.py` | Sbírá vzdálenosti, řeší pozice, ukládá kotvy |
-| **QR skener** | `esp-cam/blueprint_esp.py` | Čte QR z ESP32-CAM streamu a ukládá do MySQL |
+| **QR skener** | `esp-cam/qr_scanner.py` | Čte QR z ESP32-CAM streamu a ukládá lokálně |
 | **Kamera** | AI-Thinker ESP32-CAM | Streamuje MJPEG přes WiFi (`CameraWebServer`) |
 | **Síť** | Přenosný WiFi router | Spojuje všechna zařízení v tunelu |
-| **Databáze** | MySQL `input_db.skeny` | Ukládá `{qr_kod, x, y, z, timestamp}` |
+| **Uložiště** | `data/scans_YYYYMMDD.jsonl` | Ukládá `{qr, pozice, raw samples, timestamp}` |
 
 ## 3. Tok dat
 
@@ -30,7 +30,7 @@ ESP32-CAM  ──MJPEG stream──▶  PC (blueprint_esp.py)
 UWB TAG  ──RPT──▶  PC ANL (pc_anl.py)  ──HTTP /state──▶  QR skener
                                    │                         │
                                    ▼                         ▼
-                         MySQL input_db.skeny  ◀──  {qr, x, y, z}
+                         data/scans_YYYYMMDD.jsonl  ◀──  {qr, x, y, z, raw}
 ```
 
 ## 4. Spuštění systému
@@ -61,12 +61,17 @@ Otevři v prohlížeči zobrazenou adresu, objev uzly, nastav nebo vykalibruj ko
    ```
 
 ### 4.4 QR skener
-```powershell
-cd C:\Projects\uwb-lokalizace
-.venv\Scripts\python.exe esp-cam\blueprint_esp.py
+Nastav IP ESP32-CAM v `esp-cam/qr_scanner.py`:
+```python
+ESP32_CAM_STREAM = "http://192.168.x.y:81/stream"
 ```
 
-Ukaž QR kód kameře. Při úspěšném přečtení se uloží do MySQL spolu s aktuální UWB pozicí TAGu.
+Spusť skener:
+```powershell
+.venv\Scripts\python.exe esp-cam\qr_scanner.py
+```
+
+Ukaž QR kód kameře. Skener provede **oversampling**: po detekci sbírá vzorky po dobu 500 ms, vybere nejčastější QR kód a uloží mediánovou pozici. Vše se zapisuje do `data/scans_YYYYMMDD.jsonl` včetně raw UWB ranges a pozic kotev.
 
 ## 5. Ukládání pozic kotev
 
