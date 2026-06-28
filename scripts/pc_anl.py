@@ -884,8 +884,10 @@ HTML_PAGE = r"""
                     const tDiv = document.getElementById('tagPositions');
                     let tHtml = '<table><tr><th>Tag ID</th><th>X</th><th>Y</th><th>Z</th><th>Age (s)</th></tr>';
                     for (const [id, t] of Object.entries(data.tags)) {
-                        const pos = t.pos ? `(${t.pos[0].toFixed(2)}, ${t.pos[1].toFixed(2)}, ${t.pos[2].toFixed(2)})` : '---';
-                        tHtml += `<tr><td>${id}</td><td>${pos}</td><td>${(t.age_ms / 1000).toFixed(1)}</td></tr>`;
+                        const x = t.pos ? t.pos[0].toFixed(2) : '---';
+                        const y = t.pos ? t.pos[1].toFixed(2) : '---';
+                        const z = t.pos ? t.pos[2].toFixed(2) : '---';
+                        tHtml += `<tr><td>${id}</td><td>${x}</td><td>${y}</td><td>${z}</td><td>${(t.age_ms / 1000).toFixed(1)}</td></tr>`;
                     }
                     tHtml += '</table>';
                     tDiv.innerHTML = tHtml;
@@ -1157,12 +1159,17 @@ def state():
             "role": info["role"],
             "age_ms": now - info["last_seen_ms"],
         })
+    # Only report tags that are currently in TAG role (role == 0) in the registry.
+    # This avoids showing anchors that were temporarily switched to TAG during
+    # auto-calibration and then switched back.
+    active_tag_ids = {info["id"] for info in registry.values() if info.get("role") == 0}
     tag_state = {}
     for tid, t in tags.items():
-        tag_state[tid] = {
-            "pos": list(t["pos"]) if t["pos"] else None,
-            "age_ms": now - t["last_seen_ms"],
-        }
+        if tid in active_tag_ids:
+            tag_state[tid] = {
+                "pos": list(t["pos"]) if t["pos"] else None,
+                "age_ms": now - t["last_seen_ms"],
+            }
     return jsonify({
         "nodes": nodes,
         "anchors": {aid: list(p) for aid, p in anchors.items()},
