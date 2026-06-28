@@ -41,6 +41,10 @@ UDP_PORT = 50000
 HEARTBEAT_TIMEOUT_MS = 15000
 CAL3D_COLLECT_MS = 15000
 
+# Auto-calibration (Mode A) timing.
+AUTO_CAL_ROLE_SWITCH_WAIT_S = 40   # time for the UWB module to reconfigure after ROLE change
+AUTO_CAL_COLLECT_S = 20            # how long to gather ranges per anchor
+
 app = Flask(__name__)
 
 # ---------------------------------------------------------------------------
@@ -60,6 +64,20 @@ cal3d = {
     "points": [],      # list of {"x", "y", "z", "samples": {aid: [distances]}}
     "timer_deadline": 0,
 }
+
+# Automatic sequential anchor calibration state (Mode A)
+auto_cal = {
+    "running": False,
+    "origin_id": None,
+    "fixed": {},              # id -> (x, y, z)
+    "pending": [],            # list of ids still to calibrate
+    "current_id": None,       # id currently acting as temporary tag
+    "phase": "idle",          # idle, wait_tag, collecting, wait_anchor, wait_next, done, error
+    "deadline_ms": 0,
+    "samples": defaultdict(list),  # fixed_anchor_id -> [distances]
+    "message": "",
+}
+auto_cal_lock = threading.Lock()
 
 
 def log(msg):
@@ -129,6 +147,74 @@ def solve_tag_position(ranges):
     return None
 
 
+def solve_sequential_anchor(ranges_to_fixed, fixed):
+    """
+    Solve an anchor position from ranges to already-fixed anchors, mirroring
+    the firmware's sequential auto-calibration.
+
+    fixed: dict {anchor_id: (x, y, z)}
+    ranges_to_fixed: dict {anchor_id: distance}
+    Returns (x, y, z) or None.
+    """
+    valid = [(fixed[aid], r) for aid, r in ranges_to_fixed.items()
+             if aid in fixed and r is not None and r > 0]
+    if not valid:
+        return None
+
+    # 1 fixed anchor -> place on +X axis relative to it.
+    if len(valid) == 1:
+        (x0, y0, z0), r = valid[0]
+        return (x0 + r, y0, z0)
+
+    # 2 fixed anchors -> circle intersection, pick +Y side.
+    if len(valid) == 2:
+        (x0, y0, z0), r0 = valid[0]
+        (x1, y1, z1), r1 = valid[1]
+        dx, dy, dz = x1 - x0, y1 - y0, z1 - z0
+        d = math.sqrt(dx*dx + dy*dy + dz*dz)
+        if d <= 0.0 or d > r0 + r1 or d < abs(r0 - r1):
+            return None
+        a = (r0*r0 - r1*r1 + d*d) / (2.0 * d)
+        h = math.sqrt(max(r0*r0 - a*a, 0.0))
+        xm = x0 + a * dx / d
+        ym = y0 + a * dy / d
+        zm = z0 + a * dz / d
+        # Perpendicular in the XY plane (convention: anchors start in XY).
+        ux, uy, uz = -dy, dx, 0.0
+        ul = math.sqrt(ux*ux + uy*uy + uz*uz)
+        if ul < 1e-6:
+            ux, uy = 1.0, 0.0
+        else:
+            ux, uy = ux / ul, uy / ul
+        return (xm + ux * h, ym + uy * h, zm)
+
+    # 3+ fixed anchors -> 2D first, then +Z from distance to reference.
+    # Use the first valid fixed anchor as the reference for Z.
+    (x0, y0, z0), r0 = valid[0]
+
+    # If we have 4+ fixed anchors, try full 3D least-squares first.
+    if len(valid) >= 4:
+        anchors_dict = {i: p for i, (p, _) in enumerate(valid)}
+        ranges_dict = {i: r for i, (_, r) in enumerate(valid)}
+        pos3d = trilaterate_3d(ranges_dict, anchors_dict)
+        if pos3d:
+            return pos3d
+
+    # 2D fallback using the first 3 fixed anchors.
+    anchors_dict = {i: (p[0], p[1]) for i, (p, _) in enumerate(valid[:3])}
+    ranges_dict = {i: r for i, (_, r) in enumerate(valid[:3])}
+    pos2d = trilaterate(ranges_dict, anchors_dict)
+    if not pos2d:
+        return None
+    x, y = pos2d
+    dx = x - x0
+    dy = y - y0
+    horiz2 = dx*dx + dy*dy
+    h2 = r0*r0 - horiz2
+    z = z0 + (math.sqrt(h2) if h2 > 0.0 else 0.0)
+    return (x, y, z)
+
+
 # ---------------------------------------------------------------------------
 # UDP listener
 # ---------------------------------------------------------------------------
@@ -150,6 +236,13 @@ def handle_rpt(text):
         for aid, dist in ranges.items():
             if 0 <= aid <= 9:
                 pt["samples"].setdefault(aid, []).append(dist)
+
+    # Add to automatic calibration samples if collecting.
+    with auto_cal_lock:
+        if auto_cal["running"] and auto_cal["phase"] == "collecting" and auto_cal["current_id"] == tid:
+            for aid, dist in ranges.items():
+                if 0 <= aid <= 9:
+                    auto_cal["samples"].setdefault(aid, []).append(dist)
 
     # Solve position if enough anchors are known.
     pos = solve_tag_position(tags[tid]["ranges"])
@@ -250,6 +343,164 @@ def discovery_task():
 
 
 # ---------------------------------------------------------------------------
+# Auto-calibration helpers
+# ---------------------------------------------------------------------------
+
+def get_node_ip_by_id(node_id):
+    """Return the most recent IP for a given UWB index, or None."""
+    now = time.time() * 1000
+    best = None
+    best_age = float("inf")
+    for ip, info in registry.items():
+        if info["id"] == node_id and (now - info["last_seen_ms"]) < HEARTBEAT_TIMEOUT_MS:
+            age = now - info["last_seen_ms"]
+            if age < best_age:
+                best_age = age
+                best = ip
+    return best
+
+
+def send_role_udp(ip, role):
+    """Send ROLE command to a node's IP. Returns True on success."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(2.0)
+    try:
+        sock.sendto(f"ROLE,{role}".encode(), (ip, UDP_PORT))
+        return True
+    except Exception as e:
+        log(f"Failed to send ROLE,{role} to {ip}: {e}")
+        return False
+    finally:
+        sock.close()
+
+
+def auto_cal_reset():
+    """Clear auto-calibration state."""
+    with auto_cal_lock:
+        auto_cal["running"] = False
+        auto_cal["origin_id"] = None
+        auto_cal["fixed"].clear()
+        auto_cal["pending"].clear()
+        auto_cal["current_id"] = None
+        auto_cal["phase"] = "idle"
+        auto_cal["deadline_ms"] = 0
+        auto_cal["samples"] = defaultdict(list)
+        auto_cal["message"] = ""
+
+
+def auto_cal_loop():
+    """Background thread implementing sequential automatic anchor calibration."""
+    while True:
+        with auto_cal_lock:
+            if not auto_cal["running"]:
+                return
+            phase = auto_cal["phase"]
+            deadline = auto_cal["deadline_ms"]
+            current_id = auto_cal["current_id"]
+
+        now_ms = time.time() * 1000
+
+        if phase == "wait_tag" or phase == "wait_anchor":
+            if now_ms < deadline:
+                time.sleep(0.5)
+                continue
+
+            if phase == "wait_tag":
+                with auto_cal_lock:
+                    auto_cal["phase"] = "collecting"
+                    auto_cal["samples"] = defaultdict(list)
+                    auto_cal["deadline_ms"] = now_ms + AUTO_CAL_COLLECT_S * 1000
+                    auto_cal["message"] = f"Collecting ranges from tag {current_id}"
+                log(f"[AUTO] Window open, collecting RPT from tag {current_id}")
+                continue
+
+            if phase == "wait_anchor":
+                # Anchor should be back online; pick the next one.
+                with auto_cal_lock:
+                    if auto_cal["pending"]:
+                        auto_cal["current_id"] = None
+                        auto_cal["phase"] = "wait_next"
+                    else:
+                        auto_cal["current_id"] = None
+                        auto_cal["phase"] = "done"
+                        auto_cal["message"] = "Auto-calibration complete"
+                        auto_cal["running"] = False
+                        log("[AUTO] Calibration complete")
+                continue
+
+        if phase == "collecting":
+            if now_ms < deadline:
+                time.sleep(0.5)
+                continue
+
+            with auto_cal_lock:
+                samples = auto_cal["samples"]
+                fixed = dict(auto_cal["fixed"])
+                current_id = auto_cal["current_id"]
+
+            # Compute median ranges to already-fixed anchors.
+            median_ranges = {}
+            for aid, dists in samples.items():
+                if aid in fixed and dists:
+                    m = median(dists)
+                    if m is not None and m > 0:
+                        median_ranges[aid] = m
+
+            log(f"[AUTO] Median ranges from tag {current_id}: {median_ranges}")
+            pos = solve_sequential_anchor(median_ranges, fixed)
+
+            if pos:
+                anchors[current_id] = pos
+                with auto_cal_lock:
+                    auto_cal["fixed"][current_id] = pos
+                log(f"[AUTO] Anchor {current_id} fixed at ({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f})")
+            else:
+                log(f"[AUTO] Failed to solve anchor {current_id}; will still switch back")
+
+            ip = get_node_ip_by_id(current_id)
+            if ip:
+                send_role_udp(ip, 1)
+                log(f"[AUTO] Sent ROLE,1 to anchor {current_id}")
+            else:
+                log(f"[AUTO] No IP for {current_id} to send ROLE,1")
+
+            with auto_cal_lock:
+                auto_cal["phase"] = "wait_anchor"
+                auto_cal["deadline_ms"] = time.time() * 1000 + AUTO_CAL_ROLE_SWITCH_WAIT_S * 1000
+                auto_cal["message"] = f"Waiting for anchor {current_id} to reconfigure"
+            continue
+
+        if phase == "wait_next":
+            with auto_cal_lock:
+                if auto_cal["pending"]:
+                    next_id = auto_cal["pending"].pop(0)
+                    auto_cal["current_id"] = next_id
+                    auto_cal["phase"] = "wait_tag"
+                    auto_cal["deadline_ms"] = time.time() * 1000 + AUTO_CAL_ROLE_SWITCH_WAIT_S * 1000
+                    auto_cal["message"] = f"Switching anchor {next_id} to TAG"
+                else:
+                    auto_cal["phase"] = "done"
+                    auto_cal["message"] = "Auto-calibration complete"
+                    auto_cal["running"] = False
+                    log("[AUTO] Calibration complete")
+                    return
+
+            ip = get_node_ip_by_id(next_id)
+            if ip:
+                send_role_udp(ip, 0)
+                log(f"[AUTO] Sent ROLE,0 to anchor {next_id}")
+            else:
+                log(f"[AUTO] No IP for anchor {next_id}; skipping")
+                with auto_cal_lock:
+                    auto_cal["phase"] = "wait_next"
+                    auto_cal["current_id"] = None
+            continue
+
+        # Idle / done / error
+        return
+
+
+# ---------------------------------------------------------------------------
 # Web routes
 # ---------------------------------------------------------------------------
 
@@ -314,7 +565,18 @@ HTML_PAGE = r"""
     </div>
 
     <div class="section">
-        <h2>4. Live tag positions</h2>
+        <h2>4. Auto-calibrate anchors (Mode A)</h2>
+        <p>The PC temporarily switches each anchor to TAG, collects ranges to already-fixed anchors, solves its position, and switches it back.</p>
+        <div class="row">
+            Origin anchor ID: <input type="number" id="autoCalOrigin" min="0" max="9" value="0" style="width:60px">
+            <button id="autoCalStartBtn" onclick="startAutoCal()">Start auto-calibration</button>
+            <button onclick="stopAutoCal()">Stop / reset</button>
+        </div>
+        <div id="autoCalStatus"></div>
+    </div>
+
+    <div class="section">
+        <h2>5. Live tag positions</h2>
         <div id="tagPositions"></div>
     </div>
 
@@ -447,6 +709,56 @@ HTML_PAGE = r"""
             fetch('/cal_clear', {method: 'POST'})
                 .then(r => r.json())
                 .then(data => { refreshState(); });
+        }
+
+        function startAutoCal() {
+            const origin = document.getElementById('autoCalOrigin').value;
+            document.getElementById('autoCalStartBtn').disabled = true;
+            fetch('/auto_cal_start', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({origin_id: origin})
+            }).then(r => r.json()).then(data => {
+                if (data.error) alert(data.error);
+                pollAutoCalStatus();
+            });
+        }
+
+        function stopAutoCal() {
+            fetch('/auto_cal_stop', {method: 'POST'})
+                .then(r => r.json())
+                .then(data => { pollAutoCalStatus(); });
+        }
+
+        function pollAutoCalStatus() {
+            fetch('/auto_cal_status')
+                .then(r => r.json())
+                .then(data => {
+                    const div = document.getElementById('autoCalStatus');
+                    let html = `<p><strong>Status:</strong> ${data.phase}</p>`;
+                    if (data.message) {
+                        html += `<p>${data.message}</p>`;
+                    }
+                    if (data.current_id !== null) {
+                        html += `<p>Current tag: ${data.current_id}</p>`;
+                    }
+                    html += '<p>Fixed anchors:</p><ul>';
+                    for (const [id, p] of Object.entries(data.fixed)) {
+                        html += `<li>${id}: (${p[0].toFixed(2)}, ${p[1].toFixed(2)}, ${p[2].toFixed(2)})</li>`;
+                    }
+                    html += '</ul>';
+                    if (data.pending && data.pending.length > 0) {
+                        html += `<p>Pending: ${data.pending.join(', ')}</p>`;
+                    }
+                    div.innerHTML = html;
+
+                    if (data.running) {
+                        setTimeout(pollAutoCalStatus, 1000);
+                    } else {
+                        document.getElementById('autoCalStartBtn').disabled = false;
+                    }
+                    refreshState();
+                });
         }
 
         function refreshState() {
@@ -651,6 +963,77 @@ def cal_clear():
     }
     log("Calibration cleared")
     return jsonify({"ok": True})
+
+
+@app.route("/auto_cal_start", methods=["POST"])
+def auto_cal_start():
+    global auto_cal
+    data = request.get_json(silent=True) or {}
+    try:
+        origin_id = int(data.get("origin_id", 0))
+    except Exception:
+        return jsonify({"error": "Bad origin_id"}), 400
+
+    with auto_cal_lock:
+        if auto_cal["running"]:
+            return jsonify({"error": "Auto-calibration already running"}), 429
+
+        # Build list of discovered anchor IDs (role == 1) excluding origin.
+        anchor_ids = set()
+        for ip, info in registry.items():
+            if info.get("role") == 1:
+                anchor_ids.add(info["id"])
+            elif info.get("role") == 0:
+                # Treat currently-TAG nodes as anchors if the user says so? No,
+                # only role==1 nodes are anchors; role==0 are tags.
+                pass
+
+        if origin_id not in anchor_ids:
+            return jsonify({"error": f"Origin ID {origin_id} not found among discovered anchors"}), 400
+
+        anchor_ids.discard(origin_id)
+        if not anchor_ids:
+            return jsonify({"error": "Need at least 2 anchors for auto-calibration"}), 400
+
+        auto_cal["running"] = True
+        auto_cal["origin_id"] = origin_id
+        auto_cal["fixed"] = {origin_id: (0.0, 0.0, 0.0)}
+        auto_cal["pending"] = sorted(anchor_ids)
+        auto_cal["current_id"] = None
+        auto_cal["phase"] = "wait_next"
+        auto_cal["deadline_ms"] = 0
+        auto_cal["samples"] = defaultdict(list)
+        auto_cal["message"] = f"Starting auto-calibration with origin {origin_id}"
+
+    log(f"[AUTO] Starting calibration. Origin={origin_id}, pending={auto_cal['pending']}")
+    threading.Thread(target=auto_cal_loop, daemon=True).start()
+    return jsonify({"ok": True})
+
+
+@app.route("/auto_cal_stop", methods=["POST"])
+def auto_cal_stop():
+    with auto_cal_lock:
+        if not auto_cal["running"]:
+            return jsonify({"ok": True, "message": "Not running"})
+        auto_cal["running"] = False
+        auto_cal["phase"] = "idle"
+        auto_cal["message"] = "Stopped by user"
+    log("[AUTO] Stopped by user")
+    return jsonify({"ok": True})
+
+
+@app.route("/auto_cal_status")
+def auto_cal_status():
+    with auto_cal_lock:
+        return jsonify({
+            "running": auto_cal["running"],
+            "origin_id": auto_cal["origin_id"],
+            "phase": auto_cal["phase"],
+            "current_id": auto_cal["current_id"],
+            "pending": list(auto_cal["pending"]),
+            "fixed": {aid: list(p) for aid, p in auto_cal["fixed"].items()},
+            "message": auto_cal["message"],
+        })
 
 
 @app.route("/state")

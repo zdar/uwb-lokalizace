@@ -109,9 +109,17 @@ The web GUI lets you:
 - **Set anchor positions** manually or calibrate them with known tag points.
 - **View live tag positions** as `SOL` would normally show.
 
-### What the PC ANL GUI does not do
+### Fully automatic calibration in the PC ANL GUI
 
-The GUI is a development helper. It does **not** implement fully automatic anchor calibration (Mode A). For that, use an ESP32 ANL and send `AUTO,1` over UDP, or trigger anchors one-by-one with `CALAUTO,<id>`.
+The GUI also supports Mode A. In panel **4. Auto-calibrate anchors**, pick the origin anchor ID and click **Start auto-calibration**. The PC will:
+
+1. Fix the origin anchor at `(0, 0, 0)`.
+2. Switch the next anchor to TAG, wait 40s for UWB reconfiguration.
+3. Collect RPT ranges for 20s.
+4. Solve the anchor position and switch it back to ANCHOR.
+5. Repeat until all discovered anchors are fixed.
+
+You can stop the sequence at any time with **Stop / reset**. If you prefer, you can still use the ESP32 ANL firmware's built-in auto-calibration via `AUTO,1` or `CALAUTO,<id>`.
 
 ### Calibrate with the PC ANL GUI
 

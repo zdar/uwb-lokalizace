@@ -35,7 +35,7 @@ This means:
 - Calibrating anchors with a tag at known 3D points (Mode B).
 - Viewing live solved tag positions.
 
-It does **not** implement fully automatic anchor calibration (Mode A). That state machine lives only in the ESP32 ANL firmware (`autoCalibrateLoop()` / `CALAUTO,<id>`).
+It also supports fully automatic anchor calibration (Mode A), which temporarily switches each anchor to TAG, collects ranges, solves its position, and switches it back. The ESP32 ANL firmware has the same capability (`autoCalibrateLoop()` / `CALAUTO,<id>`), so you can use whichever ANL you prefer.
 
 ## Common gotchas
 
