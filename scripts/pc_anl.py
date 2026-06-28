@@ -149,6 +149,65 @@ def solve_tag_position(ranges):
     return None
 
 
+def _dot(a, b):
+    return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]
+
+
+def _norm(v):
+    return math.sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2])
+
+
+def _scale(v, s):
+    return (v[0]*s, v[1]*s, v[2]*s)
+
+
+def _add(a, b):
+    return (a[0]+b[0], a[1]+b[1], a[2]+b[2])
+
+
+def _sub(a, b):
+    return (a[0]-b[0], a[1]-b[1], a[2]-b[2])
+
+
+def _cross(a, b):
+    return (a[1]*b[2] - a[2]*b[1],
+            a[2]*b[0] - a[0]*b[2],
+            a[0]*b[1] - a[1]*b[0])
+
+
+def trilaterate_3d_3spheres(p0, p1, p2, r0, r1, r2):
+    """
+    Explicit intersection of three spheres. Returns (x, y, z) with +Z,
+    or None if geometry is degenerate.
+    """
+    # Translate p0 to origin.
+    ex_prime = _sub(p1, p0)
+    d = _norm(ex_prime)
+    if d < 1e-6:
+        return None
+    ex = _scale(ex_prime, 1.0 / d)
+
+    p2_prime = _sub(p2, p0)
+    i = _dot(p2_prime, ex)
+    ey_prime = _sub(p2_prime, _scale(ex, i))
+    j_len = _norm(ey_prime)
+    if j_len < 1e-6:
+        return None
+    ey = _scale(ey_prime, 1.0 / j_len)
+    ez = _cross(ex, ey)
+    j = _dot(p2_prime, ey)
+
+    x = (r0*r0 - r1*r1 + d*d) / (2.0 * d)
+    y = (r0*r0 - r2*r2 + i*i + j*j - 2.0*i*x) / (2.0 * j)
+    z2 = r0*r0 - x*x - y*y
+    if z2 < -1e-6:
+        return None
+    z = math.sqrt(max(z2, 0.0))
+
+    # Pick +Z side relative to the plane normal ez.
+    return _add(p0, _add(_add(_scale(ex, x), _scale(ey, y)), _scale(ez, z)))
+
+
 def solve_sequential_anchor(ranges_to_fixed, fixed):
     """
     Solve an anchor position from ranges to already-fixed anchors, mirroring
@@ -190,11 +249,10 @@ def solve_sequential_anchor(ranges_to_fixed, fixed):
             ux, uy = ux / ul, uy / ul
         return (xm + ux * h, ym + uy * h, zm)
 
-    # 3+ fixed anchors -> 2D first, then +Z from distance to reference.
-    # Use the first valid fixed anchor as the reference for Z.
+    # 3+ fixed anchors. Try least-squares 3D if we have 4+ non-coplanar anchors.
+    # Use the first valid fixed anchor as the reference for Z fallback.
     (x0, y0, z0), r0 = valid[0]
 
-    # If we have 4+ fixed anchors, try full 3D least-squares first.
     if len(valid) >= 4:
         anchors_dict = {i: p for i, (p, _) in enumerate(valid)}
         ranges_dict = {i: r for i, (_, r) in enumerate(valid)}
@@ -202,7 +260,14 @@ def solve_sequential_anchor(ranges_to_fixed, fixed):
         if pos3d:
             return pos3d
 
-    # 2D fallback using the first 3 fixed anchors.
+    # Either exactly 3 fixed anchors, or 4+ are coplanar and least-squares failed.
+    # Use explicit 3-sphere intersection for the first three fixed anchors.
+    (p0, r0), (p1, r1), (p2, r2) = valid[0], valid[1], valid[2]
+    pos3d = trilaterate_3d_3spheres(p0, p1, p2, r0, r1, r2)
+    if pos3d:
+        return pos3d
+
+    # Last resort: 2D fallback.
     anchors_dict = {i: (p[0], p[1]) for i, (p, _) in enumerate(valid[:3])}
     ranges_dict = {i: r for i, (_, r) in enumerate(valid[:3])}
     pos2d = trilaterate(ranges_dict, anchors_dict)
