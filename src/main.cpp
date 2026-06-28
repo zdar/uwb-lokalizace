@@ -109,6 +109,7 @@ String ssidForNetId(uint16_t netId);
 String netIdString(uint16_t netId);
 void displayRoleScreen(uint8_t role);
 void displayReadyScreen();
+void displayMainStatusScreen();
 void maybeEnterProvisioning();
 void provisioningMenu();
 int waitForButtonEvent(unsigned long timeout);
@@ -969,6 +970,7 @@ void setup()
     }
 
     displayReadyScreen();
+    displayMainStatusScreen();
     logoshow();
 
     SERIAL_LOG.println(F("===================================="));
@@ -1018,6 +1020,7 @@ void loop()
                 display.display();
                 configureUWB();
                 displayReadyScreen();
+                displayMainStatusScreen();
             }
         } else {
             unsigned long held = millis() - btnDownT;
@@ -1098,10 +1101,14 @@ void loop()
     printRegistryTable();
     handleOTA();
 
+    static unsigned long lastMainStatusUpdate = 0;
+    if (millis() - lastMainStatusUpdate >= 5000) {
+        displayMainStatusScreen();
+        lastMainStatusUpdate = millis();
+    }
+
     if (systemRole == 1) {
         drawAnlDashboard();
-    } else {
-        updateWifiStatusDisplay();
     }
 }
 
@@ -1228,7 +1235,90 @@ void displayReadyScreen()
         display.println(F("FAIL"));
     }
     display.display();
-    delay(4000);
+    delay(3000);
+}
+
+void displayMainStatusScreen()
+{
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+
+    // Role + UWB index + rate
+    display.setTextSize(2);
+    display.setCursor(0, 0);
+    String header = "";
+    if (currentRole == 0) {
+        header = header + "T" + uwbIndex;
+    } else {
+        header = header + "A" + uwbIndex;
+    }
+    header = header + "  6.8M";
+    display.println(header);
+
+    // Firmware build date
+    display.setTextSize(1);
+    display.setCursor(0, 22);
+    display.print(F("FW: "));
+    String dateStr = __DATE__;
+    String mon = dateStr.substring(0, 3);
+    int m = 0;
+    if (mon == "Jan") m = 1;
+    else if (mon == "Feb") m = 2;
+    else if (mon == "Mar") m = 3;
+    else if (mon == "Apr") m = 4;
+    else if (mon == "May") m = 5;
+    else if (mon == "Jun") m = 6;
+    else if (mon == "Jul") m = 7;
+    else if (mon == "Aug") m = 8;
+    else if (mon == "Sep") m = 9;
+    else if (mon == "Oct") m = 10;
+    else if (mon == "Nov") m = 11;
+    else if (mon == "Dec") m = 12;
+    String day = dateStr.substring(4, 6);
+    day.trim();
+    String year = dateStr.substring(dateStr.length() - 2);
+    display.print(day);
+    display.print(F("/"));
+    if (m < 10) display.print(F("0"));
+    display.print(m);
+    display.print(F("/"));
+    display.println(year);
+
+    // WiFi mode / SSID / IP
+    display.setCursor(0, 36);
+    if (systemRole == 1 && !useHomeWifi) {
+        display.print(F("AP: "));
+        display.println(ssidForNetId(networkId));
+        display.setCursor(0, 46);
+        display.print(F("IP: "));
+        display.println(WiFi.softAPIP());
+    } else {
+#if ENABLE_HOME_WIFI
+        if (useHomeWifi) {
+            display.print(F("HOME: "));
+            display.println(HOME_WIFI_SSID);
+        } else
+#endif
+        {
+            display.print(F("JOIN: "));
+            display.println(ssidForNetId(networkId));
+        }
+        display.setCursor(0, 46);
+        if (WiFi.status() == WL_CONNECTED) {
+            display.print(F("IP: "));
+            display.println(WiFi.localIP());
+        } else {
+            display.println(F("WiFi: connecting..."));
+        }
+    }
+
+    // System role
+    display.setCursor(0, 56);
+    display.print(F("SYS: "));
+    display.println(systemRole == 1 ? F("ANL") : F("NODE"));
+
+    display.display();
 }
 
 String sendData(String command, const int timeout, boolean debug)
@@ -2035,6 +2125,7 @@ registerNode(remoteIp, (uint8_t)tid, knownRole);
                 displayRoleScreen(currentRole);
                 configureUWB();
                 displayReadyScreen();
+                displayMainStatusScreen();
             } else {
                 udp.beginPacket(remoteIp, remotePort);
                 udp.print("ACK,ROLE,");
@@ -2437,6 +2528,7 @@ void processATCommand(String command)
                 displayRoleScreen(currentRole);
                 configureUWB();
                 displayReadyScreen();
+                displayMainStatusScreen();
             } else {
                 SERIAL_LOG.println(F("Already in this mode."));
             }

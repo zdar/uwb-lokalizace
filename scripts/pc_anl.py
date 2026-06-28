@@ -73,8 +73,10 @@ auto_cal = {
     "pending": [],            # list of ids still to calibrate
     "current_id": None,       # id currently acting as temporary tag
     "phase": "idle",          # idle, wait_tag, collecting, wait_anchor, wait_next, done, error
-    "deadline_ms": 0,
+    "deadline_ms": 0,         # fallback safety timeout
     "samples": defaultdict(list),  # fixed_anchor_id -> [distances]
+    "packet_count": 0,        # RPT packets received in current window
+    "packets_needed": 15,     # stop collecting after this many packets
     "message": "",
 }
 auto_cal_lock = threading.Lock()
@@ -237,12 +239,19 @@ def handle_rpt(text):
             if 0 <= aid <= 9:
                 pt["samples"].setdefault(aid, []).append(dist)
 
-    # Add to automatic calibration samples if collecting.
+    # Add to automatic calibration samples when waiting for / collecting from a temporary tag.
     with auto_cal_lock:
-        if auto_cal["running"] and auto_cal["phase"] == "collecting" and auto_cal["current_id"] == tid:
+        if (auto_cal["running"] and
+                auto_cal["current_id"] == tid and
+                auto_cal["phase"] in ("wait_tag", "collecting")):
+            auto_cal["packet_count"] += 1
             for aid, dist in ranges.items():
                 if 0 <= aid <= 9:
                     auto_cal["samples"].setdefault(aid, []).append(dist)
+            if auto_cal["phase"] == "wait_tag":
+                log(f"[AUTO] First RPT from tag {tid}; starting collection")
+                auto_cal["phase"] = "collecting"
+                auto_cal["deadline_ms"] = time.time() * 1000 + 30000  # max 30s collection
 
     # Solve position if enough anchors are known.
     pos = solve_tag_position(tags[tid]["ranges"])
@@ -385,11 +394,12 @@ def auto_cal_reset():
         auto_cal["phase"] = "idle"
         auto_cal["deadline_ms"] = 0
         auto_cal["samples"] = defaultdict(list)
+        auto_cal["packet_count"] = 0
         auto_cal["message"] = ""
 
 
 def auto_cal_loop():
-    """Background thread implementing sequential automatic anchor calibration."""
+    """Background thread implementing output-driven sequential anchor calibration."""
     while True:
         with auto_cal_lock:
             if not auto_cal["running"]:
@@ -397,46 +407,51 @@ def auto_cal_loop():
             phase = auto_cal["phase"]
             deadline = auto_cal["deadline_ms"]
             current_id = auto_cal["current_id"]
+            packets_needed = auto_cal["packets_needed"]
 
         now_ms = time.time() * 1000
 
-        if phase == "wait_tag" or phase == "wait_anchor":
-            if now_ms < deadline:
-                time.sleep(0.5)
+        if phase == "wait_tag":
+            # Wait for the first RPT from the temporary tag. Fall back to a
+            # hard timeout so we don't hang forever if the module is stuck.
+            with auto_cal_lock:
+                has_samples = bool(auto_cal["samples"])
+                timed_out = now_ms >= deadline
+
+            if not has_samples and not timed_out:
+                time.sleep(0.2)
                 continue
 
-            if phase == "wait_tag":
+            if not has_samples and timed_out:
+                log(f"[AUTO] Timeout waiting for tag {current_id} RPT")
+                # Switch it back anyway so we don't leave it stuck as TAG.
+                ip = get_node_ip_by_id(current_id)
+                if ip:
+                    send_role_udp(ip, 1)
                 with auto_cal_lock:
-                    auto_cal["phase"] = "collecting"
-                    auto_cal["samples"] = defaultdict(list)
-                    auto_cal["deadline_ms"] = now_ms + AUTO_CAL_COLLECT_S * 1000
-                    auto_cal["message"] = f"Collecting ranges from tag {current_id}"
-                log(f"[AUTO] Window open, collecting RPT from tag {current_id}")
+                    auto_cal["message"] = f"Timeout on tag {current_id}; switching back"
+                    auto_cal["phase"] = "wait_anchor"
+                    auto_cal["deadline_ms"] = now_ms + 60000
                 continue
 
-            if phase == "wait_anchor":
-                # Anchor should be back online; pick the next one.
-                with auto_cal_lock:
-                    if auto_cal["pending"]:
-                        auto_cal["current_id"] = None
-                        auto_cal["phase"] = "wait_next"
-                    else:
-                        auto_cal["current_id"] = None
-                        auto_cal["phase"] = "done"
-                        auto_cal["message"] = "Auto-calibration complete"
-                        auto_cal["running"] = False
-                        log("[AUTO] Calibration complete")
-                continue
+            # First RPT already moved us to collecting in handle_rpt.
+            continue
 
         if phase == "collecting":
-            if now_ms < deadline:
-                time.sleep(0.5)
+            with auto_cal_lock:
+                packet_count = auto_cal["packet_count"]
+                timed_out = now_ms >= deadline
+
+            if packet_count < packets_needed and not timed_out:
+                time.sleep(0.2)
                 continue
 
+            # Done collecting.
             with auto_cal_lock:
                 samples = auto_cal["samples"]
                 fixed = dict(auto_cal["fixed"])
                 current_id = auto_cal["current_id"]
+                actual_packets = auto_cal["packet_count"]
 
             # Compute median ranges to already-fixed anchors.
             median_ranges = {}
@@ -446,7 +461,7 @@ def auto_cal_loop():
                     if m is not None and m > 0:
                         median_ranges[aid] = m
 
-            log(f"[AUTO] Median ranges from tag {current_id}: {median_ranges}")
+            log(f"[AUTO] Collected {actual_packets} packets from tag {current_id}, median ranges: {median_ranges}")
             pos = solve_sequential_anchor(median_ranges, fixed)
 
             if pos:
@@ -455,7 +470,7 @@ def auto_cal_loop():
                     auto_cal["fixed"][current_id] = pos
                 log(f"[AUTO] Anchor {current_id} fixed at ({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f})")
             else:
-                log(f"[AUTO] Failed to solve anchor {current_id}; will still switch back")
+                log(f"[AUTO] Failed to solve anchor {current_id}; switching back anyway")
 
             ip = get_node_ip_by_id(current_id)
             if ip:
@@ -466,8 +481,30 @@ def auto_cal_loop():
 
             with auto_cal_lock:
                 auto_cal["phase"] = "wait_anchor"
-                auto_cal["deadline_ms"] = time.time() * 1000 + AUTO_CAL_ROLE_SWITCH_WAIT_S * 1000
-                auto_cal["message"] = f"Waiting for anchor {current_id} to reconfigure"
+                auto_cal["deadline_ms"] = now_ms + 60000
+                auto_cal["message"] = f"Waiting for anchor {current_id} heartbeat"
+            continue
+
+        if phase == "wait_anchor":
+            # Wait until the heartbeat says this node is an anchor again.
+            role_is_anchor = False
+            for ip, info in registry.items():
+                if info.get("id") == current_id and info.get("role") == 1:
+                    role_is_anchor = True
+                    break
+
+            timed_out = now_ms >= deadline
+
+            if not role_is_anchor and not timed_out:
+                time.sleep(0.5)
+                continue
+
+            if not role_is_anchor and timed_out:
+                log(f"[AUTO] Timeout waiting for anchor {current_id} to return")
+
+            with auto_cal_lock:
+                auto_cal["current_id"] = None
+                auto_cal["phase"] = "wait_next"
             continue
 
         if phase == "wait_next":
@@ -476,7 +513,9 @@ def auto_cal_loop():
                     next_id = auto_cal["pending"].pop(0)
                     auto_cal["current_id"] = next_id
                     auto_cal["phase"] = "wait_tag"
-                    auto_cal["deadline_ms"] = time.time() * 1000 + AUTO_CAL_ROLE_SWITCH_WAIT_S * 1000
+                    auto_cal["samples"] = defaultdict(list)
+                    auto_cal["packet_count"] = 0
+                    auto_cal["deadline_ms"] = now_ms + 60000
                     auto_cal["message"] = f"Switching anchor {next_id} to TAG"
                 else:
                     auto_cal["phase"] = "done"
@@ -614,7 +653,9 @@ HTML_PAGE = r"""
                 div.innerHTML = '<p>No nodes discovered yet.</p>';
                 return;
             }
-            let html = '<table><tr><th>ID</th><th>IP</th><th>Role</th><th>Age (s)</th><th>Action</th></tr>';
+            nodes.sort((a, b) => a.id - b.id);
+            let html = `<p>Connected: <strong>${nodes.length}</strong></p>`;
+            html += '<table><tr><th>ID</th><th>IP</th><th>Role</th><th>Age (s)</th><th>Action</th></tr>';
             for (const n of nodes) {
                 const target = n.role === 1 ? 'TAG' : 'ANCHOR';
                 const roleNum = n.role === 1 ? '0' : '1';
@@ -741,6 +782,7 @@ HTML_PAGE = r"""
                     }
                     if (data.current_id !== null) {
                         html += `<p>Current tag: ${data.current_id}</p>`;
+                        html += `<p>Packets: ${data.packet_count} / ${data.packets_needed}</p>`;
                     }
                     html += '<p>Fixed anchors:</p><ul>';
                     for (const [id, p] of Object.entries(data.fixed)) {
@@ -1003,6 +1045,7 @@ def auto_cal_start():
         auto_cal["phase"] = "wait_next"
         auto_cal["deadline_ms"] = 0
         auto_cal["samples"] = defaultdict(list)
+        auto_cal["packet_count"] = 0
         auto_cal["message"] = f"Starting auto-calibration with origin {origin_id}"
 
     log(f"[AUTO] Starting calibration. Origin={origin_id}, pending={auto_cal['pending']}")
@@ -1032,6 +1075,8 @@ def auto_cal_status():
             "current_id": auto_cal["current_id"],
             "pending": list(auto_cal["pending"]),
             "fixed": {aid: list(p) for aid, p in auto_cal["fixed"].items()},
+            "packet_count": auto_cal["packet_count"],
+            "packets_needed": auto_cal["packets_needed"],
             "message": auto_cal["message"],
         })
 
