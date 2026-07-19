@@ -1,0 +1,52 @@
+@echo off
+setlocal
+
+REM This batch file is designed to live in the project root (e.g. a SharePoint/OneDrive synced folder).
+REM It launches the PC ANL GUI using a per-user virtual environment created by setup.bat.
+REM It also starts the ESP32-CAM QR scanner so the trny QR scanning screen works in the UI.
+
+set "PROJECT_DIR=%~dp0"
+set "VENV_DIR=%LOCALAPPDATA%\uwb-lokalizace\venv"
+
+REM Optional: override the ESP32-CAM URL if your camera has a different IP.
+REM set "ESP32_CAM_URL=http://192.168.0.159/capture"
+
+echo ==========================================
+echo  UWB PC ANL - GUI + ESP-CAM scanner
+echo ==========================================
+
+if not exist "%VENV_DIR%\Scripts\python.exe" (
+    echo.
+    echo ERROR: Virtual environment not found.
+    echo Please run setup.bat first to install the required Python packages.
+    echo.
+    pause
+    exit /b 1
+)
+
+cd /d "%PROJECT_DIR%"
+echo Project directory: %PROJECT_DIR%
+echo.
+echo Starting PC ANL GUI and ESP-CAM QR scanner...
+echo.
+
+REM Launch the PC ANL web GUI in its own window.
+start "PC ANL - UWB GUI" "%VENV_DIR%\Scripts\python.exe" scripts\pc_anl.py
+
+REM Give the GUI a moment to bind UDP ports before starting the scanner.
+timeout /t 2 /nobreak >nul
+
+REM Launch the ESP32-CAM QR scanner in its own window (local or parent project root).
+if exist "esp-cam\qr_scanner.py" (
+    start "ESP-CAM QR Scanner" "%VENV_DIR%\Scripts\python.exe" esp-cam\qr_scanner.py
+) else if exist "..\esp-cam\qr_scanner.py" (
+    start "ESP-CAM QR Scanner" "%VENV_DIR%\Scripts\python.exe" ..\esp-cam\qr_scanner.py
+) else (
+    echo WARNING: esp-cam\qr_scanner.py not found. The QR scanner will not start.
+)
+
+echo.
+echo Both services are running in their own windows.
+echo Close those windows to stop the services.
+echo.
+pause

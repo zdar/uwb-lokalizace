@@ -1,0 +1,3 @@
+# Dependencies for scripts/pc_anl.py (PC ANL GUI).
+# Run setup.bat on Windows to install these into a local virtual environment.
+flask>=3.0.0
