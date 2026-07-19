@@ -474,7 +474,7 @@ def reset_transform():
 
 
 def start_qr_collection(qr_code):
-    """Start collecting UWB ranges for a QR-scanned reference point."""
+    """Start collecting UWB ranges for a QR-scanned point (trny or arbitrary)."""
     point = None
     point_id = None
     for pid, p in trny.items():
@@ -484,8 +484,12 @@ def start_qr_collection(qr_code):
             break
 
     if point is None:
-        log(f"[QR] Unknown QR code: {qr_code}")
-        return False
+        # Unknown QR: still record it as a measurement, just without a known global point.
+        point_xyz = (None, None, None)
+        log_msg = f"[QR] DETECTED {qr_code} — unknown code, saving measurement ({QR_COLLECT_MS}ms)"
+    else:
+        point_xyz = (point["x"], point["y"], point["z"])
+        log_msg = f"[QR] DETECTED {qr_code} — started collection for point {point_id} ({QR_COLLECT_MS}ms)"
 
     scan_id = datetime.now().strftime("%Y%m%d%H%M%S")
     collection = {
@@ -493,7 +497,7 @@ def start_qr_collection(qr_code):
         "scan_id": scan_id,
         "qr_code": qr_code,
         "point_id": point_id,
-        "point_xyz": (point["x"], point["y"], point["z"]),
+        "point_xyz": point_xyz,
         "tag_id": None,
         "start_ms": time.time() * 1000,
         "duration_ms": QR_COLLECT_MS,
@@ -504,7 +508,7 @@ def start_qr_collection(qr_code):
     with qr_collect_lock:
         qr_active.append(collection)
     qr_detected_ms = time.time() * 1000
-    log(f"[QR] DETECTED {qr_code} — started collection for point {point_id} ({QR_COLLECT_MS}ms)")
+    log(log_msg)
     threading.Timer(QR_COLLECT_MS / 1000.0, lambda c=collection: finish_qr_collection(c)).start()
     return True
 
@@ -544,25 +548,25 @@ def finish_qr_collection(collection):
     global_xyz = None
 
     if computed_xyz:
-        # Store this scan as a mapping pair for real-world calibration.
-        # If the point was scanned before, replace the old pair instead of
-        # creating a duplicate.
-        with transform_lock:
-            replaced = False
-            for pair in transform["pairs"]:
-                if pair["point_id"] == point_id:
-                    pair["uwb"] = computed_xyz
-                    pair["global"] = point_xyz
-                    replaced = True
-                    break
-            if not replaced:
-                transform["pairs"].append({
-                    "point_id": point_id,
-                    "uwb": computed_xyz,
-                    "global": point_xyz,
-                })
-            # A re-scan invalidates the previously computed transform.
-            transform["active"] = False
+        # For known trny points, store this scan as a mapping pair for
+        # real-world calibration. Unknown QR codes are measurements only.
+        if point_id is not None:
+            with transform_lock:
+                replaced = False
+                for pair in transform["pairs"]:
+                    if pair["point_id"] == point_id:
+                        pair["uwb"] = computed_xyz
+                        pair["global"] = point_xyz
+                        replaced = True
+                        break
+                if not replaced:
+                    transform["pairs"].append({
+                        "point_id": point_id,
+                        "uwb": computed_xyz,
+                        "global": point_xyz,
+                    })
+                # A re-scan invalidates the previously computed transform.
+                transform["active"] = False
         if transform["active"]:
             global_xyz = apply_transform(computed_xyz)
     else:
