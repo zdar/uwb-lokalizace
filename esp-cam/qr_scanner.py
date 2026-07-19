@@ -4,7 +4,7 @@ import time
 import random
 import winsound
 import threading
-from collections import deque
+from collections import deque, defaultdict
 
 import cv2
 import numpy as np
@@ -21,14 +21,19 @@ QR_EVENT_HOST = "127.0.0.1"
 QR_EVENT_PORT = 50002                         # musi odpovidat pc_anl.py
 TAG_ID = None                                 # None = prvni aktivni tag; jinak cislo
 
-# Jak dlouho po detekci QR sbirame vzorky pro median (ms).
-SAMPLE_WINDOW_MS = int(os.environ.get("QR_SAMPLE_WINDOW_MS", 5000))
-# Cooldown mezi dvema skeny (ms).
-SCAN_COOLDOWN_MS = int(os.environ.get("QR_SCAN_COOLDOWN_MS", 1000))
+# Cooldown po potvrzenem QR scanu (ms) - musi pokryt 5s UWB sběr v pc_anl.py.
+QR_COOLDOWN_MS = int(os.environ.get("QR_COOLDOWN_MS", 6000))
+# Jak dlouho sbirame detekce pro potvrzeni QR (ms).
+QR_CONFIRM_MS = int(os.environ.get("QR_CONFIRM_MS", 200))
+# Kolik detekci v okne potrebujeme pro potvrzeni (majorita).
+QR_CONFIRM_MIN = int(os.environ.get("QR_CONFIRM_MIN", 2))
 # Frekvence stahovani snimku z ESP32-CAM (s).
 CAPTURE_INTERVAL_S = float(os.environ.get("QR_CAPTURE_INTERVAL_S", 0.1))
 # Timeout pro jeden HTTP pozadavek na kameru (s).
 CAMERA_REQUEST_TIMEOUT_S = 5
+# Zapnout agresivnejsi predzpracovani (CLAHE + Otsu) jen kdyz je to nutne;
+# muze zpusobovat falesne detekce.
+QR_AGGRESSIVE_DECODE = os.environ.get("QR_AGGRESSIVE_DECODE", "0") == "1"
 
 ANCHOR_COUNT = 10
 
@@ -183,11 +188,11 @@ def capture_thread():
 
 
 def decode_latest_qr(frame):
-    """Pokus o dekodovani QR z BGR snimku s nekolika predzpracovanimi.
+    """Pokus o dekodovani QR z BGR snimku.
 
-    ESP32-CAM casto posila snimky s nizkym kontrastem nebo sikmo natoceny
-    QR kod. Zkusime proto primy BGR preklad, grayscale + CLAHE a Otsu
-    prahovani, abychom detekci urychlili a zvysili uspesnost.
+    Vychozi postup je rychly a bezpecny: primy barevny snimek a grayscale.
+    Agresivnejsi metody (CLAHE, Otsu) jsou volitelne pres QR_AGGRESSIVE_DECODE,
+    protoze mohou generovat falesne detekce z sumu.
     """
     if frame is None:
         return None
@@ -197,19 +202,22 @@ def decode_latest_qr(frame):
     if codes:
         return codes[0].data.decode("utf-8")
 
-    # 2) grayscale + CLAHE (lokalni kontrast)
+    # 2) grayscale
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     codes = decode(gray)
     if codes:
         return codes[0].data.decode("utf-8")
 
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    if not QR_AGGRESSIVE_DECODE:
+        return None
+
+    # 3) volitelne agresivni predzpracovani
+    clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
     enhanced = clahe.apply(gray)
     codes = decode(enhanced)
     if codes:
         return codes[0].data.decode("utf-8")
 
-    # 3) Otsu prahovani jako posledni pokus
     _, binary = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     codes = decode(binary)
     if codes:
@@ -241,6 +249,20 @@ def qr_scan_thread():
     cooldown_until = 0
     frame_count = 0
     last_fps_time = time.time()
+    qr_history = deque()
+    pending_beep_end = 0
+
+    def get_stable_qr(now_ms):
+        if len(qr_history) < QR_CONFIRM_MIN:
+            return None
+        votes = defaultdict(int)
+        for _, code in qr_history:
+            votes[code] += 1
+        winner = max(votes, key=votes.get)
+        # majority = more than half
+        if votes[winner] > len(qr_history) / 2:
+            return winner
+        return None
 
     while state.running:
         now_ms = int(time.time() * 1000)
@@ -262,27 +284,40 @@ def qr_scan_thread():
                 last_qr = state.last_qr_info
             print_status(uwb, last_qr, fps)
 
-        qr = decode_latest_qr(frame)
-        if qr is None or now_ms < cooldown_until:
+        # End-of-collection beep if scheduled.
+        if pending_beep_end and now_ms >= pending_beep_end:
+            winsound.Beep(700, 150)
+            pending_beep_end = 0
+
+        # During cooldown ignore all QR codes to prevent duplicates.
+        if now_ms < cooldown_until:
+            qr_history.clear()
             continue
 
-        print(f"\n[QR] detekovan '{qr}', odesilam do PC ANL...")
-        winsound.Beep(1500, 150)
-        notify_pc_anl(qr)
+        qr = decode_latest_qr(frame)
+        if qr:
+            qr_history.append((now_ms, qr))
 
-        # Pockame na vzorkovaci okno, aby se stejny QR nescanoval opakovane
-        # a uzivatel dostal zpetnou vazbu. Ulozeni resi PC ANL.
-        window_end = now_ms + SAMPLE_WINDOW_MS
-        while int(time.time() * 1000) < window_end and state.running:
-            time.sleep(0.05)
+        # Drop old detections outside confirmation window.
+        while qr_history and now_ms - qr_history[0][0] > QR_CONFIRM_MS:
+            qr_history.popleft()
 
-        winsound.Beep(700, 250)  # jiny ton = okno dokonceno
-        print(f"[QR] '{qr}' - vzorkovani dokonceno ({SAMPLE_WINDOW_MS}ms)")
+        stable_qr = get_stable_qr(now_ms)
+        if stable_qr is None:
+            continue
+
+        # Confirmed QR - accept it.
+        print(f"\n[QR] potvrzen '{stable_qr}', odesilam do PC ANL...")
+        winsound.Beep(1800, 80)  # rychly, vyrazny pipnuti
+        notify_pc_anl(stable_qr)
+        qr_history.clear()
 
         with state.lock:
-            state.last_qr_info = (qr, int(time.time() * 1000))
+            state.last_qr_info = (stable_qr, now_ms)
 
-        cooldown_until = int(time.time() * 1000) + SCAN_COOLDOWN_MS
+        # Lockout long enough to cover pc_anl.py's 5s UWB collection.
+        cooldown_until = now_ms + QR_COOLDOWN_MS
+        pending_beep_end = cooldown_until
 
 
 # --- KOMUNIKACE S PC ANL ---------------------------------------------------
