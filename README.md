@@ -10,7 +10,7 @@ Stručně:
 - **UWB moduly** (MaUWB-ESP32S3) tvoří síť kotva + tag.
 - **PC jako ANL** běží `scripts/pc_anl.py`, řeší pozice, ukládá kotvy a forwarduje raw RPT pakety.
 - **ESP32-CAM** poskytuje JPEG snímky přes HTTP `/capture`.
-- **QR skener** (`esp-cam/qr_scanner.py`) čte QR z kamery, sbírá raw RPT data a ukládá je do CSV.
+- **QR skener** (`esp-cam/qr_scanner.py`) čte QR z kamery a posílá události do PC ANL, který ukládá vše do session CSV.
 - V tunelu se používá **přenosný WiFi router**, ke kterému se připojí všechna zařízení.
 
 ## Struktura repozitáře
@@ -24,8 +24,7 @@ Stručně:
 | `specifikace.md` | Původní specifikace |
 | `architektura.md` | Finální architektonické rozhodnutí |
 | `anchors.json` | Runtime uložení pozic kotev (neposílej do gitu) |
-| `data/scans/scans_raw_*.csv` | Raw RPT vzorky (neposílej do gitu) |
-| `data/scans/scans_computed_*.csv` | Vypočtené pozice skenů (neposílej do gitu) |
+| `sessions/session_YYYYMMDD_HHMMSS.csv` | Jeden session CSV s veškerými daty (neposílej do gitu) |
 
 ## Rychlý start
 
@@ -52,4 +51,4 @@ Spusť skener:
 .venv\Scripts\python.exe esp-cam\qr_scanner.py
 ```
 
-Skeny se ukládají do `data/scans/scans_raw_YYYYMMDD.csv` (raw RPT vzorky) a `data/scans/scans_computed_YYYYMMDD.csv` (vypočtené pozice).
+Všechna data jednoho měřicího/kalibračního běhu se ukládají do jednoho `sessions/session_YYYYMMDD_HHMMSS.csv`. Nový CSV začíná automaticky při startu kalibrace, případně ručně tlačítkem **New session**.

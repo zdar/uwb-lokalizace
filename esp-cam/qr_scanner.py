@@ -1,12 +1,10 @@
-import csv
 import os
 import socket
 import time
 import random
 import winsound
 import threading
-from datetime import datetime, timezone
-from collections import defaultdict
+from collections import deque
 
 import cv2
 import numpy as np
@@ -14,80 +12,48 @@ import requests
 from pyzbar.pyzbar import decode
 
 # --- KONFIGURACE -----------------------------------------------------------
-ESP32_CAM_URL = "http://192.168.0.159/capture"
+ESP32_CAM_URL = os.environ.get(
+    "ESP32_CAM_URL", "http://192.168.0.159/capture"
+)
 PC_ANL_URL = "http://localhost:5000/state"
 RAW_RPT_PORT = 50001
+QR_EVENT_HOST = "127.0.0.1"
+QR_EVENT_PORT = 50002                         # musi odpovidat pc_anl.py
 TAG_ID = None                                 # None = prvni aktivni tag; jinak cislo
 
 # Jak dlouho po detekci QR sbirame vzorky pro median (ms).
-SAMPLE_WINDOW_MS = 5000
+SAMPLE_WINDOW_MS = int(os.environ.get("QR_SAMPLE_WINDOW_MS", 5000))
 # Cooldown mezi dvema skeny (ms).
-SCAN_COOLDOWN_MS = 3000
+SCAN_COOLDOWN_MS = int(os.environ.get("QR_SCAN_COOLDOWN_MS", 1000))
 # Frekvence stahovani snimku z ESP32-CAM (s).
-CAPTURE_INTERVAL_S = 0.10
-
-OUTPUT_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "scans"
-)
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+CAPTURE_INTERVAL_S = float(os.environ.get("QR_CAPTURE_INTERVAL_S", 0.1))
+# Timeout pro jeden HTTP pozadavek na kameru (s).
+CAMERA_REQUEST_TIMEOUT_S = 5
 
 ANCHOR_COUNT = 10
 
 
 # --- SDILENY STAV ----------------------------------------------------------
+RPT_HISTORY_MAXLEN = 2000
+# Velka hodnota, aby kamera zustala "pripravena" i mezi pomalymi snimky.
+# Az kdyz se opravdu vypne, UI po teto dobe zcervena.
+CAMERA_TIMEOUT_MS = 60000
+
+
 class SharedState:
     def __init__(self):
         self.lock = threading.Lock()
         self.frame = None
         self.uwb_state = None
         self.latest_rpt = None
-        self.last_save_info = None
+        self.rpt_history = deque(maxlen=RPT_HISTORY_MAXLEN)
+        self.last_qr_info = None
+        self.camera_last_frame_ms = 0
+        self.camera_connected = False
         self.running = True
 
 
 state = SharedState()
-
-
-# --- ULOZISTE CSV ----------------------------------------------------------
-def output_filenames():
-    today = datetime.now(timezone.utc).strftime("%Y%m%d")
-    raw = os.path.join(OUTPUT_DIR, f"scans_raw_{today}.csv")
-    computed = os.path.join(OUTPUT_DIR, f"scans_computed_{today}.csv")
-    return raw, computed
-
-
-def init_csv_files():
-    raw, computed = output_filenames()
-    if not os.path.exists(raw):
-        with open(raw, "w", newline="", encoding="utf-8") as f:
-            header = [
-                "timestamp", "scan_id", "qr_raw", "tag_id",
-                *[f"range_{i}" for i in range(ANCHOR_COUNT)],
-                "pos_x", "pos_y", "pos_z", "pos_source", "rpt_age_ms"
-            ]
-            csv.writer(f).writerow(header)
-    if not os.path.exists(computed):
-        with open(computed, "w", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow([
-                "timestamp", "scan_id", "qr_raw", "x", "y", "z",
-                "source", "samples_count"
-            ])
-    return raw, computed
-
-
-def append_raw_rows(rows):
-    raw, _ = output_filenames()
-    init_csv_files()
-    with open(raw, "a", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerows(rows)
-
-
-def append_computed_row(row):
-    _, computed = output_filenames()
-    init_csv_files()
-    with open(computed, "a", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerow(row)
 
 
 # --- UWB / PC ANL ----------------------------------------------------------
@@ -185,48 +151,75 @@ def rpt_listener_thread():
                 "tag_id": tid,
                 "ranges": ranges,
             }
+            state.rpt_history.append({
+                "timestamp": now_ms,
+                "tag_id": tid,
+                "ranges": dict(ranges),
+            })
     sock.close()
 
 
 # --- KAMERA ----------------------------------------------------------------
 def capture_thread():
     print(f"[KAMERA] stahuji snimky z {ESP32_CAM_URL} (QVGA, kazdych {CAPTURE_INTERVAL_S*1000:.0f} ms)")
+    consecutive_errors = 0
     while state.running:
         try:
-            response = requests.get(ESP32_CAM_URL, timeout=2)
+            response = requests.get(ESP32_CAM_URL, timeout=CAMERA_REQUEST_TIMEOUT_S)
             if response.status_code == 200:
                 img_array = np.frombuffer(response.content, dtype=np.uint8)
                 frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
                 if frame is not None:
                     with state.lock:
                         state.frame = frame
+                        state.camera_last_frame_ms = int(time.time() * 1000)
+                        state.camera_connected = True
+                    consecutive_errors = 0
         except Exception as e:
-            print(f"[KAMERA] chyba: {e}")
+            consecutive_errors += 1
+            if consecutive_errors <= 3 or consecutive_errors % 10 == 0:
+                print(f"[KAMERA] chyba: {e}")
         time.sleep(CAPTURE_INTERVAL_S)
 
 
 def decode_latest_qr(frame):
+    """Pokus o dekodovani QR z BGR snimku s nekolika predzpracovanimi.
+
+    ESP32-CAM casto posila snimky s nizkym kontrastem nebo sikmo natoceny
+    QR kod. Zkusime proto primy BGR preklad, grayscale + CLAHE a Otsu
+    prahovani, abychom detekci urychlili a zvysili uspesnost.
+    """
+    if frame is None:
+        return None
+
+    # 1) primy preklad z barevneho snimku
     codes = decode(frame)
-    if not codes:
-        return None
-    return codes[0].data.decode("utf-8")
+    if codes:
+        return codes[0].data.decode("utf-8")
+
+    # 2) grayscale + CLAHE (lokalni kontrast)
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    codes = decode(gray)
+    if codes:
+        return codes[0].data.decode("utf-8")
+
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+    codes = decode(enhanced)
+    if codes:
+        return codes[0].data.decode("utf-8")
+
+    # 3) Otsu prahovani jako posledni pokus
+    _, binary = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    codes = decode(binary)
+    if codes:
+        return codes[0].data.decode("utf-8")
+
+    return None
 
 
-# --- QR S OVERSAMPLINGEM ---------------------------------------------------
-def median_3d(points):
-    if not points:
-        return None
-    xs = [p[0] for p in points]
-    ys = [p[1] for p in points]
-    zs = [p[2] for p in points]
-    return (
-        sum(xs) / len(xs),
-        sum(ys) / len(ys),
-        sum(zs) / len(zs),
-    )
-
-
-def print_status(uwb_data, last_save, fps):
+# --- QR DETEKCE ------------------------------------------------------------
+def print_status(uwb_data, last_qr, fps):
     t_data = pick_tag_data(uwb_data)
     if t_data and t_data.get("pos"):
         x, y, z = normalize_pos(t_data["pos"])
@@ -234,10 +227,10 @@ def print_status(uwb_data, last_save, fps):
     else:
         pos_line = "UWB: ---"
 
-    if last_save:
-        qr, x, y, z, src, ts = last_save
+    if last_qr:
+        qr, ts = last_qr
         age_s = (int(time.time() * 1000) - ts) / 1000.0
-        save_line = f"| posledni: {qr} -> X={x:.2f} Y={y:.2f} Z={z:.2f} ({src}) pred {age_s:.1f}s"
+        save_line = f"| posledni: {qr} pred {age_s:.1f}s"
     else:
         save_line = "| cekam na QR..."
 
@@ -245,7 +238,6 @@ def print_status(uwb_data, last_save, fps):
 
 
 def qr_scan_thread():
-    init_csv_files()
     cooldown_until = 0
     frame_count = 0
     last_fps_time = time.time()
@@ -267,108 +259,64 @@ def qr_scan_thread():
             last_fps_time = time.time()
             with state.lock:
                 uwb = state.uwb_state
-                last_save = state.last_save_info
-            print_status(uwb, last_save, fps)
+                last_qr = state.last_qr_info
+            print_status(uwb, last_qr, fps)
 
         qr = decode_latest_qr(frame)
         if qr is None or now_ms < cooldown_until:
             continue
 
-        print(f"\n[QR] detekovan '{qr}', sbiram vzorky {SAMPLE_WINDOW_MS}ms...")
-        scan_id = now_ms
+        print(f"\n[QR] detekovan '{qr}', odesilam do PC ANL...")
+        winsound.Beep(1500, 150)
+        notify_pc_anl(qr)
+
+        # Pockame na vzorkovaci okno, aby se stejny QR nescanoval opakovane
+        # a uzivatel dostal zpetnou vazbu. Ulozeni resi PC ANL.
         window_end = now_ms + SAMPLE_WINDOW_MS
-
-        samples = []
-        qr_votes = defaultdict(int)
-        collected_positions = []
-
-        seen_rpt_keys = set()
-
         while int(time.time() * 1000) < window_end and state.running:
-            with state.lock:
-                f = state.frame
-                history = list(state.rpt_history)
-                uwb = state.uwb_state
+            time.sleep(0.05)
 
-            if f is not None:
-                q = decode_latest_qr(f)
-                if q:
-                    qr_votes[q] += 1
-
-            # Sbereme vsechny RPT pakety prijate behem okna.
-            for pkt in history:
-                if not (scan_id <= pkt["timestamp"] <= window_end):
-                    continue
-                key = (pkt["timestamp"], pkt["tag_id"], tuple(sorted(pkt["ranges"].items())))
-                if key in seen_rpt_keys:
-                    continue
-                seen_rpt_keys.add(key)
-
-                row_ranges = [pkt["ranges"].get(i, "") for i in range(ANCHOR_COUNT)]
-                rpt_age = int(time.time() * 1000) - pkt["timestamp"]
-                t_data = pick_tag_data(uwb)
-                if t_data and t_data.get("pos"):
-                    pos = normalize_pos(t_data["pos"])
-                    pos_source = "UWB"
-                    collected_positions.append(pos)
-                else:
-                    pos = None
-                    pos_source = "SIM"
-                samples.append({
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "tag_id": pkt["tag_id"],
-                    "ranges": row_ranges,
-                    "pos": pos,
-                    "pos_source": pos_source,
-                    "rpt_age_ms": rpt_age,
-                })
-
-            time.sleep(0.02)
-
-        if not qr_votes:
-            continue
-
-        winner = max(qr_votes, key=qr_votes.get)
-        if winner != qr:
-            print(f"[QR] zmena behem okna: '{qr}' -> '{winner}', ignoruji")
-            continue
-
-        if collected_positions:
-            x, y, z = median_3d(collected_positions)
-            source = "UWB"
-        else:
-            x = max(0.0, min(100.0, 50.0 + random.uniform(-5.0, 5.0)))
-            y = max(0.0, min(100.0, 50.0 + random.uniform(-5.0, 5.0)))
-            z = max(0.0, min(10.0, 5.0 + random.uniform(-1.0, 1.0)))
-            source = "SIM"
-
-        ts = datetime.now(timezone.utc).isoformat()
-
-        raw_rows = []
-        for s in samples:
-            pos = s["pos"] or (None, None, None)
-            raw_rows.append([
-                s["timestamp"], scan_id, winner, s["tag_id"],
-                *s["ranges"],
-                pos[0] if pos[0] is not None else "",
-                pos[1] if pos[1] is not None else "",
-                pos[2] if pos[2] is not None else "",
-                s["pos_source"], s["rpt_age_ms"]
-            ])
-        append_raw_rows(raw_rows)
-
-        append_computed_row([
-            ts, scan_id, winner, round(x, 2), round(y, 2), round(z, 2),
-            source, len(samples)
-        ])
-
-        print(f"[ULOZENO] QR={winner} X={x:.2f} Y={y:.2f} Z={z:.2f} ({source}) vzorku={len(samples)}")
+        winsound.Beep(700, 250)  # jiny ton = okno dokonceno
+        print(f"[QR] '{qr}' - vzorkovani dokonceno ({SAMPLE_WINDOW_MS}ms)")
 
         with state.lock:
-            state.last_save_info = (winner, x, y, z, source, int(time.time() * 1000))
+            state.last_qr_info = (qr, int(time.time() * 1000))
 
-        winsound.Beep(1500, 150)
         cooldown_until = int(time.time() * 1000) + SCAN_COOLDOWN_MS
+
+
+# --- KOMUNIKACE S PC ANL ---------------------------------------------------
+def notify_pc_anl(qr_code):
+    """Posli UDP udalost QR,<kod> do pc_anl.py (port 50002)."""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.sendto(f"QR,{qr_code}".encode("utf-8"), (QR_EVENT_HOST, QR_EVENT_PORT))
+        sock.close()
+    except Exception as e:
+        print(f"\n[QR] chyba notifikace PC ANL: {e}")
+
+
+def qr_heartbeat_thread():
+    """Pravidelne posila prazdnou QR udalost, pouze kdyz kamera nedavno poslala snimek."""
+    last_connected = None
+    while state.running:
+        now_ms = int(time.time() * 1000)
+        with state.lock:
+            last_frame = state.camera_last_frame_ms
+        connected = (last_frame > 0) and (now_ms - last_frame < CAMERA_TIMEOUT_MS)
+        with state.lock:
+            state.camera_connected = connected
+        if last_connected is None or connected != last_connected:
+            print(f"[KAMERA] stav: {'pripojena' if connected else 'ODPOJENA'}")
+            last_connected = connected
+        if connected:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.sendto(b"QR,", (QR_EVENT_HOST, QR_EVENT_PORT))
+                sock.close()
+            except Exception:
+                pass
+        time.sleep(5.0)
 
 
 # --- MAIN ------------------------------------------------------------------
@@ -377,7 +325,7 @@ def main():
     print(f"Kamera: {ESP32_CAM_URL}")
     print(f"UWB:    {PC_ANL_URL}")
     print(f"RPT:    UDP {RAW_RPT_PORT}")
-    print(f"Output: {OUTPUT_DIR}")
+    print("Data se ukladaji do session CSV pres PC ANL.")
     print("[Ctrl+C] - Ukoncit program\n")
 
     threads = [
@@ -385,6 +333,7 @@ def main():
         threading.Thread(target=rpt_listener_thread, daemon=True),
         threading.Thread(target=uwb_poller_thread, daemon=True),
         threading.Thread(target=qr_scan_thread, daemon=True),
+        threading.Thread(target=qr_heartbeat_thread, daemon=True),
     ]
     for t in threads:
         t.start()

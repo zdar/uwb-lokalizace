@@ -1,40 +1,16 @@
-# Dev notes: raw scans CSV is empty
+# Dev notes
 
-**Date:** 2026-06-28  
-**Branch:** `esp-cam`  
-**Status:** QR scan + computed CSV works; raw CSV only has header.
+## 2026-06-28 — raw scans CSV was empty
+**Status:** Fixed by architecture change (see below).  
+Old `data/scans/scans_raw_*.csv` and `data/scans/scans_computed_*.csv` were replaced by a single session CSV.
 
-## Problem
-`data/scans/scans_raw_YYYYMMDD.csv` is created with the correct header, but no data rows are appended. The `scans_computed_YYYYMMDD.csv` file does get rows.
+## 2026-07-19 — unified session CSV
+All data is now stored in `sessions/session_YYYYMMDD_HHMMSS.csv`:
+- One CSV per calibration/measurement session.
+- A new session starts automatically when auto-calibration or manual 3D calibration begins, or manually via the **New session** button.
+- Sections: SESSION, TRNY, ANCHORS_RESOLVED, ANCHORS_GLOBAL, TRANSFORM, ANCHOR_RAW, CAL3D_RAW, QR_RAW, QR_COMPUTED.
 
-## Likely root cause
-In `esp-cam/qr_scanner.py`, `qr_scan_thread()` collects raw RPT samples from `state.rpt_history` during the oversampling window. It should keep all unique packets received in the window.
-
-If the TAG sends RPT packets slower than the sample loop, or if the timing is unlucky, the `latest_rpt` seen during the window is either:
-- too old (`rpt_age >= 500 ms`), so it is skipped, or
-- the same packet sampled repeatedly.
-
-The `rpt_listener_thread` already populates `state.rpt_history` (a deque), but `qr_scan_thread` does not use it.
-
-## Suggested fix
-During the oversampling window, collect **all** RPT packets from `state.rpt_history` whose timestamp falls inside `[window_start, window_end]`.
-
-Current implementation already uses `state.rpt_history` with a unique key per packet. Window duration is controlled by `SAMPLE_WINDOW_MS`.
-
-## Other things to verify
-1. `pc_anl.py` is forwarding `RPT` packets to `127.0.0.1:50001`. Check `_forward_sock.sendto(...)` in `scripts/pc_anl.py`.
-2. `qr_scanner.py` successfully binds UDP port 50001. It prints `[RPT] nasloucham na portu 50001`.
-3. The TAG is actually sending `RPT` packets (check PC ANL live tag table).
-4. `CAPTURE_INTERVAL_S = 0.10` and `SCAN_COOLDOWN_MS = 3000` are tuned OK.
-
-## Files involved
-- `esp-cam/qr_scanner.py` — main fix here
-- `scripts/pc_anl.py` — RPT forwarder
-- `data/scans/scans_raw_*.csv` — output to verify
-
-## Small UI improvement (done 2026-06-28)
-Added fixed anchors count in `scripts/pc_anl.py` HTML:
-- `anchorCount` span showing `Object.keys(data.anchors).length`.
+`esp-cam/qr_scanner.py` no longer writes its own CSV files; it only detects QR codes and notifies `scripts/pc_anl.py`, which handles all storage.
 
 ## Future work (do not implement now, just planned)
 1. **Kalman filter** for UWB position smoothing.
