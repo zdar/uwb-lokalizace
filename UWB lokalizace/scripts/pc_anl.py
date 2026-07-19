@@ -260,7 +260,14 @@ def new_session(origin_id=None):
         session_csv.write_session_info(origin_id)
         session_csv.write_trny(trny)
         if anchors:
-            session_csv.append_anchors_resolved(datetime.now().isoformat(), anchors)
+            ts = datetime.now().isoformat()
+            session_csv.append_anchors_resolved(ts, anchors)
+            with transform_lock:
+                transform_active = transform["active"]
+                if transform_active:
+                    global_anchors = {aid: apply_transform(p) for aid, p in anchors.items()}
+            if transform_active:
+                session_csv.append_anchors_global(ts, global_anchors)
     log(f"[SESSION] New session started: {session_csv.filepath}")
     return session_csv
 
