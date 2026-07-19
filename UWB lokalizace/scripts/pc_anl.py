@@ -42,10 +42,43 @@ from positioning.position import (
 
 UDP_PORT = 50000
 RAW_RPT_FORWARD_PORT = 50001   # forward raw RPT packets for qr_scanner.py
+RAW_RPT_FORWARD_ADDR = ("127.0.0.1", RAW_RPT_FORWARD_PORT)
 QR_EVENT_PORT = 50002          # receive QR scan events from ESP32-CAM
 HEARTBEAT_TIMEOUT_MS = 15000
+
+_forward_sock = None
+
+
+def get_forward_sock():
+    """Lazy-create a UDP socket for forwarding raw RPT to the QR scanner."""
+    global _forward_sock
+    if _forward_sock is None:
+        try:
+            _forward_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        except Exception:
+            _forward_sock = None
+    return _forward_sock
+
+
+def forward_rpt_packet(tid, ranges):
+    """Forward a parsed RPT packet to the local QR scanner listener."""
+    if not ranges:
+        return
+    sock = get_forward_sock()
+    if sock is None:
+        return
+    payload = f"RPT,{tid}:" + ",".join(f"{aid}={dist}" for aid, dist in ranges.items())
+    try:
+        sock.sendto(payload.encode("utf-8"), RAW_RPT_FORWARD_ADDR)
+    except Exception:
+        pass
+QR_HEARTBEAT_TIMEOUT_MS = 10000
 CAL3D_COLLECT_MS = 15000
+# Musi odpovidat SAMPLE_WINDOW_MS v esp-cam/qr_scanner.py.
 QR_COLLECT_MS = 5000
+
+# Exponential moving average smoothing factor for UWB ranges (0 = no smoothing, 1 = instant).
+RANGE_SMOOTHING_ALPHA = 0.25
 
 # Auto-calibration (Mode A) timing.
 AUTO_CAL_ROLE_SWITCH_WAIT_S = 40   # time for the UWB module to reconfigure after ROLE change
@@ -77,6 +110,8 @@ auto_cal = {
     "origin_id": None,
     "fixed": {},              # id -> (x, y, z)
     "pending": [],            # list of ids still to calibrate
+    "blocked": [],            # ids temporarily skipped because they can't see a fixed anchor yet
+    "solved_this_pass": 0,    # how many anchors were solved since blocked list was last flushed
     "current_id": None,       # id currently acting as temporary tag
     "phase": "idle",          # idle, wait_tag, collecting, wait_anchor, wait_next, done, error
     "deadline_ms": 0,         # fallback safety timeout
@@ -112,6 +147,9 @@ transform_lock = threading.Lock()
 # File used to persist anchor coordinates between sessions.
 ANCHORS_FILE = os.path.join(PROJECT_ROOT, "anchors.json")
 
+# File used to persist UWB-to-global transform between sessions.
+TRANSFORM_FILE = os.path.join(PROJECT_ROOT, "transform.json")
+
 # Known reference points (trny) with global coordinates and QR codes.
 TRNY_FILE = os.path.join(PROJECT_ROOT, "trny.json")
 
@@ -146,9 +184,10 @@ class SessionCsvWriter:
         """Append multiple rows to a section, creating the header if needed."""
         if not rows:
             return
-        self._ensure_section(section, header)
-        with open(self.filepath, "a", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerows(rows)
+        with csv_lock:
+            self._ensure_section(section, header)
+            with open(self.filepath, "a", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerows(rows)
 
     def write_session_info(self, origin_id):
         self.append_rows("SESSION", ["key", "value"], [
@@ -193,9 +232,47 @@ class SessionCsvWriter:
         ], [[scan_id, timestamp, qr_code, point_id, x, y, z,
              tag_id, sample_count, cx, cy, cz, source, gx, gy, gz]])
 
+    def append_transform(self, timestamp, result):
+        self.append_rows("TRANSFORM", [
+            "timestamp", "scale", "theta_rad", "theta_deg",
+            "tx", "ty", "tz"
+        ], [[timestamp, result["scale"], result["theta"],
+             math.degrees(result["theta"]), result["tx"],
+             result["ty"], result["tz"]]])
+
+    def append_cal3d_raw(self, timestamp, point_idx, x, y, z, anchor_id, distance):
+        self.append_rows("CAL3D_RAW", [
+            "timestamp", "point_idx", "point_x", "point_y", "point_z",
+            "anchor_id", "range"
+        ], [[timestamp, point_idx, x, y, z, anchor_id, distance]])
+
 
 session_csv = None
+csv_lock = threading.Lock()   # protects all SessionCsvWriter file writes
 trny = {}  # id -> {"x", "y", "z", "qr"}
+
+
+def new_session(origin_id=None):
+    """Start a fresh session CSV. All subsequent data goes into it."""
+    global session_csv
+    with csv_lock:
+        session_csv = SessionCsvWriter()
+        session_csv.write_session_info(origin_id)
+        session_csv.write_trny(trny)
+        if anchors:
+            session_csv.append_anchors_resolved(datetime.now().isoformat(), anchors)
+    log(f"[SESSION] New session started: {session_csv.filepath}")
+    return session_csv
+
+
+def ensure_session():
+    """Return the current session CSV, creating one lazily if needed."""
+    global session_csv
+    if session_csv is None:
+        return new_session()
+    return session_csv
+qr_last_seen_ms = None        # last QR event timestamp from ESP32-CAM
+qr_detected_ms = None         # timestamp of the last actual QR code scan
 
 
 def load_trny():
@@ -241,18 +318,68 @@ def load_anchors():
         log(f"Failed to load anchors: {e}")
 
 
+def load_transform():
+    """Load a saved UWB-to-global transform from transform.json if it exists."""
+    if not os.path.exists(TRANSFORM_FILE):
+        return
+    try:
+        with open(TRANSFORM_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        with transform_lock:
+            transform["active"] = bool(data.get("active", False))
+            transform["scale"] = float(data.get("scale", 1.0))
+            transform["theta"] = float(data.get("theta", 0.0))
+            transform["cos"] = float(data.get("cos", 1.0))
+            transform["sin"] = float(data.get("sin", 0.0))
+            transform["tx"] = float(data.get("tx", 0.0))
+            transform["ty"] = float(data.get("ty", 0.0))
+            transform["tz"] = float(data.get("tz", 0.0))
+            transform["pairs"] = [
+                {"point_id": p["point_id"], "uwb": tuple(p["uwb"]), "global": tuple(p["global"])}
+                for p in data.get("pairs", [])
+            ]
+        log(f"Loaded transform from {TRANSFORM_FILE} (active={transform['active']})")
+    except Exception as e:
+        log(f"Failed to load transform: {e}")
+
+
+def save_transform():
+    """Save the current UWB-to-global transform to transform.json."""
+    try:
+        with transform_lock:
+            data = {
+                "active": transform["active"],
+                "scale": transform["scale"],
+                "theta": transform["theta"],
+                "cos": transform["cos"],
+                "sin": transform["sin"],
+                "tx": transform["tx"],
+                "ty": transform["ty"],
+                "tz": transform["tz"],
+                "pairs": [
+                    {"point_id": p["point_id"], "uwb": list(p["uwb"]), "global": list(p["global"])}
+                    for p in transform["pairs"]
+                ],
+            }
+        with open(TRANSFORM_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        log(f"Saved transform to {TRANSFORM_FILE}")
+    except Exception as e:
+        log(f"Failed to save transform: {e}")
+
+
 def save_anchors():
     """Save current anchor coordinates to anchors.json and the session CSV."""
     try:
         data = {str(aid): [float(p[0]), float(p[1]), float(p[2])] for aid, p in anchors.items()}
         with open(ANCHORS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
-        if session_csv:
-            session_csv.append_anchors_resolved(datetime.now().isoformat(), anchors)
-            if transform["active"]:
-                session_csv.append_anchors_global(datetime.now().isoformat(), {
-                    aid: apply_transform(p) for aid, p in anchors.items()
-                })
+        ensure_session()
+        session_csv.append_anchors_resolved(datetime.now().isoformat(), anchors)
+        if transform["active"]:
+            session_csv.append_anchors_global(datetime.now().isoformat(), {
+                aid: apply_transform(p) for aid, p in anchors.items()
+            })
         log(f"Saved {len(anchors)} anchor(s) to {ANCHORS_FILE}")
     except Exception as e:
         log(f"Failed to save anchors: {e}")
@@ -373,9 +500,11 @@ def start_qr_collection(qr_code):
         "samples": defaultdict(list),
         "packet_count": 0,
     }
+    global qr_detected_ms
     with qr_collect_lock:
         qr_active.append(collection)
-    log(f"[QR] Started collection for {qr_code} (point {point_id}, {QR_COLLECT_MS}ms)")
+    qr_detected_ms = time.time() * 1000
+    log(f"[QR] DETECTED {qr_code} — started collection for point {point_id} ({QR_COLLECT_MS}ms)")
     threading.Timer(QR_COLLECT_MS / 1000.0, lambda c=collection: finish_qr_collection(c)).start()
     return True
 
@@ -416,29 +545,41 @@ def finish_qr_collection(collection):
 
     if computed_xyz:
         # Store this scan as a mapping pair for real-world calibration.
+        # If the point was scanned before, replace the old pair instead of
+        # creating a duplicate.
         with transform_lock:
-            transform["pairs"].append({
-                "point_id": point_id,
-                "uwb": computed_xyz,
-                "global": point_xyz,
-            })
+            replaced = False
+            for pair in transform["pairs"]:
+                if pair["point_id"] == point_id:
+                    pair["uwb"] = computed_xyz
+                    pair["global"] = point_xyz
+                    replaced = True
+                    break
+            if not replaced:
+                transform["pairs"].append({
+                    "point_id": point_id,
+                    "uwb": computed_xyz,
+                    "global": point_xyz,
+                })
+            # A re-scan invalidates the previously computed transform.
+            transform["active"] = False
         if transform["active"]:
             global_xyz = apply_transform(computed_xyz)
     else:
         computed_xyz = (None, None, None)
 
     ts = datetime.now().isoformat()
-    if session_csv:
-        # Write every individual range sample to QR_RAW.
-        raw_rows = []
-        for aid, dists in samples.items():
-            for d in dists:
-                raw_rows.append([scan_id, ts, qr_code, tag_id, aid, d])
-        session_csv.append_rows("QR_RAW",
-            ["scan_id", "timestamp", "qr_code", "tag_id", "anchor_id", "range"], raw_rows)
-        session_csv.append_qr_computed(scan_id, ts, qr_code, point_id, point_xyz,
-                                       tag_id, sum(len(v) for v in samples.values()),
-                                       computed_xyz, source, global_xyz)
+    ensure_session()
+    # Write every individual range sample to QR_RAW.
+    raw_rows = []
+    for aid, dists in samples.items():
+        for d in dists:
+            raw_rows.append([scan_id, ts, qr_code, tag_id, aid, d])
+    session_csv.append_rows("QR_RAW",
+        ["scan_id", "timestamp", "qr_code", "tag_id", "anchor_id", "range"], raw_rows)
+    session_csv.append_qr_computed(scan_id, ts, qr_code, point_id, point_xyz,
+                                   tag_id, sum(len(v) for v in samples.values()),
+                                   computed_xyz, source, global_xyz)
 
     log(f"[QR] Saved {qr_code}: ranges={len(median_ranges)}, computed={computed_xyz}, global={global_xyz}")
 
@@ -648,22 +789,38 @@ def solve_sequential_anchor(ranges_to_fixed, fixed):
 # ---------------------------------------------------------------------------
 
 def handle_rpt(text):
+    if text.startswith("RPT,"):
+        text = text[4:]
     parsed = parse_at_range_line(text)
     if not parsed:
         return
     tid, ranges = parsed
     now = time.time() * 1000
+    forward_rpt_packet(tid, ranges)
     if tid not in tags:
-        tags[tid] = {"ranges": {}, "last_seen_ms": 0, "pos": None}
+        tags[tid] = {"ranges": {}, "last_seen_ms": 0, "pos": None, "range_ema": {}}
     tags[tid]["ranges"].update(ranges)
     tags[tid]["last_seen_ms"] = now
+
+    # Smooth incoming ranges with an exponential moving average to reduce noise.
+    ema = tags[tid]["range_ema"]
+    alpha = RANGE_SMOOTHING_ALPHA
+    for aid, dist in ranges.items():
+        if aid in ema:
+            ema[aid] = alpha * dist + (1 - alpha) * ema[aid]
+        else:
+            ema[aid] = dist
 
     # Add to active calibration window if any.
     if cal3d["active"] and cal3d["tag_id"] == tid:
         pt = cal3d["points"][cal3d["point_idx"]]
+        ts = datetime.now().isoformat()
         for aid, dist in ranges.items():
             if 0 <= aid <= 9:
                 pt["samples"].setdefault(aid, []).append(dist)
+                if session_csv:
+                    session_csv.append_cal3d_raw(
+                        ts, cal3d["point_idx"], pt["x"], pt["y"], pt["z"], aid, dist)
 
     # Add to automatic calibration samples when waiting for / collecting from a temporary tag.
     with auto_cal_lock:
@@ -694,14 +851,15 @@ def handle_rpt(text):
                         if 0 <= aid <= 9:
                             coll["samples"].setdefault(aid, []).append(dist)
 
-    # Solve position if enough anchors are known.
-    pos = solve_tag_position(tags[tid]["ranges"])
+    # Solve position from smoothed ranges for stability.
+    pos = solve_tag_position(ema)
     if pos:
         tags[tid]["pos"] = pos
 
 
 def qr_listener():
     """Listen for QR scan events from ESP32-CAM."""
+    global qr_last_seen_ms
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
@@ -722,9 +880,23 @@ def qr_listener():
 
         text = data.decode("utf-8", errors="ignore").strip()
         if text.startswith("QR,"):
+            qr_last_seen_ms = time.time() * 1000
             qr_code = text[3:].strip()
             if qr_code:
                 start_qr_collection(qr_code)
+
+
+def prune_registry_and_tags():
+    """Remove registry/tag entries that have not been seen recently."""
+    now = time.time() * 1000
+    stale_ips = [ip for ip, info in registry.items()
+                 if now - info.get("last_seen_ms", 0) > HEARTBEAT_TIMEOUT_MS]
+    for ip in stale_ips:
+        del registry[ip]
+    stale_tids = [tid for tid, t in tags.items()
+                  if now - t.get("last_seen_ms", 0) > HEARTBEAT_TIMEOUT_MS]
+    for tid in stale_tids:
+        del tags[tid]
 
 
 def udp_listener():
@@ -738,7 +910,14 @@ def udp_listener():
     sock.settimeout(1.0)
     log(f"Listening for UDP on port {UDP_PORT}")
 
+    last_prune_ms = time.time() * 1000
+
     while True:
+        now_ms = time.time() * 1000
+        if now_ms - last_prune_ms >= 5000:
+            prune_registry_and_tags()
+            last_prune_ms = now_ms
+
         try:
             data, addr = sock.recvfrom(1024)
         except socket.timeout:
@@ -768,7 +947,7 @@ def udp_listener():
                     "has_pos": False,
                 }
         elif text.startswith("RPT,"):
-            handle_rpt(text[4:])
+            handle_rpt(text)
 
 
 def discovery_task():
@@ -851,6 +1030,13 @@ def send_role_udp(ip, role):
         sock.close()
 
 
+def _clear_auto_cal_retry_keys():
+    """Remove per-anchor ROLE,1 retry timestamps left over from previous runs."""
+    for key in list(auto_cal.keys()):
+        if key.startswith("last_retry_"):
+            del auto_cal[key]
+
+
 def auto_cal_reset():
     """Clear auto-calibration state."""
     with auto_cal_lock:
@@ -858,6 +1044,8 @@ def auto_cal_reset():
         auto_cal["origin_id"] = None
         auto_cal["fixed"].clear()
         auto_cal["pending"].clear()
+        auto_cal["blocked"].clear()
+        auto_cal["solved_this_pass"] = 0
         auto_cal["current_id"] = None
         auto_cal["phase"] = "idle"
         auto_cal["deadline_ms"] = 0
@@ -867,6 +1055,7 @@ def auto_cal_reset():
         auto_cal["succeeded"].clear()
         auto_cal["failed"].clear()
         auto_cal["auto_retried"] = False
+        _clear_auto_cal_retry_keys()
 
 
 def auto_cal_loop():
@@ -906,6 +1095,30 @@ def auto_cal_loop():
                     auto_cal["deadline_ms"] = now_ms + 60000
                 continue
 
+            # First RPT received. Make sure this tag can see at least one
+            # already-fixed anchor; otherwise we can't solve it yet.
+            with auto_cal_lock:
+                samples = auto_cal["samples"]
+                fixed = dict(auto_cal["fixed"])
+                current_id = auto_cal["current_id"]
+
+            visible_fixed = [aid for aid in samples if aid in fixed]
+            if not visible_fixed:
+                log(f"[AUTO] Tag {current_id} cannot see any fixed anchor yet; blocking for later")
+                ip = get_node_ip_by_id(current_id)
+                if ip:
+                    send_role_udp(ip, 1)
+                    log(f"[AUTO] Sent ROLE,1 to blocked anchor {current_id}")
+                with auto_cal_lock:
+                    if current_id not in auto_cal["blocked"]:
+                        auto_cal["blocked"].append(current_id)
+                    auto_cal["message"] = f"Tag {current_id} blocked; no fixed anchor visible"
+                    auto_cal["phase"] = "wait_anchor"
+                    auto_cal["deadline_ms"] = now_ms + 60000
+                continue
+
+            log(f"[AUTO] Tag {current_id} sees fixed anchors {visible_fixed}; collecting")
+
             # First RPT already moved us to collecting in handle_rpt.
             continue
 
@@ -941,6 +1154,7 @@ def auto_cal_loop():
                 with auto_cal_lock:
                     auto_cal["fixed"][current_id] = pos
                     auto_cal["succeeded"].add(current_id)
+                    auto_cal["solved_this_pass"] += 1
                 save_anchors()
                 log(f"[AUTO] Anchor {current_id} fixed at ({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f})")
             else:
@@ -1002,6 +1216,28 @@ def auto_cal_loop():
 
         if phase == "wait_next":
             with auto_cal_lock:
+                # If pending is empty but blocked anchors remain, unblock them
+                # only if we made progress since the last unblock. Otherwise
+                # no anchor can see a fixed anchor and we must give up.
+                if not auto_cal["pending"] and auto_cal["blocked"]:
+                    if auto_cal["solved_this_pass"] > 0:
+                        solved = auto_cal["solved_this_pass"]
+                        pending_count = len(auto_cal["blocked"])
+                        auto_cal["pending"] = auto_cal["blocked"]
+                        auto_cal["blocked"] = []
+                        auto_cal["solved_this_pass"] = 0
+                        log(f"[AUTO] Unblocking {pending_count} anchor(s) after {solved} solve(s)")
+                    else:
+                        # No progress possible. Move blocked to failed and stop.
+                        blocked_ids = list(auto_cal["blocked"])
+                        auto_cal["failed"].update(blocked_ids)
+                        auto_cal["blocked"].clear()
+                        auto_cal["phase"] = "done"
+                        auto_cal["message"] = f"No progress possible; blocked: {sorted(blocked_ids)}"
+                        auto_cal["running"] = False
+                        log(f"[AUTO] No progress possible. Blocked: {sorted(blocked_ids)}")
+                        return
+
                 if auto_cal["pending"]:
                     next_id = auto_cal["pending"].pop(0)
                     auto_cal["current_id"] = next_id
@@ -1045,6 +1281,8 @@ HTML_PAGE = r"""
     <title>PC ANL - UWB Prototype</title>
     <style>
         body { font-family: sans-serif; max-width: 1100px; margin: 30px auto; padding: 0 20px; }
+        #globalWarningBox { position: fixed; top: 0; left: 0; width: 100%; padding: 14px; background: #c00; color: #fff; font-weight: bold; text-align: center; z-index: 2000; display: none; font-size: 16px; }
+        #globalWarningBox button { background: #fff; color: #c00; border: none; padding: 6px 12px; margin-left: 12px; cursor: pointer; font-weight: bold; border-radius: 4px; }
         h1, h2 { color: #333; }
         button { padding: 8px 16px; margin: 4px 4px 4px 0; font-size: 14px; cursor: pointer; }
         button:disabled { opacity: 0.5; cursor: not-allowed; }
@@ -1057,27 +1295,166 @@ HTML_PAGE = r"""
         #logBox { border: 1px solid #ccc; padding: 10px; height: 200px; overflow-y: auto; background: #f9f9f9; font-family: monospace; font-size: 12px; }
         .log-line { margin: 2px 0; }
         . stale { color: #888; }
-        #setupModal { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: #ffffff; display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 1000; text-align: center; }
-        #setupModal h1 { font-size: 32px; margin-bottom: 30px; }
-        #setupModal p { font-size: 20px; margin: 10px 0; max-width: 600px; }
-        #setupModal button { padding: 15px 40px; font-size: 18px; margin-top: 30px; }
+        .modal { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: #ffffff; display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 1000; text-align: center; }
+        .modal h1 { font-size: 32px; margin-bottom: 20px; }
+        .modal p { font-size: 20px; margin: 10px 0; max-width: 600px; }
+        .modal button { padding: 15px 40px; font-size: 18px; margin-top: 20px; }
+        #setupModal { display: flex; }
+        #startChoiceModal { display: none; }
+        #calModal { display: none; }
+        #tagSelectModal { display: none; }
+        #trnyModal { display: none; }
+        #measureModal { display: none; }
+        #calModal .timer { font-size: 48px; font-weight: bold; color: #333; margin: 20px 0; }
+        #calModal .status { font-size: 22px; color: #555; margin: 10px 0; }
+        #calModal .counts { font-size: 18px; margin: 15px 0; }
+        #calModal .counts span { margin: 0 12px; }
+        #calModal .success { color: green; font-weight: bold; }
+        #calModal .fail { color: red; font-weight: bold; }
+        #calModal .pending { color: #666; }
+        #calModal .blocked { color: orange; }
+        #calModal #calLogBox { border: 1px solid #ccc; padding: 10px; height: 200px; overflow-y: auto; background: #f9f9f9; font-family: monospace; font-size: 12px; text-align: left; width: 90%; max-width: 700px; margin: 20px auto; }
+        #calModal .result-actions { margin-top: 25px; }
+        #calModal .result-actions button { margin: 0 10px; }
         #mainContent { display: none; }
+        .dev-link { font-size: 14px; color: #666; margin-top: 30px; }
+        .nav-bar { margin-bottom: 15px; }
+        .nav-bar button { padding: 6px 12px; font-size: 13px; margin: 0 3px; }
+        #tagSelectList { max-height: 55vh; overflow-y: auto; margin: 15px 0; }
+        #tagSelectList table { font-size: 13px; }
+        #tagSelectList th, #tagSelectList td { padding: 5px 8px; }
+        #tagSelectList button { padding: 5px 10px; font-size: 12px; }
     </style>
 </head>
 <body>
-    <div id="setupModal">
+    <div id="globalWarningBox"></div>
+    <div id="setupModal" class="modal">
+        <div class="nav-bar">
+            <button onclick="showSetupModal()">Domů</button>
+            <button onclick="showCalModal()">Kalibrace</button>
+            <button onclick="showTrnyModal()">Trny</button>
+            <button onclick="showMeasureModal()">Měření</button>
+        </div>
         <h1>PC ANL - UWB Prototype</h1>
         <p><strong>Rozmísti krabičky.</strong></p>
-        <p>Klikni Pokračovat, až budou rozmístěny.</p>
-        <button onclick="startSetupFlow()">Pokračovat</button>
-        <p style="margin-top: 30px; font-size: 14px;">
-            <a href="#" onclick="skipSetupFlow(); return false;" style="color: #666;">Vývojářský režim – přeskočit kalibraci</a>
+        <p>Klikni Kalibrovat, až budou rozmístěny.</p>
+        <button onclick="startSetupFlow()">Kalibrovat</button>
+        <p class="dev-link">
+            <a href="#" onclick="enterDevMode(); return false;" style="color: #666;">Vývojářský režim</a>
+        </p>
+    </div>
+
+    <div id="startChoiceModal" class="modal">
+        <div class="nav-bar">
+            <button onclick="showSetupModal()">Domů</button>
+            <button onclick="showCalModal()">Kalibrace</button>
+            <button onclick="showTrnyModal()">Trny</button>
+            <button onclick="showMeasureModal()">Měření</button>
+        </div>
+        <h1>Uložená kalibrace nalezena</h1>
+        <p>Máš už uložené pozice kotviček.</p>
+        <p>Chceš pokračovat s nimi, nebo začít novou kalibraci?</p>
+        <div style="margin-top: 25px;">
+            <button onclick="startNewCalibration()" style="margin-bottom: 10px;">Nová kalibrace</button>
+        </div>
+        <div>
+            <button onclick="keepCalibration()" style="font-size: 14px; padding: 6px 12px;">Pokračovat k trnům</button>
+        </div>
+        <p class="dev-link">
+            <a href="#" onclick="enterDevMode(); return false;" style="color: #666;">Vývojářský režim</a>
+        </p>
+    </div>
+
+    <div id="calModal" class="modal">
+        <div class="nav-bar">
+            <button onclick="showSetupModal()">Domů</button>
+            <button onclick="showCalModal()">Kalibrace</button>
+            <button onclick="showTrnyModal()">Trny</button>
+            <button onclick="showMeasureModal()">Měření</button>
+        </div>
+        <h1>Kalibrace kotviček</h1>
+        <div id="calModalStatus" class="status">Příprava...</div>
+        <div id="calTimer" class="timer">00:00</div>
+        <div id="calCounts" class="counts"></div>
+        <div id="calCurrent"></div>
+        <div id="calLogBox"></div>
+        <div id="calCoordinates" style="margin-top:20px; font-size:16px;"></div>
+        <div id="calResultActions" class="result-actions" style="display:none;"></div>
+        <p class="dev-link">
+            <a href="#" onclick="enterDevMode(); return false;" style="color: #666;">Vývojářský režim</a>
+        </p>
+    </div>
+
+    <div id="tagSelectModal" class="modal">
+        <div class="nav-bar">
+            <button onclick="showSetupModal()">Domů</button>
+            <button onclick="showCalModal()">Kalibrace</button>
+            <button onclick="showTrnyModal()">Trny</button>
+            <button onclick="showMeasureModal()">Měření</button>
+        </div>
+        <h1>Výběr tagu</h1>
+        <div id="tagSelectStatus" class="status">Vyber modul, který bude sloužit jako tag při skenování QR kódů.</div>
+        <div id="tagSelectList" style="margin: 20px 0;"></div>
+        <div id="tagSelectActions" style="margin-top:25px;"></div>
+        <p class="dev-link">
+            <a href="#" onclick="enterDevMode(); return false;" style="color: #666;">Vývojářský režim</a>
+        </p>
+    </div>
+
+    <div id="trnyModal" class="modal">
+        <div class="nav-bar">
+            <button onclick="showSetupModal()">Domů</button>
+            <button onclick="showCalModal()">Kalibrace</button>
+            <button onclick="showTrnyModal()">Trny</button>
+            <button onclick="showMeasureModal()">Měření</button>
+        </div>
+        <h1>Kalibrace reálného světa</h1>
+        <div id="trnyConnectionStatus" class="status">Kontrola ESP32-CAM...</div>
+        <p>Naskenuj QR kódy na známých trnových bodech. Potřebuješ alespoň 3.</p>
+        <div id="trnyPoints"></div>
+        <div id="trnyTransformInfo" style="margin-top:20px; font-size:16px;"></div>
+        <div id="trnyActions" style="margin-top:25px;">
+            <button id="trnyComputeBtn" onclick="computeTransformFromUser()" disabled>Spočítat transformaci</button>
+            <button onclick="clearTransformFromUser()">Vymazat transformaci</button>
+            <button onclick="showStartChoiceModal()" style="margin-left: 10px;">Zpět</button>
+        </div>
+        <p class="dev-link">
+            <a href="#" onclick="enterDevMode(); return false;" style="color: #666;">Vývojářský režim</a>
+        </p>
+    </div>
+
+    <div id="measureModal" class="modal">
+        <div class="nav-bar">
+            <button onclick="showSetupModal()">Domů</button>
+            <button onclick="showCalModal()">Kalibrace</button>
+            <button onclick="showTrnyModal()">Trny</button>
+            <button onclick="showMeasureModal()">Měření</button>
+        </div>
+        <h1>Měření</h1>
+        <div id="measureCameraStatus" class="status">Kontrola ESP32-CAM...</div>
+        <div id="measureTransformInfo" style="margin: 15px 0; font-size: 16px;"></div>
+        <h2>Manuální spoušť QR</h2>
+        <div class="row">
+            QR kód:
+            <input type="text" id="manualQrInput" placeholder="např. TRN-A1" style="width:160px">
+            <button id="manualQrBtn" onclick="manualQrTrigger()">Manuální spušť</button>
+        </div>
+        <div id="manualQrStatus" style="margin-top:8px; font-weight:bold; color:#333; min-height:24px;"></div>
+        <h2>Pozice tagů</h2>
+        <div id="measureTagPositions"></div>
+        <p class="dev-link">
+            <a href="#" onclick="enterDevMode(); return false;" style="color: #666;">Vývojářský režim</a>
         </p>
     </div>
 
     <div id="mainContent">
     <h1>PC ANL (prototype over home WiFi)</h1>
     <p>PC IP: <strong>{{ pc_ip }}</strong> | UDP port: <strong>50000</strong></p>
+    <p>
+        <button onclick="toggleUserMode()" style="font-size:14px; padding:6px 12px;">Uživatelský režim</button>
+        <button onclick="startNewSession()" style="font-size:14px; padding:6px 12px; margin-left:8px;">New session</button>
+        <span id="sessionPath" style="margin-left:12px; color:#666; font-size:12px;"></span>
+    </p>
 
     <div class="section">
         <h2>1. Discover / control nodes</h2>
@@ -1151,48 +1528,407 @@ HTML_PAGE = r"""
     </div>
 
     <script>
-        let pollInterval = null;
+        let calTimerInterval = null;
+        let calStartTime = null;
+        let calDoneNotified = false;
+        let lastTrnyPairsJson = null;
+        let lastQrDetectedMs = null;
+        let discoveryPollActive = false;
+        const EXPECTED_NODE_COUNT = 10;
+        let silencedMissingIds = new Set();
+
+        function hideAllModals() {
+            document.getElementById('setupModal').style.display = 'none';
+            document.getElementById('startChoiceModal').style.display = 'none';
+            document.getElementById('calModal').style.display = 'none';
+            document.getElementById('tagSelectModal').style.display = 'none';
+            document.getElementById('trnyModal').style.display = 'none';
+            document.getElementById('measureModal').style.display = 'none';
+        }
+
+        function showSetupModal() {
+            hideAllModals();
+            document.getElementById('setupModal').style.display = 'flex';
+            document.getElementById('mainContent').style.display = 'none';
+        }
+
+        function showStartChoiceModal() {
+            hideAllModals();
+            document.getElementById('startChoiceModal').style.display = 'flex';
+            document.getElementById('mainContent').style.display = 'none';
+        }
+
+        function keepCalibration() {
+            showTrnyModal();
+        }
+
+        function startNewSession() {
+            fetch('/new_session', {method: 'POST'})
+                .then(r => r.json())
+                .then(data => {
+                    if (data.error) alert(data.error);
+                    else {
+                        document.getElementById('sessionPath').textContent = data.session;
+                        alert('New session started: ' + data.session);
+                    }
+                });
+        }
+
+        function startNewCalibration() {
+            fetch('/new_session', {method: 'POST'})
+                .then(() => fetch('/reset_anchors', {method: 'POST'}))
+                .then(() => fetch('/clear_transform', {method: 'POST'}))
+                .then(() => startSetupFlow());
+        }
+
+        function showCalModal() {
+            hideAllModals();
+            document.getElementById('calModal').style.display = 'flex';
+            document.getElementById('mainContent').style.display = 'none';
+        }
+
+        function hideCalModal() {
+            document.getElementById('calModal').style.display = 'none';
+        }
+
+        function showTagSelectModal() {
+            hideAllModals();
+            document.getElementById('tagSelectModal').style.display = 'flex';
+            document.getElementById('mainContent').style.display = 'none';
+            renderTagSelect();
+        }
+
+        function showTrnyModal() {
+            hideAllModals();
+            document.getElementById('trnyModal').style.display = 'flex';
+            document.getElementById('mainContent').style.display = 'none';
+            pollScanState();
+        }
+
+        let measurePollInterval = null;
+
+        function showMeasureModal() {
+            hideAllModals();
+            document.getElementById('measureModal').style.display = 'flex';
+            document.getElementById('mainContent').style.display = 'none';
+            pollMeasureState();
+        }
+
+        function stopPollMeasureState() {
+            if (measurePollInterval) {
+                clearInterval(measurePollInterval);
+                measurePollInterval = null;
+            }
+        }
+
+        function pollMeasureState() {
+            stopPollMeasureState();
+            renderMeasureState();
+            measurePollInterval = setInterval(renderMeasureState, 1000);
+        }
+
+        function manualQrTrigger() {
+            const input = document.getElementById('manualQrInput');
+            const btn = document.getElementById('manualQrBtn');
+            const status = document.getElementById('manualQrStatus');
+            const qr = input.value.trim();
+            if (!qr) return;
+
+            btn.disabled = true;
+            input.disabled = true;
+
+            // Start the backend collection immediately so it covers the countdown.
+            fetch('/manual_qr', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({qr: qr})
+            }).then(r => r.json()).then(data => {
+                if (data.error) {
+                    alert(data.error);
+                    status.textContent = '';
+                    btn.disabled = false;
+                    input.disabled = false;
+                    return;
+                }
+
+                // 5..1 countdown with beeps, matching the camera QR routine.
+                let count = 5;
+                status.textContent = `Scanning ${qr}: ${count}`;
+                playTone(880, 0.1);
+
+                const timer = setInterval(() => {
+                    count--;
+                    if (count > 0) {
+                        status.textContent = `Scanning ${qr}: ${count}`;
+                        playTone(880, 0.1);
+                    } else {
+                        clearInterval(timer);
+                        status.textContent = `Scanning ${qr}: done`;
+                        playScanSuccessSound();
+                        setTimeout(() => {
+                            status.textContent = '';
+                            btn.disabled = false;
+                            input.disabled = false;
+                            input.value = '';
+                        }, 1500);
+                    }
+                }, 1000);
+            }).catch(err => {
+                alert(err);
+                btn.disabled = false;
+                input.disabled = false;
+            });
+        }
+
+        function renderMeasureState() {
+            Promise.all([
+                fetch('/scan_state').then(r => r.json()),
+                fetch('/state').then(r => r.json())
+            ]).then(([scanData, stateData]) => {
+                const camEl = document.getElementById('measureCameraStatus');
+                if (scanData.qr_connected) {
+                    camEl.innerHTML = '<span style="color:green">ESP32-CAM připojena</span>';
+                } else {
+                    camEl.innerHTML = '<span style="color:red">ESP32-CAM není připojena</span> - zkontroluj napájení a síť';
+                }
+
+                const infoEl = document.getElementById('measureTransformInfo');
+                if (scanData.transform_active) {
+                    const t = scanData.transform;
+                    infoEl.innerHTML = `<p><strong>Transformace aktivní:</strong></p>` +
+                        `<p>Měřítko: ${t.scale.toFixed(4)}, Rotace: ${(t.theta * 180 / Math.PI).toFixed(2)}°, ` +
+                        `Offset: (${t.tx.toFixed(2)}, ${t.ty.toFixed(2)}, ${t.tz.toFixed(2)})</p>`;
+                } else {
+                    infoEl.innerHTML = '<p>Transformace není aktivní.</p>';
+                }
+
+                const div = document.getElementById('measureTagPositions');
+                const tags = stateData.tags || {};
+                const tagIds = Object.keys(tags).sort((a, b) => a - b);
+                if (tagIds.length === 0) {
+                    div.innerHTML = '<p>Žádný tag nevidím.</p>';
+                    return;
+                }
+                let html = '<table><tr><th>Tag ID</th><th>UWB X</th><th>UWB Y</th><th>UWB Z</th>';
+                if (scanData.transform_active) {
+                    html += '<th>Global X</th><th>Global Y</th><th>Global Z</th>';
+                }
+                html += '<th>Věk (s)</th></tr>';
+                for (const tid of tagIds) {
+                    const t = tags[tid];
+                    const pos = t.pos || [];
+                    const gpos = t.global_pos || [];
+                    const x = pos.length > 0 ? pos[0].toFixed(2) : '---';
+                    const y = pos.length > 1 ? pos[1].toFixed(2) : '---';
+                    const z = pos.length > 2 ? pos[2].toFixed(2) : '0.00';
+                    const gx = gpos.length > 0 ? gpos[0].toFixed(2) : '---';
+                    const gy = gpos.length > 1 ? gpos[1].toFixed(2) : '---';
+                    const gz = gpos.length > 2 ? gpos[2].toFixed(2) : '0.00';
+                    html += `<tr><td>${tid}</td><td>${x}</td><td>${y}</td><td>${z}</td>`;
+                    if (scanData.transform_active) {
+                        html += `<td>${gx}</td><td>${gy}</td><td>${gz}</td>`;
+                    }
+                    html += `<td>${(t.age_ms / 1000).toFixed(1)}</td></tr>`;
+                }
+                html += '</table>';
+                div.innerHTML = html;
+            });
+        }
+
+        function showMainContent() {
+            hideAllModals();
+            document.getElementById('mainContent').style.display = 'block';
+            refreshState();
+        }
+
+        function enterDevMode() {
+            discoveryPollActive = false;
+            showMainContent();
+        }
+
+        function toggleUserMode() {
+            Promise.all([
+                fetch('/auto_cal_status').then(r => r.json()),
+                fetch('/state').then(r => r.json())
+            ]).then(([calData, stateData]) => {
+                const hasCalState = calData.phase !== 'idle' || calData.running;
+                const hasAnchors = Object.keys(stateData.anchors).length > 0;
+                if (hasCalState) {
+                    showCalModal();
+                } else if (hasAnchors) {
+                    showStartChoiceModal();
+                } else {
+                    document.getElementById('setupModal').style.display = 'flex';
+                    document.getElementById('startChoiceModal').style.display = 'none';
+                    document.getElementById('calModal').style.display = 'none';
+                    document.getElementById('tagSelectModal').style.display = 'none';
+                    document.getElementById('trnyModal').style.display = 'none';
+                    document.getElementById('mainContent').style.display = 'none';
+                }
+            });
+        }
+
+        function startCalTimer() {
+            stopCalTimer();
+            calStartTime = Date.now();
+            updateCalTimer();
+            calTimerInterval = setInterval(updateCalTimer, 1000);
+        }
+
+        function stopCalTimer() {
+            if (calTimerInterval) {
+                clearInterval(calTimerInterval);
+                calTimerInterval = null;
+            }
+        }
+
+        function updateCalTimer() {
+            const elapsed = Math.floor((Date.now() - calStartTime) / 1000);
+            const m = Math.floor(elapsed / 60).toString().padStart(2, '0');
+            const s = (elapsed % 60).toString().padStart(2, '0');
+            document.getElementById('calTimer').textContent = `${m}:${s}`;
+        }
+
+        let audioCtx = null;
+
+        function getAudioContext() {
+            const AudioContext = window.AudioContext || window.webkitAudioContext;
+            if (!AudioContext) return null;
+            if (!audioCtx) {
+                audioCtx = new AudioContext();
+            }
+            if (audioCtx.state === 'suspended') {
+                audioCtx.resume().catch(() => {});
+            }
+            return audioCtx;
+        }
+
+        function playTone(freq, duration, type = 'sine') {
+            const ctx = getAudioContext();
+            if (!ctx) return;
+            try {
+                const osc = ctx.createOscillator();
+                const gain = ctx.createGain();
+                osc.type = type;
+                osc.frequency.value = freq;
+                osc.connect(gain);
+                gain.connect(ctx.destination);
+                osc.start();
+                gain.gain.setValueAtTime(0.1, ctx.currentTime);
+                gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + duration);
+                osc.stop(ctx.currentTime + duration);
+            } catch (e) {}
+        }
+
+        function playSuccessSound() {
+            playTone(880, 0.2);
+            setTimeout(() => playTone(1100, 0.3), 150);
+        }
+
+        function playFailureSound() {
+            playTone(220, 0.3, 'sawtooth');
+            setTimeout(() => playTone(196, 0.4, 'sawtooth'), 200);
+        }
+
+        function playAlarmBeep() {
+            const ctx = getAudioContext();
+            if (!ctx) return;
+            const now = ctx.currentTime;
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
+            osc.type = 'sine';
+            osc.frequency.value = 880;
+            osc.connect(gain);
+            gain.connect(ctx.destination);
+            osc.start(now);
+            gain.gain.setValueAtTime(0.05, now);
+            gain.gain.exponentialRampToValueAtTime(0.001, now + 0.3);
+            osc.stop(now + 0.3);
+        }
+
+        function playScanSuccessSound() {
+            playTone(880, 0.12, 'sine');
+            setTimeout(() => playTone(1175, 0.25, 'sine'), 120);
+        }
 
         function startSetupFlow() {
-            document.getElementById('setupModal').style.display = 'none';
-            document.getElementById('mainContent').style.display = 'block';
+            discoveryPollActive = false;
+            showCalModal();
+            document.getElementById('calModalStatus').textContent = 'Hledání kotviček...';
+            document.getElementById('calResultActions').style.display = 'none';
+            document.getElementById('calCoordinates').innerHTML = '';
+            document.getElementById('calLogBox').innerHTML = '';
+            calDoneNotified = false;
+            startCalTimer();
             fetch('/discover', {method: 'POST'})
                 .then(r => r.json())
-                .then(() => pollDiscoveryForAutoCal());
+                .then(() => {
+                    discoveryPollActive = true;
+                    pollDiscoveryForAutoCal();
+                });
         }
 
         function skipSetupFlow() {
-            document.getElementById('setupModal').style.display = 'none';
-            document.getElementById('mainContent').style.display = 'block';
+            enterDevMode();
         }
 
         function pollDiscoveryForAutoCal() {
+            if (!discoveryPollActive) return;
             fetch('/discovery_status')
                 .then(r => r.json())
                 .then(data => {
+                    if (!discoveryPollActive) return;
                     if (data.running) {
                         setTimeout(pollDiscoveryForAutoCal, 500);
                         return;
                     }
                     const anchors = data.nodes.filter(n => n.role === 1);
-                    if (anchors.length === 0) {
-                        alert('Nebyly nalezeny žádné kotvičky. Zkontroluj, že jsou krabičky zapnuté a na stejné síti.');
+                    const EXPECTED_ANCHORS = 10;
+                    const statusEl = document.getElementById('calModalStatus');
+                    const actionsEl = document.getElementById('calResultActions');
+                    if (anchors.length < EXPECTED_ANCHORS) {
+                        stopCalTimer();
+                        const missing = EXPECTED_ANCHORS - anchors.length;
+                        statusEl.textContent = `Připojeno ${anchors.length} z ${EXPECTED_ANCHORS} kotviček. Chybí ${missing}. Čekám na zbývající...`;
+                        actionsEl.innerHTML =
+                            '<button onclick="startSetupFlow()">Zkusit znovu</button>' +
+                            '<button onclick="enterDevMode()">Vývojářský režim</button>';
+                        actionsEl.style.display = 'block';
+                        playAlarmBeep();
+                        setTimeout(pollDiscoveryForAutoCal, 3000);
                         return;
                     }
-                    // Use the first discovered anchor as the calibration origin.
+                    stopCalTimer();
+                    statusEl.textContent = `Všechny ${EXPECTED_ANCHORS} kotvičky připojeny.`;
                     const originId = anchors[0].id;
-                    fetch('/auto_cal_start', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({origin_id: originId})
-                    }).then(r => r.json()).then(data => {
-                        if (data.error) {
-                            alert(data.error);
-                            return;
-                        }
-                        pollAutoCalStatus();
-                    });
+                    actionsEl.innerHTML =
+                        `<button onclick="startDiscoveredAutoCal(${originId})">Spustit kalibraci</button>` +
+                        '<button onclick="enterDevMode()">Vývojářský režim</button>';
+                    actionsEl.style.display = 'block';
                 });
+        }
+
+        function startDiscoveredAutoCal(originId) {
+            const statusEl = document.getElementById('calModalStatus');
+            const actionsEl = document.getElementById('calResultActions');
+            statusEl.textContent = 'Spouštím kalibraci...';
+            actionsEl.style.display = 'none';
+            startCalTimer();
+            fetch('/auto_cal_start', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({origin_id: originId})
+            }).then(r => r.json()).then(data => {
+                if (data.error) {
+                    stopCalTimer();
+                    statusEl.textContent = 'Chyba: ' + data.error;
+                    actionsEl.innerHTML =
+                        '<button onclick="startSetupFlow()">Zkusit znovu</button>';
+                    actionsEl.style.display = 'block';
+                    return;
+                }
+                pollAutoCalStatus();
+            });
         }
 
         function discover() {
@@ -1222,7 +1958,12 @@ HTML_PAGE = r"""
                 return;
             }
             nodes.sort((a, b) => a.id - b.id);
-            let html = `<p>Connected: <strong>${nodes.length}</strong></p>`;
+            const missingCount = Math.max(0, EXPECTED_NODE_COUNT - nodes.length);
+            let html = `<p>Connected: <strong>${nodes.length}</strong>`;
+            if (missingCount > 0) {
+                html += ` <span style="color:#c00;">(chybí ${missingCount} z ${EXPECTED_NODE_COUNT})</span>`;
+            }
+            html += '</p>';
             html += '<table><tr><th>ID</th><th>IP</th><th>Role</th><th>Age (s)</th><th>Action</th></tr>';
             for (const n of nodes) {
                 const target = n.role === 1 ? 'TAG' : 'ANCHOR';
@@ -1338,12 +2079,26 @@ HTML_PAGE = r"""
         function startAutoCal() {
             const origin = document.getElementById('autoCalOrigin').value;
             document.getElementById('autoCalStartBtn').disabled = true;
+            showCalModal();
+            document.getElementById('calModalStatus').textContent = 'Spouštím kalibraci...';
+            document.getElementById('calResultActions').style.display = 'none';
+            document.getElementById('calCoordinates').innerHTML = '';
+            document.getElementById('calLogBox').innerHTML = '';
+            calDoneNotified = false;
+            startCalTimer();
             fetch('/auto_cal_start', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({origin_id: origin})
             }).then(r => r.json()).then(data => {
-                if (data.error) alert(data.error);
+                if (data.error) {
+                    stopCalTimer();
+                    document.getElementById('calModalStatus').textContent = 'Chyba: ' + data.error;
+                    document.getElementById('calResultActions').innerHTML =
+                        '<button onclick="enterDevMode()">Vývojářský režim</button>';
+                    document.getElementById('calResultActions').style.display = 'block';
+                    return;
+                }
                 pollAutoCalStatus();
             });
         }
@@ -1354,66 +2109,129 @@ HTML_PAGE = r"""
                 .then(data => { pollAutoCalStatus(); });
         }
 
-        function pollAutoCalStatus() {
-            fetch('/auto_cal_status')
-                .then(r => r.json())
-                .then(data => {
-                    const div = document.getElementById('autoCalStatus');
-                    let html = `<p><strong>Status:</strong> ${data.phase}</p>`;
-                    if (data.message) {
-                        html += `<p>${data.message}</p>`;
-                    }
-                    if (data.current_id !== null) {
-                        html += `<p>Current tag: ${data.current_id}</p>`;
-                        html += `<p>Packets: ${data.packet_count} / ${data.packets_needed}</p>`;
-                    }
-                    html += '<p><strong>Fixed anchors:</strong></p><ul>';
-                    for (const [id, p] of Object.entries(data.fixed)) {
-                        html += `<li>${id}: (${p[0].toFixed(2)}, ${p[1].toFixed(2)}, ${p[2].toFixed(2)})</li>`;
-                    }
-                    html += '</ul>';
-                    if (data.pending && data.pending.length > 0) {
-                        html += `<p><strong>Pending:</strong> ${data.pending.join(', ')}</p>`;
-                    }
-                    if (data.succeeded && data.succeeded.length > 0) {
-                        html += `<p style="color:green"><strong>Successfully calibrated:</strong> ${data.succeeded.join(', ')}</p>`;
-                    }
-                    if (data.failed && data.failed.length > 0) {
-                        html += `<p style="color:red"><strong>Failed:</strong> ${data.failed.join(', ')}</p>`;
-                    }
+        function renderCalStatus(data, logLines) {
+            const statusEl = document.getElementById('calModalStatus');
+            const countsEl = document.getElementById('calCounts');
+            const currentEl = document.getElementById('calCurrent');
+            const logBox = document.getElementById('calLogBox');
+            const resultActions = document.getElementById('calResultActions');
+            const finished = !data.running;
 
-                    const done = !data.running && data.phase === 'done';
-                    const hasFailed = data.failed && data.failed.length > 0;
+            if (data.message) {
+                statusEl.textContent = data.message;
+            }
 
-                    if (done && hasFailed) {
-                        html += `<div style="margin-top:15px">`;
-                        html += `<button onclick="retryFailedAutoCal()" style="margin-right:10px">Kalibrovat neúspěšné kotvičky</button>`;
-                        html += `<button onclick="startFullAutoCal()">Nová plná kalibrace</button>`;
-                        html += `</div>`;
+            const successCount = (data.succeeded || []).length + (data.origin_id !== null ? 1 : 0);
+            countsEl.innerHTML =
+                `<span class="success">✓ ${successCount}</span>` +
+                `<span class="fail">✗ ${(data.failed || []).length}</span>` +
+                `<span class="pending">⏳ ${(data.pending || []).length}</span>` +
+                `<span class="blocked">⊘ ${(data.blocked || []).length}</span>`;
 
-                        // One automatic retry on the first unsuccessful run.
-                        if (!data.auto_retried) {
-                            html += `<p style="color:orange">Některé kotvičky se nepodařilo vykalibrovat. Zkouším to znovu automaticky...</p>`;
-                            div.innerHTML = html;
-                            retryFailedAutoCal();
-                            refreshState();
-                            return;
-                        }
-                    }
-                    div.innerHTML = html;
+            if (data.current_id !== null) {
+                currentEl.innerHTML = `<p>Kotvička ${data.current_id}: ${data.packet_count} / ${data.packets_needed} paketů</p>`;
+            } else {
+                currentEl.innerHTML = '';
+            }
 
-                    if (data.running) {
-                        setTimeout(pollAutoCalStatus, 1000);
-                    } else {
-                        document.getElementById('autoCalStartBtn').disabled = false;
-                    }
-                    refreshState();
-                });
+            // Update log box.
+            const cur = logBox.children.length;
+            for (let i = cur; i < logLines.length; i++) {
+                const div = document.createElement('div');
+                div.className = 'log-line';
+                div.textContent = logLines[i];
+                logBox.appendChild(div);
+                logBox.scrollTop = logBox.scrollHeight;
+            }
+
+            if (finished && !calDoneNotified) {
+                calDoneNotified = true;
+                stopCalTimer();
+                const failed = data.failed || [];
+                const succeeded = data.succeeded || [];
+                let resultHtml = '';
+
+                if (data.phase === 'idle') {
+                    statusEl.textContent = 'Kalibrace zastavena uživatelem.';
+                } else if (failed.length === 0) {
+                    statusEl.textContent = 'Kalibrace dokončena úspěšně.';
+                    playSuccessSound();
+                } else if (failed.length <= 2) {
+                    statusEl.textContent = `Kalibrace dokončena. ${failed.length} kotvička selhala.`;
+                    playFailureSound();
+                } else {
+                    statusEl.textContent = `Kalibrace selhala. ${failed.length} kotviček se nepodařilo vykalibrovat.`;
+                    playFailureSound();
+                }
+
+                if (succeeded.length > 0) {
+                    resultHtml += `<button onclick="continueToTrny()" style="margin-right:10px">Pokračovat k trnám</button>`;
+                }
+                if (failed.length > 0 && failed.length <= 2) {
+                    resultHtml += `<button onclick="retryFailedFromCal()" style="margin-right:10px">Zkusit znovu selhané</button>`;
+                }
+                if (failed.length > 0) {
+                    resultHtml += `<button onclick="startFullAutoCalFromCal()">Nová plná kalibrace</button>`;
+                }
+                resultActions.innerHTML = resultHtml;
+                resultActions.style.display = 'block';
+
+                // Solved coordinates are intentionally not shown in the user-mode modal.
+                document.getElementById('calCoordinates').innerHTML = '';
+            }
+
+            // Keep the developer-mode panel up to date too.
+            const devDiv = document.getElementById('autoCalStatus');
+            if (devDiv) {
+                let devHtml = `<p><strong>Status:</strong> ${data.phase}</p>`;
+                if (data.message) devHtml += `<p>${data.message}</p>`;
+                if (data.current_id !== null) {
+                    devHtml += `<p>Current tag: ${data.current_id}</p>`;
+                    devHtml += `<p>Packets: ${data.packet_count} / ${data.packets_needed}</p>`;
+                }
+                devHtml += '<p><strong>Fixed anchors:</strong></p><ul>';
+                for (const [id, p] of Object.entries(data.fixed)) {
+                    devHtml += `<li>${id}: (${p[0].toFixed(2)}, ${p[1].toFixed(2)}, ${p[2].toFixed(2)})</li>`;
+                }
+                devHtml += '</ul>';
+                if (data.pending && data.pending.length > 0) {
+                    devHtml += `<p><strong>Pending:</strong> ${data.pending.join(', ')}</p>`;
+                }
+                if (data.blocked && data.blocked.length > 0) {
+                    devHtml += `<p style="color:orange"><strong>Blocked (will retry):</strong> ${data.blocked.join(', ')}</p>`;
+                }
+                if (data.succeeded && data.succeeded.length > 0) {
+                    devHtml += `<p style="color:green"><strong>Successfully calibrated:</strong> ${data.succeeded.join(', ')}</p>`;
+                }
+                if (data.failed && data.failed.length > 0) {
+                    devHtml += `<p style="color:red"><strong>Failed:</strong> ${data.failed.join(', ')}</p>`;
+                }
+                devDiv.innerHTML = devHtml;
+            }
         }
 
-        function retryFailedAutoCal() {
-            const div = document.getElementById('autoCalStatus');
-            div.innerHTML = '<p>Opakuji kalibraci neúspěšných kotviček...</p>';
+        function pollAutoCalStatus() {
+            Promise.all([
+                fetch('/auto_cal_status').then(r => r.json()),
+                fetch('/state').then(r => r.json())
+            ]).then(([data, stateData]) => {
+                renderCalStatus(data, stateData.log || []);
+                if (data.running) {
+                    setTimeout(pollAutoCalStatus, 1000);
+                } else {
+                    document.getElementById('autoCalStartBtn').disabled = false;
+                }
+                refreshState();
+            });
+        }
+
+        function retryFailedFromCal() {
+            document.getElementById('calResultActions').style.display = 'none';
+            document.getElementById('calCoordinates').innerHTML = '';
+            document.getElementById('calModalStatus').textContent = 'Opakuji kalibraci neúspěšných kotviček...';
+            document.getElementById('calLogBox').innerHTML = '';
+            calDoneNotified = false;
+            startCalTimer();
             fetch('/auto_cal_retry_failed', {method: 'POST'})
                 .then(r => r.json())
                 .then(data => {
@@ -1425,15 +2243,201 @@ HTML_PAGE = r"""
                 });
         }
 
-        function startFullAutoCal() {
+        function startFullAutoCalFromCal() {
             if (!confirm('Toto smaže všechny uložené pozice kotviček a spustí úplně novou kalibraci. Pokračovat?')) return;
-            const div = document.getElementById('autoCalStatus');
-            div.innerHTML = '<p>Mažu uložené pozice a vyhledávám kotvičky pro novou kalibraci...</p>';
+            document.getElementById('calResultActions').style.display = 'none';
+            document.getElementById('calCoordinates').innerHTML = '';
+            document.getElementById('calModalStatus').textContent = 'Mažu uložené pozice a vyhledávám kotvičky...';
+            document.getElementById('calLogBox').innerHTML = '';
+            calDoneNotified = false;
+            startCalTimer();
             fetch('/reset_anchors', {method: 'POST'})
                 .then(r => r.json())
                 .then(() => fetch('/discover', {method: 'POST'}))
                 .then(r => r.json())
                 .then(() => pollDiscoveryForFullAutoCal());
+        }
+
+        function continueToTrny() {
+            showTagSelectModal();
+        }
+
+        let selectedQrTagId = null;
+
+        function renderTagSelect() {
+            fetch('/discovery_status')
+                .then(r => r.json())
+                .then(data => {
+                    const list = document.getElementById('tagSelectList');
+                    const actions = document.getElementById('tagSelectActions');
+                    const status = document.getElementById('tagSelectStatus');
+                    if (data.nodes.length === 0) {
+                        status.textContent = 'Žádné moduly nebyly nalezeny. Zkontroluj připojení.';
+                        list.innerHTML = '';
+                        actions.innerHTML = '<button onclick="renderTagSelect()">Zkusit znovu</button>';
+                        return;
+                    }
+                    status.textContent = 'Vyber modul, který bude sloužit jako tag při skenování QR kódů.';
+                    const nodes = [...data.nodes].sort((a, b) => a.id - b.id);
+                    let html = '<table><tr><th>ID</th><th>IP</th><th>Role</th><th>Akce</th></tr>';
+                    for (const n of nodes) {
+                        const isTag = n.role === 0;
+                        const selected = selectedQrTagId === n.id;
+                        const btnText = selected ? 'Vybráno' : 'Vybrat';
+                        const btn = `<button onclick="selectQrTag(${n.id}, ${n.role}, '${n.ip}')" ${selected ? 'disabled' : ''}>${btnText}</button>`;
+                        html += `<tr style="${selected ? 'background:#e6f7e6;' : ''}">
+                            <td>${n.id}</td>
+                            <td>${n.ip}</td>
+                            <td>${isTag ? 'TAG' : 'ANCHOR'}</td>
+                            <td>${btn}</td>
+                        </tr>`;
+                    }
+                    html += '</table>';
+                    list.innerHTML = html;
+                    if (selectedQrTagId !== null) {
+                        actions.innerHTML = `<button onclick="confirmTagAndGoToTrny()" style="margin-right:10px">Pokračovat k trnám</button>`;
+                    } else {
+                        actions.innerHTML = '';
+                    }
+                });
+        }
+
+        function selectQrTag(id, role, ip) {
+            selectedQrTagId = id;
+            if (role === 1) {
+                // Switch selected anchor to TAG.
+                const status = document.getElementById('tagSelectStatus');
+                status.textContent = `Přepínám kotvičku ${id} na TAG...`;
+                fetch('/switch_role', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ip: ip, role: '0', id: id})
+                }).then(r => r.json()).then(data => {
+                    if (data.error) {
+                        alert(data.error);
+                        selectedQrTagId = null;
+                        renderTagSelect();
+                        return;
+                    }
+                    waitForTagRole(id);
+                });
+            } else {
+                renderTagSelect();
+            }
+        }
+
+        function waitForTagRole(tagId) {
+            const status = document.getElementById('tagSelectStatus');
+            status.textContent = `Čekám, až se modul ${tagId} přepne do role TAG...`;
+            function check() {
+                fetch('/discovery_status')
+                    .then(r => r.json())
+                    .then(data => {
+                        const node = data.nodes.find(n => n.id === tagId);
+                        if (node && node.role === 0) {
+                            renderTagSelect();
+                        } else if (!data.running) {
+                            setTimeout(check, 500);
+                        } else {
+                            setTimeout(check, 500);
+                        }
+                    });
+            }
+            check();
+        }
+
+        function confirmTagAndGoToTrny() {
+            if (selectedQrTagId === null) return;
+            showTrnyModal();
+        }
+
+        let trnyPollInterval = null;
+
+        function pollScanState() {
+            if (trnyPollInterval) clearInterval(trnyPollInterval);
+            renderScanState();
+            trnyPollInterval = setInterval(renderScanState, 1000);
+        }
+
+        function stopPollScanState() {
+            if (trnyPollInterval) {
+                clearInterval(trnyPollInterval);
+                trnyPollInterval = null;
+            }
+        }
+
+        function renderScanState() {
+            fetch('/scan_state')
+                .then(r => r.json())
+                .then(data => {
+                    const connEl = document.getElementById('trnyConnectionStatus');
+                    const pointsEl = document.getElementById('trnyPoints');
+                    const infoEl = document.getElementById('trnyTransformInfo');
+                    const computeBtn = document.getElementById('trnyComputeBtn');
+
+                    if (data.qr_connected) {
+                        connEl.innerHTML = '<span style="color:green">ESP32-CAM připojena</span>';
+                    } else {
+                        connEl.innerHTML = '<span style="color:red">ESP32-CAM není připojena</span> - zkontroluj napájení a síť';
+                    }
+
+                    const scannedIds = new Set(data.pairs.map(p => p.point_id));
+                    let html = '<table><tr><th>Bod</th><th>QR</th><th>Global X</th><th>Global Y</th><th>Global Z</th><th>Stav</th></tr>';
+                    for (const [pid, p] of Object.entries(data.trny)) {
+                        const scanned = scannedIds.has(pid);
+                        html += `<tr style="${scanned ? 'background:#e6f7e6;' : ''}">
+                            <td>${pid}</td>
+                            <td>${p.qr}</td>
+                            <td>${p.x}</td>
+                            <td>${p.y}</td>
+                            <td>${p.z}</td>
+                            <td>${scanned ? '✓ naskenováno' : '⏳ čeká'}</td>
+                        </tr>`;
+                    }
+                    html += '</table>';
+                    pointsEl.innerHTML = html;
+
+                    computeBtn.disabled = data.pairs.length < 3;
+
+                    if (data.qr_detected_ms !== null) {
+                        if (lastQrDetectedMs !== null && data.qr_detected_ms !== lastQrDetectedMs) {
+                            playScanSuccessSound();
+                        }
+                        lastQrDetectedMs = data.qr_detected_ms;
+                    }
+
+                    const totalTrny = Object.keys(data.trny).length;
+                    if (data.transform_active) {
+                        const t = data.transform;
+                        infoEl.innerHTML = `<p><strong>Transformace aktivní:</strong></p>` +
+                            `<p>Měřítko: ${t.scale.toFixed(4)}, Rotace: ${(t.theta * 180 / Math.PI).toFixed(2)}°, ` +
+                            `Offset: (${t.tx.toFixed(2)}, ${t.ty.toFixed(2)}, ${t.tz.toFixed(2)})</p>` +
+                            `<p style="margin-top:15px;"><button onclick="showMeasureModal()">Pokračovat k měření</button></p>`;
+                    } else {
+                        infoEl.innerHTML = `<p>Naskenováno ${data.pairs.length} / ${totalTrny} bodů.</p>`;
+                    }
+                });
+        }
+
+        function computeTransformFromUser() {
+            fetch('/compute_transform', {method: 'POST'})
+                .then(r => r.json())
+                .then(data => {
+                    if (data.error) {
+                        alert(data.error);
+                        return;
+                    }
+                    renderScanState();
+                });
+        }
+
+        function clearTransformFromUser() {
+            if (!confirm('Vymazat transformaci a všechny naskenované trny?')) return;
+            fetch('/clear_transform', {method: 'POST'})
+                .then(r => r.json())
+                .then(data => {
+                    renderScanState();
+                });
         }
 
         function pollDiscoveryForFullAutoCal() {
@@ -1446,7 +2450,11 @@ HTML_PAGE = r"""
                     }
                     const anchors = data.nodes.filter(n => n.role === 1);
                     if (anchors.length === 0) {
-                        alert('Nebyly nalezeny žádné kotvičky. Zkontroluj, že jsou krabičky zapnuté a na stejné síti.');
+                        stopCalTimer();
+                        document.getElementById('calModalStatus').textContent = 'Nebyly nalezeny žádné kotvičky.';
+                        document.getElementById('calResultActions').innerHTML =
+                            '<button onclick="startSetupFlow()">Zkusit znovu</button>';
+                        document.getElementById('calResultActions').style.display = 'block';
                         return;
                     }
                     const originId = anchors[0].id;
@@ -1456,7 +2464,11 @@ HTML_PAGE = r"""
                         body: JSON.stringify({origin_id: originId})
                     }).then(r => r.json()).then(data => {
                         if (data.error) {
-                            alert(data.error);
+                            stopCalTimer();
+                            document.getElementById('calModalStatus').textContent = 'Chyba: ' + data.error;
+                            document.getElementById('calResultActions').innerHTML =
+                                '<button onclick="startSetupFlow()">Zkusit znovu</button>';
+                            document.getElementById('calResultActions').style.display = 'block';
                             return;
                         }
                         pollAutoCalStatus();
@@ -1464,10 +2476,115 @@ HTML_PAGE = r"""
                 });
         }
 
+        function setDiff(a, b) {
+            return new Set([...a].filter(x => !b.has(x)));
+        }
+
+        const EXPECTED_NODE_IDS = new Set([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        let disconnectedAtMs = {};
+        let disconnectAlarmInterval = null;
+        let currentConnectedIds = new Set();
+
+        function formatDuration(ms) {
+            const totalSeconds = Math.floor(ms / 1000);
+            const m = Math.floor(totalSeconds / 60);
+            const s = totalSeconds % 60;
+            if (m > 0) return `${m}m ${s}s`;
+            return `${s}s`;
+        }
+
+        function startDisconnectAlarm() {
+            stopDisconnectAlarm();
+            disconnectAlarmInterval = setInterval(() => {
+                const missingIds = setDiff(EXPECTED_NODE_IDS, currentConnectedIds);
+                const newMissing = setDiff(missingIds, silencedMissingIds);
+                if (newMissing.size > 0) {
+                    playAlarmBeep();
+                }
+            }, 8000);
+        }
+
+        function stopDisconnectAlarm() {
+            if (disconnectAlarmInterval) {
+                clearInterval(disconnectAlarmInterval);
+                disconnectAlarmInterval = null;
+            }
+        }
+
+        function renderDisconnectWarning(currentIds) {
+            const box = document.getElementById('globalWarningBox');
+            const missingIds = setDiff(EXPECTED_NODE_IDS, currentIds);
+            const now = Date.now();
+
+            // Track when each module went missing.
+            for (const id of missingIds) {
+                if (!disconnectedAtMs[id]) disconnectedAtMs[id] = now;
+            }
+            for (const id of Object.keys(disconnectedAtMs)) {
+                if (!missingIds.has(Number(id))) delete disconnectedAtMs[id];
+            }
+
+            // A module that reconnected loses its silence.
+            silencedMissingIds = new Set([...silencedMissingIds].filter(id => missingIds.has(id)));
+            const newMissingIds = setDiff(missingIds, silencedMissingIds);
+
+            if (missingIds.size === 0) {
+                box.style.display = 'none';
+                box.innerHTML = '';
+                stopDisconnectAlarm();
+                return newMissingIds;
+            }
+
+            const ids = [...missingIds].sort((a, b) => a - b);
+            const info = ids.map(id => {
+                const dur = formatDuration(now - (disconnectedAtMs[id] || now));
+                return `ID ${id} (${dur})`;
+            }).join(', ');
+
+            if (newMissingIds.size === 0) {
+                // All current disconnections are acknowledged: keep banner, no sound.
+                box.style.background = '#c60';
+                box.innerHTML = `⚠ Disconnected (silenced): ${info} ` +
+                    `<button onclick="silenceDisconnectWarning()">Silence / Acknowledge</button>`;
+                box.style.display = 'block';
+                stopDisconnectAlarm();
+                return newMissingIds;
+            }
+
+            box.style.background = '#c00';
+            box.innerHTML = `⚠ MODULE DISCONNECTED: ${info} ` +
+                `<button onclick="silenceDisconnectWarning()">Silence / Acknowledge</button>`;
+            box.style.display = 'block';
+            startDisconnectAlarm();
+            return newMissingIds;
+        }
+
+        function silenceDisconnectWarning() {
+            const missingIds = setDiff(EXPECTED_NODE_IDS, currentConnectedIds);
+            silencedMissingIds = new Set(missingIds);
+            renderDisconnectWarning(currentConnectedIds);
+        }
+
+        function checkNodeDisconnections(nodes) {
+            const currentIds = new Set(nodes.map(n => n.id));
+            currentConnectedIds = currentIds;
+            const newMissingIds = renderDisconnectWarning(currentIds);
+
+            // Alarm immediately on any non-silenced missing module, including at startup.
+            if (newMissingIds.size > 0) {
+                playAlarmBeep();
+            }
+        }
+
         function refreshState() {
             fetch('/state')
                 .then(r => r.json())
                 .then(data => {
+                    const spEl = document.getElementById('sessionPath');
+                    if (spEl && data.session_path) {
+                        spEl.textContent = data.session_path;
+                    }
+                    checkNodeDisconnections(data.nodes);
                     renderNodes(data.nodes);
                     const anchorIds = Object.keys(data.anchors);
                     document.getElementById('anchorCount').textContent = anchorIds.length;
@@ -1574,6 +2691,13 @@ HTML_PAGE = r"""
         }
 
         setInterval(refreshState, 1000);
+
+        // If anchors are already loaded, ask whether to keep the calibration or start fresh.
+        fetch('/state').then(r => r.json()).then(data => {
+            if (Object.keys(data.anchors).length > 0) {
+                showStartChoiceModal();
+            }
+        });
     </script>
 </body>
 </html>
@@ -1583,6 +2707,20 @@ HTML_PAGE = r"""
 @app.route("/")
 def index():
     return render_template_string(HTML_PAGE, pc_ip=get_pc_ip())
+
+
+@app.route("/new_session", methods=["POST"])
+def new_session_route():
+    """Explicitly start a new session CSV (e.g. before manual calibration)."""
+    data = request.get_json(silent=True) or {}
+    origin_id = data.get("origin_id")
+    if origin_id is not None:
+        try:
+            origin_id = int(origin_id)
+        except Exception:
+            return jsonify({"error": "Bad origin_id"}), 400
+    new_session(origin_id)
+    return jsonify({"ok": True, "session": session_csv.filepath})
 
 
 @app.route("/discover", methods=["POST"])
@@ -1674,6 +2812,8 @@ def cal_point():
     if cal3d["active"]:
         return jsonify({"error": "Collection already running"}), 429
 
+    ensure_session()
+
     cal3d["active"] = True
     cal3d["tag_id"] = tid
     cal3d["points"].append({"x": x, "y": y, "z": z, "samples": defaultdict(list)})
@@ -1761,7 +2901,7 @@ def cal_clear():
 
 @app.route("/auto_cal_start", methods=["POST"])
 def auto_cal_start():
-    global auto_cal
+    global auto_cal, session_csv
     data = request.get_json(silent=True) or {}
 
     # origin_id is optional; if omitted the first discovered anchor is used.
@@ -1795,6 +2935,8 @@ def auto_cal_start():
         auto_cal["origin_id"] = origin_id
         auto_cal["fixed"] = {origin_id: (0.0, 0.0, 0.0)}
         auto_cal["pending"] = sorted(anchor_ids)
+        auto_cal["blocked"].clear()
+        auto_cal["solved_this_pass"] = 0
         auto_cal["current_id"] = None
         auto_cal["phase"] = "wait_next"
         auto_cal["deadline_ms"] = 0
@@ -1804,12 +2946,11 @@ def auto_cal_start():
         auto_cal["succeeded"].clear()
         auto_cal["failed"].clear()
         auto_cal["auto_retried"] = False
+        _clear_auto_cal_retry_keys()
 
-        # Write calibration start metadata to the session CSV.
-        if session_csv:
-            session_csv.write_session_info(origin_id)
-            session_csv.write_trny(trny)
-            session_csv.append_anchors_resolved(datetime.now().isoformat(), {origin_id: (0.0, 0.0, 0.0)})
+        # Start a fresh session CSV for this calibration run.
+        new_session(origin_id)
+        session_csv.append_anchors_resolved(datetime.now().isoformat(), {origin_id: (0.0, 0.0, 0.0)})
 
     log(f"[AUTO] Starting calibration. Origin={origin_id}, pending={auto_cal['pending']}")
     threading.Thread(target=auto_cal_loop, daemon=True).start()
@@ -1846,6 +2987,8 @@ def auto_cal_retry_failed():
         # Keep the solved anchors, retry only the failed ones.
         auto_cal["running"] = True
         auto_cal["pending"] = sorted(failed)
+        auto_cal["blocked"].clear()
+        auto_cal["solved_this_pass"] = 0
         auto_cal["failed"].clear()
         auto_cal["current_id"] = None
         auto_cal["phase"] = "wait_next"
@@ -1854,6 +2997,7 @@ def auto_cal_retry_failed():
         auto_cal["packet_count"] = 0
         auto_cal["message"] = f"Retrying failed anchors: {failed}"
         auto_cal["auto_retried"] = True
+        _clear_auto_cal_retry_keys()
 
     log(f"[AUTO] Retrying failed anchors: {failed}")
     threading.Thread(target=auto_cal_loop, daemon=True).start()
@@ -1868,6 +3012,48 @@ def reset_anchors():
     auto_cal_reset()
     log("Anchors reset")
     return jsonify({"ok": True})
+
+
+@app.route("/manual_qr", methods=["POST"])
+def manual_qr():
+    """Manually trigger a QR collection as if the camera scanned the code."""
+    data = request.get_json(silent=True) or {}
+    qr_code = str(data.get("qr", "")).strip()
+    if not qr_code:
+        return jsonify({"error": "Missing qr"}), 400
+    ok = start_qr_collection(qr_code)
+    return jsonify({"ok": ok})
+
+
+@app.route("/scan_state")
+def scan_state():
+    """Return everything the user-mode trny scanning screen needs."""
+    global qr_last_seen_ms, qr_detected_ms
+    now = time.time() * 1000
+    qr_connected = False
+    qr_age_ms = None
+    if qr_last_seen_ms is not None:
+        qr_age_ms = now - qr_last_seen_ms
+        qr_connected = qr_age_ms < QR_HEARTBEAT_TIMEOUT_MS
+    with transform_lock:
+        return jsonify({
+            "qr_connected": qr_connected,
+            "qr_age_ms": qr_age_ms,
+            "qr_detected_ms": qr_detected_ms,
+            "trny": trny,
+            "pairs": [
+                {"point_id": p["point_id"], "uwb": list(p["uwb"]), "global": list(p["global"])}
+                for p in transform["pairs"]
+            ],
+            "transform_active": transform["active"],
+            "transform": {
+                "scale": transform["scale"],
+                "theta": transform["theta"],
+                "tx": transform["tx"],
+                "ty": transform["ty"],
+                "tz": transform["tz"],
+            },
+        })
 
 
 @app.route("/transform_status")
@@ -1912,8 +3098,11 @@ def compute_transform():
 
     log(f"[TRANSFORM] scale={result['scale']:.4f}, theta={math.degrees(result['theta']):.2f}°, "
         f"offset=({result['tx']:.2f}, {result['ty']:.2f}, {result['tz']:.2f})")
+    save_transform()
     if session_csv:
-        session_csv.append_anchors_global(datetime.now().isoformat(), {
+        ts = datetime.now().isoformat()
+        session_csv.append_transform(ts, result)
+        session_csv.append_anchors_global(ts, {
             aid: apply_transform(p) for aid, p in anchors.items()
         })
     return jsonify({"ok": True, "transform": result})
@@ -1922,6 +3111,11 @@ def compute_transform():
 @app.route("/clear_transform", methods=["POST"])
 def clear_transform_route():
     reset_transform()
+    try:
+        if os.path.exists(TRANSFORM_FILE):
+            os.remove(TRANSFORM_FILE)
+    except Exception as e:
+        log(f"Failed to remove transform file: {e}")
     log("Transform cleared")
     return jsonify({"ok": True})
 
@@ -1935,6 +3129,8 @@ def auto_cal_status():
             "phase": auto_cal["phase"],
             "current_id": auto_cal["current_id"],
             "pending": list(auto_cal["pending"]),
+            "blocked": list(auto_cal["blocked"]),
+            "solved_this_pass": auto_cal["solved_this_pass"],
             "fixed": {aid: list(p) for aid, p in auto_cal["fixed"].items()},
             "packet_count": auto_cal["packet_count"],
             "packets_needed": auto_cal["packets_needed"],
@@ -1978,15 +3174,16 @@ def state():
         "tags": tag_state,
         "transform_active": transform_active,
         "log": log_lines,
+        "session_path": session_csv.filepath if session_csv else None,
     })
 
 
 def main():
-    global session_csv
     load_anchors()
     load_trny()
-    session_csv = SessionCsvWriter()
-    session_csv.write_trny(trny)
+    load_transform()
+    # Session CSV is created only when a calibration starts or when data
+    # arrives, so one CSV = one session/calibration run.
     threading.Thread(target=udp_listener, daemon=True).start()
     threading.Thread(target=qr_listener, daemon=True).start()
     ip = get_pc_ip()

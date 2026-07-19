@@ -12,7 +12,7 @@ REM Optional: override the ESP32-CAM URL if your camera has a different IP.
 REM set "ESP32_CAM_URL=http://192.168.0.159/capture"
 
 echo ==========================================
-echo  UWB PC ANL - GUI + ESP-CAM scanner
+echo  UWB PC ANL - GUI + ESP-CAM scanner + session sync
 echo ==========================================
 
 if not exist "%VENV_DIR%\Scripts\python.exe" (
@@ -27,7 +27,7 @@ if not exist "%VENV_DIR%\Scripts\python.exe" (
 cd /d "%PROJECT_DIR%"
 echo Project directory: %PROJECT_DIR%
 echo.
-echo Starting PC ANL GUI and ESP-CAM QR scanner...
+echo Starting PC ANL GUI, ESP-CAM QR scanner and session sync...
 echo.
 
 REM Launch the PC ANL web GUI in its own window.
@@ -36,17 +36,22 @@ start "PC ANL - UWB GUI" "%VENV_DIR%\Scripts\python.exe" scripts\pc_anl.py
 REM Give the GUI a moment to bind UDP ports before starting the scanner.
 timeout /t 2 /nobreak >nul
 
-REM Launch the ESP32-CAM QR scanner in its own window (local or parent project root).
+REM Launch the ESP32-CAM QR scanner in its own window.
 if exist "esp-cam\qr_scanner.py" (
     start "ESP-CAM QR Scanner" "%VENV_DIR%\Scripts\python.exe" esp-cam\qr_scanner.py
-) else if exist "..\esp-cam\qr_scanner.py" (
-    start "ESP-CAM QR Scanner" "%VENV_DIR%\Scripts\python.exe" ..\esp-cam\qr_scanner.py
 ) else (
     echo WARNING: esp-cam\qr_scanner.py not found. The QR scanner will not start.
 )
 
+REM Launch the session CSV backup/sync tool.
+if exist "scripts\session_sync.py" (
+    start "Session Sync" "%VENV_DIR%\Scripts\python.exe" scripts\session_sync.py
+) else (
+    echo WARNING: scripts\session_sync.py not found. Session sync will not start.
+)
+
 echo.
-echo Both services are running in their own windows.
+echo Services are running in their own windows.
 echo Close those windows to stop the services.
 echo.
 pause

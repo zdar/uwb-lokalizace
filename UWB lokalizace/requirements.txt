@@ -1,3 +1,9 @@
 # Dependencies for scripts/pc_anl.py (PC ANL GUI).
 # Run setup.bat on Windows to install these into a local virtual environment.
 flask>=3.0.0
+
+# ESP-CAM QR scanner (esp-cam/qr_scanner.py)
+requests>=2.31
+opencv-python>=4.8
+pyzbar>=0.1.9
+numpy>=1.24

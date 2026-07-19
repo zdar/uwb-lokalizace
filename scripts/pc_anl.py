@@ -1830,22 +1830,20 @@ HTML_PAGE = r"""
             setTimeout(() => playTone(196, 0.4, 'sawtooth'), 200);
         }
 
-        function playScaryBeep() {
+        function playAlarmBeep() {
             const ctx = getAudioContext();
             if (!ctx) return;
             const now = ctx.currentTime;
-            [220, 196, 174, 146, 110].forEach((freq, i) => {
-                const osc = ctx.createOscillator();
-                const gain = ctx.createGain();
-                osc.type = 'sawtooth';
-                osc.frequency.value = freq;
-                osc.connect(gain);
-                gain.connect(ctx.destination);
-                osc.start(now + i * 0.18);
-                gain.gain.setValueAtTime(0.2, now + i * 0.18);
-                gain.gain.exponentialRampToValueAtTime(0.001, now + i * 0.18 + 0.35);
-                osc.stop(now + i * 0.18 + 0.35);
-            });
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
+            osc.type = 'sine';
+            osc.frequency.value = 880;
+            osc.connect(gain);
+            gain.connect(ctx.destination);
+            osc.start(now);
+            gain.gain.setValueAtTime(0.05, now);
+            gain.gain.exponentialRampToValueAtTime(0.001, now + 0.3);
+            osc.stop(now + 0.3);
         }
 
         function playScanSuccessSound() {
@@ -1896,7 +1894,7 @@ HTML_PAGE = r"""
                             '<button onclick="startSetupFlow()">Zkusit znovu</button>' +
                             '<button onclick="enterDevMode()">Vývojářský režim</button>';
                         actionsEl.style.display = 'block';
-                        playScaryBeep();
+                        playAlarmBeep();
                         setTimeout(pollDiscoveryForAutoCal, 3000);
                         return;
                     }
@@ -2496,14 +2494,14 @@ HTML_PAGE = r"""
         }
 
         function startDisconnectAlarm() {
-            if (disconnectAlarmInterval) return;
+            stopDisconnectAlarm();
             disconnectAlarmInterval = setInterval(() => {
                 const missingIds = setDiff(EXPECTED_NODE_IDS, currentConnectedIds);
                 const newMissing = setDiff(missingIds, silencedMissingIds);
                 if (newMissing.size > 0) {
-                    playScaryBeep();
+                    playAlarmBeep();
                 }
-            }, 3000);
+            }, 8000);
         }
 
         function stopDisconnectAlarm() {
@@ -2545,6 +2543,7 @@ HTML_PAGE = r"""
 
             if (newMissingIds.size === 0) {
                 // All current disconnections are acknowledged: keep banner, no sound.
+                box.style.background = '#c60';
                 box.innerHTML = `⚠ Disconnected (silenced): ${info} ` +
                     `<button onclick="silenceDisconnectWarning()">Silence / Acknowledge</button>`;
                 box.style.display = 'block';
@@ -2552,6 +2551,7 @@ HTML_PAGE = r"""
                 return newMissingIds;
             }
 
+            box.style.background = '#c00';
             box.innerHTML = `⚠ MODULE DISCONNECTED: ${info} ` +
                 `<button onclick="silenceDisconnectWarning()">Silence / Acknowledge</button>`;
             box.style.display = 'block';
@@ -2572,7 +2572,7 @@ HTML_PAGE = r"""
 
             // Alarm immediately on any non-silenced missing module, including at startup.
             if (newMissingIds.size > 0) {
-                playScaryBeep();
+                playAlarmBeep();
             }
         }
 
