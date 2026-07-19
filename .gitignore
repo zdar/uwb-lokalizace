@@ -32,5 +32,6 @@ esp-cam/src/wifi_secrets.h
 
 # Runtime data
 anchors.json
+transform.json
 data/
 sessions/

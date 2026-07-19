@@ -147,6 +147,9 @@ transform_lock = threading.Lock()
 # File used to persist anchor coordinates between sessions.
 ANCHORS_FILE = os.path.join(PROJECT_ROOT, "anchors.json")
 
+# File used to persist UWB-to-global transform between sessions.
+TRANSFORM_FILE = os.path.join(PROJECT_ROOT, "transform.json")
+
 # Known reference points (trny) with global coordinates and QR codes.
 TRNY_FILE = os.path.join(PROJECT_ROOT, "trny.json")
 
@@ -313,6 +316,56 @@ def load_anchors():
         log(f"Loaded {len(anchors)} anchor(s) from {ANCHORS_FILE}")
     except Exception as e:
         log(f"Failed to load anchors: {e}")
+
+
+def load_transform():
+    """Load a saved UWB-to-global transform from transform.json if it exists."""
+    if not os.path.exists(TRANSFORM_FILE):
+        return
+    try:
+        with open(TRANSFORM_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        with transform_lock:
+            transform["active"] = bool(data.get("active", False))
+            transform["scale"] = float(data.get("scale", 1.0))
+            transform["theta"] = float(data.get("theta", 0.0))
+            transform["cos"] = float(data.get("cos", 1.0))
+            transform["sin"] = float(data.get("sin", 0.0))
+            transform["tx"] = float(data.get("tx", 0.0))
+            transform["ty"] = float(data.get("ty", 0.0))
+            transform["tz"] = float(data.get("tz", 0.0))
+            transform["pairs"] = [
+                {"point_id": p["point_id"], "uwb": tuple(p["uwb"]), "global": tuple(p["global"])}
+                for p in data.get("pairs", [])
+            ]
+        log(f"Loaded transform from {TRANSFORM_FILE} (active={transform['active']})")
+    except Exception as e:
+        log(f"Failed to load transform: {e}")
+
+
+def save_transform():
+    """Save the current UWB-to-global transform to transform.json."""
+    try:
+        with transform_lock:
+            data = {
+                "active": transform["active"],
+                "scale": transform["scale"],
+                "theta": transform["theta"],
+                "cos": transform["cos"],
+                "sin": transform["sin"],
+                "tx": transform["tx"],
+                "ty": transform["ty"],
+                "tz": transform["tz"],
+                "pairs": [
+                    {"point_id": p["point_id"], "uwb": list(p["uwb"]), "global": list(p["global"])}
+                    for p in transform["pairs"]
+                ],
+            }
+        with open(TRANSFORM_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        log(f"Saved transform to {TRANSFORM_FILE}")
+    except Exception as e:
+        log(f"Failed to save transform: {e}")
 
 
 def save_anchors():
@@ -3045,6 +3098,7 @@ def compute_transform():
 
     log(f"[TRANSFORM] scale={result['scale']:.4f}, theta={math.degrees(result['theta']):.2f}°, "
         f"offset=({result['tx']:.2f}, {result['ty']:.2f}, {result['tz']:.2f})")
+    save_transform()
     if session_csv:
         ts = datetime.now().isoformat()
         session_csv.append_transform(ts, result)
@@ -3057,6 +3111,11 @@ def compute_transform():
 @app.route("/clear_transform", methods=["POST"])
 def clear_transform_route():
     reset_transform()
+    try:
+        if os.path.exists(TRANSFORM_FILE):
+            os.remove(TRANSFORM_FILE)
+    except Exception as e:
+        log(f"Failed to remove transform file: {e}")
     log("Transform cleared")
     return jsonify({"ok": True})
 
@@ -3122,6 +3181,7 @@ def state():
 def main():
     load_anchors()
     load_trny()
+    load_transform()
     # Session CSV is created only when a calibration starts or when data
     # arrives, so one CSV = one session/calibration run.
     threading.Thread(target=udp_listener, daemon=True).start()
