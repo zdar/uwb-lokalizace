@@ -1228,8 +1228,8 @@ HTML_PAGE = r"""
     <title>PC ANL - UWB Prototype</title>
     <style>
         body { font-family: sans-serif; max-width: 1100px; margin: 30px auto; padding: 0 20px; }
-        #globalWarningBox { position: fixed; top: 0; left: 0; width: 100%; padding: 12px; background: #c00; color: #fff; font-weight: bold; text-align: center; z-index: 2000; display: none; }
-        #globalWarningBox button { background: #fff; color: #c00; border: none; padding: 6px 12px; margin-left: 10px; cursor: pointer; font-weight: bold; border-radius: 4px; }
+        #globalWarningBox { position: fixed; top: 0; left: 0; width: 100%; padding: 14px; background: #c00; color: #fff; font-weight: bold; text-align: center; z-index: 2000; display: none; font-size: 16px; }
+        #globalWarningBox button { background: #fff; color: #c00; border: none; padding: 6px 12px; margin-left: 12px; cursor: pointer; font-weight: bold; border-radius: 4px; }
         h1, h2 { color: #333; }
         button { padding: 8px 16px; margin: 4px 4px 4px 0; font-size: 14px; cursor: pointer; }
         button:disabled { opacity: 0.5; cursor: not-allowed; }
@@ -1482,9 +1482,7 @@ HTML_PAGE = r"""
         let lastQrDetectedMs = null;
         let discoveryPollActive = false;
         const EXPECTED_NODE_COUNT = 10;
-        let knownNodeIds = new Set();
         let silencedMissingIds = new Set();
-        let lastMissingIds = new Set();
 
         function hideAllModals() {
             document.getElementById('setupModal').style.display = 'none';
@@ -2431,8 +2429,10 @@ HTML_PAGE = r"""
             return new Set([...a].filter(x => !b.has(x)));
         }
 
+        const EXPECTED_NODE_IDS = new Set([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
         let disconnectedAtMs = {};
         let disconnectAlarmInterval = null;
+        let currentConnectedIds = new Set();
 
         function formatDuration(ms) {
             const totalSeconds = Math.floor(ms / 1000);
@@ -2445,9 +2445,8 @@ HTML_PAGE = r"""
         function startDisconnectAlarm() {
             if (disconnectAlarmInterval) return;
             disconnectAlarmInterval = setInterval(() => {
-                const missingIds = setDiff(knownNodeIds, currentConnectedIds);
-                const stillSilent = new Set([...silencedMissingIds].filter(id => missingIds.has(id)));
-                const newMissing = setDiff(missingIds, stillSilent);
+                const missingIds = setDiff(EXPECTED_NODE_IDS, currentConnectedIds);
+                const newMissing = setDiff(missingIds, silencedMissingIds);
                 if (newMissing.size > 0) {
                     playScaryBeep();
                 }
@@ -2461,10 +2460,9 @@ HTML_PAGE = r"""
             }
         }
 
-        function renderDisconnectWarning(prevIds, currentIds) {
+        function renderDisconnectWarning(currentIds) {
             const box = document.getElementById('globalWarningBox');
-            const missingIds = setDiff(prevIds, currentIds);
-            lastMissingIds = missingIds;
+            const missingIds = setDiff(EXPECTED_NODE_IDS, currentIds);
             const now = Date.now();
 
             // Track when each module went missing.
@@ -2475,8 +2473,9 @@ HTML_PAGE = r"""
                 if (!missingIds.has(Number(id))) delete disconnectedAtMs[id];
             }
 
-            const stillSilentMissing = new Set([...silencedMissingIds].filter(id => missingIds.has(id)));
-            const newMissingIds = setDiff(missingIds, stillSilentMissing);
+            // A module that reconnected loses its silence.
+            silencedMissingIds = new Set([...silencedMissingIds].filter(id => missingIds.has(id)));
+            const newMissingIds = setDiff(missingIds, silencedMissingIds);
 
             if (missingIds.size === 0) {
                 box.style.display = 'none';
@@ -2492,7 +2491,7 @@ HTML_PAGE = r"""
             }).join(', ');
 
             if (newMissingIds.size === 0) {
-                // All current disconnections are acknowledged.
+                // All current disconnections are acknowledged: keep banner, no sound.
                 box.innerHTML = `⚠ Disconnected (silenced): ${info} ` +
                     `<button onclick="silenceDisconnectWarning()">Silence / Acknowledge</button>`;
                 box.style.display = 'block';
@@ -2508,27 +2507,20 @@ HTML_PAGE = r"""
         }
 
         function silenceDisconnectWarning() {
-            const missingIds = setDiff(knownNodeIds, currentConnectedIds);
+            const missingIds = setDiff(EXPECTED_NODE_IDS, currentConnectedIds);
             silencedMissingIds = new Set(missingIds);
-            renderDisconnectWarning(knownNodeIds, currentConnectedIds);
+            renderDisconnectWarning(currentConnectedIds);
         }
-
-        let currentConnectedIds = new Set();
 
         function checkNodeDisconnections(nodes) {
             const currentIds = new Set(nodes.map(n => n.id));
             currentConnectedIds = currentIds;
-            const missingIds = setDiff(knownNodeIds, currentIds);
-            const newMissingIds = renderDisconnectWarning(knownNodeIds, currentIds);
+            const newMissingIds = renderDisconnectWarning(currentIds);
 
-            // Don't alarm on the very first state fetch (page load).
-            if (knownNodeIds.size > 0 && newMissingIds.size > 0) {
+            // Alarm immediately on any non-silenced missing module, including at startup.
+            if (newMissingIds.size > 0) {
                 playScaryBeep();
             }
-
-            // Remove reconnected modules from the silenced set.
-            silencedMissingIds = new Set([...silencedMissingIds].filter(id => missingIds.has(id)));
-            knownNodeIds = currentIds;
         }
 
         function refreshState() {
