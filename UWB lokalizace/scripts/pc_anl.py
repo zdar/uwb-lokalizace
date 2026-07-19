@@ -172,6 +172,25 @@ class SessionCsvWriter:
         # Start with an empty file.
         open(self.filepath, "w", encoding="utf-8").close()
 
+    @classmethod
+    def from_existing(cls, filepath):
+        """Reuse an existing session CSV file for appending."""
+        writer = cls.__new__(cls)
+        writer.filepath = filepath
+        writer.sections = writer._scan_sections()
+        return writer
+
+    def _scan_sections(self):
+        sections = set()
+        try:
+            with open(self.filepath, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("# "):
+                        sections.add(line[2:].strip())
+        except Exception:
+            pass
+        return sections
+
     def _ensure_section(self, section, header):
         if section in self.sections:
             return
@@ -272,12 +291,40 @@ def new_session(origin_id=None):
     return session_csv
 
 
+def _latest_session_file():
+    """Return the most recent session_* CSV file, or None."""
+    if not os.path.isdir(SESSIONS_DIR):
+        return None
+    files = [
+        os.path.join(SESSIONS_DIR, f)
+        for f in os.listdir(SESSIONS_DIR)
+        if f.startswith("session_") and f.endswith(".csv")
+    ]
+    if not files:
+        return None
+    return max(files, key=os.path.getmtime)
+
+
+def _file_age_hours(path):
+    try:
+        return (time.time() - os.path.getmtime(path)) / 3600.0
+    except Exception:
+        return float("inf")
+
+
 def ensure_session():
-    """Return the current session CSV, creating one lazily if needed."""
+    """Return the current session CSV, reusing a recent one or creating new."""
     global session_csv
-    if session_csv is None:
-        return new_session()
-    return session_csv
+    if session_csv is not None:
+        return session_csv
+
+    latest = _latest_session_file()
+    if latest and _file_age_hours(latest) < 24:
+        session_csv = SessionCsvWriter.from_existing(latest)
+        log(f"[SESSION] Reusing recent session: {latest}")
+        return session_csv
+
+    return new_session()
 qr_last_seen_ms = None        # last QR event timestamp from ESP32-CAM
 qr_detected_ms = None         # timestamp of the last actual QR code scan
 
@@ -2823,7 +2870,12 @@ def cal_point():
     if cal3d["active"]:
         return jsonify({"error": "Collection already running"}), 429
 
-    ensure_session()
+    # First point of a manual calibration starts a fresh session;
+    # subsequent points append to the same session.
+    if len(cal3d["points"]) == 0:
+        new_session()
+    else:
+        ensure_session()
 
     cal3d["active"] = True
     cal3d["tag_id"] = tid
