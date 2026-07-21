@@ -1637,10 +1637,25 @@ HTML_PAGE = r"""
         }
 
         function startNewCalibration() {
+            const btn = document.querySelector('#startChoiceModal button[onclick="startNewCalibration()"]');
+            if (btn) {
+                btn.disabled = true;
+                btn.textContent = 'Startuji...';
+            }
             fetch('/new_session', {method: 'POST'})
+                .then(r => { if (!r.ok) throw new Error('new_session ' + r.status); return r.json(); })
                 .then(() => fetch('/reset_anchors', {method: 'POST'}))
+                .then(r => { if (!r.ok) throw new Error('reset_anchors ' + r.status); return r.json(); })
                 .then(() => fetch('/clear_transform', {method: 'POST'}))
-                .then(() => startSetupFlow());
+                .then(r => { if (!r.ok) throw new Error('clear_transform ' + r.status); return r.json(); })
+                .then(() => startSetupFlow())
+                .catch(err => {
+                    alert('Chyba při startu kalibrace: ' + err.message);
+                    if (btn) {
+                        btn.disabled = false;
+                        btn.textContent = 'Nová kalibrace';
+                    }
+                });
         }
 
         function showCalModal() {
@@ -1932,10 +1947,15 @@ HTML_PAGE = r"""
             calDoneNotified = false;
             startCalTimer();
             fetch('/discover', {method: 'POST'})
-                .then(r => r.json())
+                .then(r => { if (!r.ok) throw new Error('discover ' + r.status); return r.json(); })
                 .then(() => {
                     discoveryPollActive = true;
                     pollDiscoveryForAutoCal();
+                })
+                .catch(err => {
+                    const statusEl = document.getElementById('calModalStatus');
+                    statusEl.textContent = 'Chyba při hledání: ' + err.message;
+                    stopCalTimer();
                 });
         }
 
