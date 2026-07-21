@@ -274,6 +274,14 @@ trny = {}  # id -> {"x", "y", "z", "qr"}
 def new_session(origin_id=None):
     """Start a fresh session CSV. All subsequent data goes into it."""
     global session_csv
+    # Read transform state before acquiring csv_lock to avoid a deadlock with
+    # compute_transform(), which holds transform_lock and then calls session_csv.
+    with transform_lock:
+        transform_active = transform["active"]
+        global_anchors = None
+        if transform_active and anchors:
+            global_anchors = {aid: apply_transform(p) for aid, p in anchors.items()}
+
     with csv_lock:
         session_csv = SessionCsvWriter()
         session_csv.write_session_info(origin_id)
@@ -281,11 +289,7 @@ def new_session(origin_id=None):
         if anchors:
             ts = datetime.now().isoformat()
             session_csv.append_anchors_resolved(ts, anchors)
-            with transform_lock:
-                transform_active = transform["active"]
-                if transform_active:
-                    global_anchors = {aid: apply_transform(p) for aid, p in anchors.items()}
-            if transform_active:
+            if transform_active and global_anchors:
                 session_csv.append_anchors_global(ts, global_anchors)
     log(f"[SESSION] New session started: {session_csv.filepath}")
     return session_csv
@@ -1806,8 +1810,8 @@ HTML_PAGE = r"""
 
         function toggleUserMode() {
             Promise.all([
-                fetch('/auto_cal_status').then(r => r.json()),
-                fetch('/state').then(r => r.json())
+                fetch('/auto_cal_status').then(r => { if (!r.ok) throw new Error('auto_cal_status ' + r.status); return r.json(); }),
+                fetch('/state').then(r => { if (!r.ok) throw new Error('state ' + r.status); return r.json(); })
             ]).then(([calData, stateData]) => {
                 const hasCalState = calData.phase !== 'idle' || calData.running;
                 const hasAnchors = Object.keys(stateData.anchors).length > 0;
@@ -1823,6 +1827,15 @@ HTML_PAGE = r"""
                     document.getElementById('trnyModal').style.display = 'none';
                     document.getElementById('mainContent').style.display = 'none';
                 }
+            }).catch(err => {
+                const box = document.getElementById('logBox');
+                if (!box) return;
+                const div = document.createElement('div');
+                div.className = 'log-line';
+                div.style.color = 'red';
+                div.textContent = `[UI] toggleUserMode error: ${err.message}`;
+                box.appendChild(div);
+                box.scrollTop = box.scrollHeight;
             });
         }
 
@@ -2636,7 +2649,10 @@ HTML_PAGE = r"""
 
         function refreshState() {
             fetch('/state')
-                .then(r => r.json())
+                .then(r => {
+                    if (!r.ok) throw new Error('HTTP ' + r.status);
+                    return r.json();
+                })
                 .then(data => {
                     const spEl = document.getElementById('sessionPath');
                     if (spEl && data.session_path) {
@@ -2695,6 +2711,16 @@ HTML_PAGE = r"""
                         box.appendChild(div);
                         box.scrollTop = box.scrollHeight;
                     }
+                })
+                .catch(err => {
+                    const box = document.getElementById('logBox');
+                    if (!box) return;
+                    const div = document.createElement('div');
+                    div.className = 'log-line';
+                    div.style.color = 'red';
+                    div.textContent = `[UI] /state error: ${err.message}`;
+                    box.appendChild(div);
+                    box.scrollTop = box.scrollHeight;
                 });
         }
 
