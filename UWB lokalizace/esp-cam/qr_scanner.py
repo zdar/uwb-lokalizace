@@ -4,6 +4,8 @@ import time
 import random
 import winsound
 import threading
+import ipaddress
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque, defaultdict
 
 import cv2
@@ -11,10 +13,67 @@ import numpy as np
 import requests
 from pyzbar.pyzbar import decode
 
+
+# --- AUTO-DISCOVERY ESP32-CAM ---------------------------------------------
+def get_local_subnet():
+    """Return the /24 subnet of the default local interface as a string."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(0.5)
+        # connect to a public address; no actual traffic is sent
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+    except Exception:
+        ip = "192.168.0.1"
+    net = ipaddress.ip_network(f"{ip}/24", strict=False)
+    return str(net)
+
+
+def _try_cam_url(url, timeout_s=1.0):
+    """Try to fetch /capture from a candidate URL. Return URL if it works."""
+    try:
+        r = requests.get(url, timeout=timeout_s)
+        if r.status_code == 200 and len(r.content) > 100:
+            content_type = r.headers.get("Content-Type", "").lower()
+            if "image" in content_type or r.content[:2] == b"\xff\xd8":
+                return url
+    except Exception:
+        pass
+    return None
+
+
+def discover_esp32_cam_url(fallback="http://192.168.0.111/capture"):
+    """Scan the local /24 subnet for an ESP32-CAM /capture endpoint."""
+    if os.environ.get("ESP32_CAM_URL"):
+        return os.environ.get("ESP32_CAM_URL")
+    subnet = get_local_subnet()
+    network = ipaddress.ip_network(subnet, strict=False)
+    hosts = list(network.hosts())
+    print(f"[KAMERA] hledam ESP32-CAM v siti {subnet} ({len(hosts)} adres)...")
+    found = None
+    with ThreadPoolExecutor(max_workers=50) as ex:
+        futures = {
+            ex.submit(_try_cam_url, f"http://{host}/capture", 0.6): host
+            for host in hosts
+        }
+        for fut in as_completed(futures):
+            url = fut.result()
+            if url:
+                found = url
+                # cancel remaining futures as soon as possible
+                for f in futures:
+                    f.cancel()
+                break
+    if found:
+        print(f"[KAMERA] nalezena ESP32-CAM: {found}")
+        return found
+    print(f"[KAMERA] ESP32-CAM nenalezena, pouzivam fallback {fallback}")
+    return fallback
+
+
 # --- KONFIGURACE -----------------------------------------------------------
-ESP32_CAM_URL = os.environ.get(
-    "ESP32_CAM_URL", "http://192.168.0.159/capture"
-)
+ESP32_CAM_URL = discover_esp32_cam_url()
 PC_ANL_URL = "http://localhost:5000/state"
 RAW_RPT_PORT = 50001
 QR_EVENT_HOST = "127.0.0.1"

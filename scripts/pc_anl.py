@@ -32,7 +32,7 @@ from collections import defaultdict
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
-from flask import Flask, render_template_string, jsonify, request
+from flask import Flask, render_template_string, jsonify, request, make_response
 from positioning.position import (
     parse_at_range_line,
     trilaterate,
@@ -83,6 +83,7 @@ RANGE_SMOOTHING_ALPHA = 0.25
 # Auto-calibration (Mode A) timing.
 AUTO_CAL_ROLE_SWITCH_WAIT_S = 40   # time for the UWB module to reconfigure after ROLE change
 AUTO_CAL_COLLECT_S = 20            # how long to gather ranges per anchor
+AUTO_CAL_FORCE_COPLANAR = True     # force solved anchor Z coordinate to 0 (deployment is on one plane)
 
 app = Flask(__name__)
 
@@ -164,20 +165,22 @@ class SessionCsvWriter:
     a '# SECTION' marker line. Sections can be appended incrementally.
     """
 
-    def __init__(self):
+    def __init__(self, suffix="", lock=None):
         os.makedirs(SESSIONS_DIR, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.filepath = os.path.join(SESSIONS_DIR, f"session_{timestamp}.csv")
+        self.filepath = os.path.join(SESSIONS_DIR, f"session_{timestamp}{suffix}.csv")
         self.sections = set()
+        self.lock = lock if lock is not None else threading.RLock()
         # Start with an empty file.
         open(self.filepath, "w", encoding="utf-8").close()
 
     @classmethod
-    def from_existing(cls, filepath):
+    def from_existing(cls, filepath, lock=None):
         """Reuse an existing session CSV file for appending."""
         writer = cls.__new__(cls)
         writer.filepath = filepath
         writer.sections = writer._scan_sections()
+        writer.lock = lock if lock is not None else threading.RLock()
         return writer
 
     def _scan_sections(self):
@@ -203,7 +206,7 @@ class SessionCsvWriter:
         """Append multiple rows to a section, creating the header if needed."""
         if not rows:
             return
-        with csv_lock:
+        with self.lock:
             self._ensure_section(section, header)
             with open(self.filepath, "a", newline="", encoding="utf-8") as f:
                 csv.writer(f).writerows(rows)
@@ -266,47 +269,60 @@ class SessionCsvWriter:
         ], [[timestamp, point_idx, x, y, z, anchor_id, distance]])
 
 
-session_csv = None
-csv_lock = threading.Lock()   # protects all SessionCsvWriter file writes
-trny = {}  # id -> {"x", "y", "z", "qr"}
+def _session_pair_paths(timestamp):
+    """Return raw and solved file paths for a given session timestamp."""
+    raw_path = os.path.join(SESSIONS_DIR, f"session_{timestamp}_raw.csv")
+    solved_path = os.path.join(SESSIONS_DIR, f"session_{timestamp}_solved.csv")
+    return raw_path, solved_path
+
+
+session_csv_raw = None
+session_csv_solved = None
+csv_raw_lock = threading.RLock()
+csv_solved_lock = threading.RLock()
+trny = {}  # id -> {x, y, z, qr}
 
 
 def new_session(origin_id=None):
-    """Start a fresh session CSV. All subsequent data goes into it."""
-    global session_csv
+    """Start a fresh raw + solved session CSV pair. All subsequent data goes into them."""
+    global session_csv_raw, session_csv_solved
     # Read transform state before acquiring csv_lock to avoid a deadlock with
-    # compute_transform(), which holds transform_lock and then calls session_csv.
+    # compute_transform(), which holds transform_lock and then calls session_csv_solved.
     with transform_lock:
         transform_active = transform["active"]
         global_anchors = None
         if transform_active and anchors:
             global_anchors = {aid: apply_transform(p) for aid, p in anchors.items()}
 
-    with csv_lock:
-        session_csv = SessionCsvWriter()
-        session_csv.write_session_info(origin_id)
-        session_csv.write_trny(trny)
-        if anchors:
-            ts = datetime.now().isoformat()
-            session_csv.append_anchors_resolved(ts, anchors)
-            if transform_active and global_anchors:
-                session_csv.append_anchors_global(ts, global_anchors)
-    log(f"[SESSION] New session started: {session_csv.filepath}")
-    return session_csv
+    session_csv_raw = SessionCsvWriter(suffix="_raw", lock=csv_raw_lock)
+    session_csv_solved = SessionCsvWriter(suffix="_solved", lock=csv_solved_lock)
+    session_csv_solved.write_session_info(origin_id)
+    session_csv_solved.write_trny(trny)
+    if anchors:
+        ts = datetime.now().isoformat()
+        session_csv_solved.append_anchors_resolved(ts, anchors)
+        if transform_active and global_anchors:
+            session_csv_solved.append_anchors_global(ts, global_anchors)
+    log(f"[SESSION] New session started: raw={session_csv_raw.filepath}, solved={session_csv_solved.filepath}")
+    return session_csv_raw, session_csv_solved
 
 
-def _latest_session_file():
-    """Return the most recent session_* CSV file, or None."""
+def _latest_session_pair():
+    """Return the most recent session_*_solved.csv and its raw pair, or (None, None)."""
     if not os.path.isdir(SESSIONS_DIR):
-        return None
-    files = [
+        return None, None
+    solved_files = [
         os.path.join(SESSIONS_DIR, f)
         for f in os.listdir(SESSIONS_DIR)
-        if f.startswith("session_") and f.endswith(".csv")
+        if f.startswith("session_") and f.endswith("_solved.csv")
     ]
-    if not files:
-        return None
-    return max(files, key=os.path.getmtime)
+    if not solved_files:
+        return None, None
+    solved_path = max(solved_files, key=os.path.getmtime)
+    raw_path = solved_path.replace("_solved.csv", "_raw.csv")
+    if not os.path.exists(raw_path):
+        return None, None
+    return raw_path, solved_path
 
 
 def _file_age_hours(path):
@@ -317,16 +333,17 @@ def _file_age_hours(path):
 
 
 def ensure_session():
-    """Return the current session CSV, reusing a recent one or creating new."""
-    global session_csv
-    if session_csv is not None:
-        return session_csv
+    """Return the current session CSV pair, reusing a recent one or creating new."""
+    global session_csv_raw, session_csv_solved
+    if session_csv_raw is not None and session_csv_solved is not None:
+        return session_csv_raw, session_csv_solved
 
-    latest = _latest_session_file()
-    if latest and _file_age_hours(latest) < 24:
-        session_csv = SessionCsvWriter.from_existing(latest)
-        log(f"[SESSION] Reusing recent session: {latest}")
-        return session_csv
+    raw_path, solved_path = _latest_session_pair()
+    if solved_path and _file_age_hours(solved_path) < 24:
+        session_csv_raw = SessionCsvWriter.from_existing(raw_path, lock=csv_raw_lock)
+        session_csv_solved = SessionCsvWriter.from_existing(solved_path, lock=csv_solved_lock)
+        log(f"[SESSION] Reusing recent session: raw={raw_path}, solved={solved_path}")
+        return session_csv_raw, session_csv_solved
 
     return new_session()
 qr_last_seen_ms = None        # last QR event timestamp from ESP32-CAM
@@ -426,18 +443,31 @@ def save_transform():
         log(f"Failed to save transform: {e}")
 
 
+def _save_anchors_json():
+    """Persist current anchor coordinates to anchors.json only."""
+    data = {str(aid): [float(p[0]), float(p[1]), float(p[2])] for aid, p in anchors.items()}
+    with open(ANCHORS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+def write_anchors_to_session():
+    """Write the current anchor set to the solved session CSV once."""
+    ensure_session()
+    with transform_lock:
+        transform_active = transform["active"]
+        global_anchors = None
+        if transform_active:
+            global_anchors = {aid: apply_transform(p) for aid, p in anchors.items()}
+    session_csv_solved.append_anchors_resolved(datetime.now().isoformat(), anchors)
+    if transform_active and global_anchors:
+        session_csv_solved.append_anchors_global(datetime.now().isoformat(), global_anchors)
+
+
 def save_anchors():
-    """Save current anchor coordinates to anchors.json and the session CSV."""
+    """Save current anchor coordinates to anchors.json and the solved session CSV."""
     try:
-        data = {str(aid): [float(p[0]), float(p[1]), float(p[2])] for aid, p in anchors.items()}
-        with open(ANCHORS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-        ensure_session()
-        session_csv.append_anchors_resolved(datetime.now().isoformat(), anchors)
-        if transform["active"]:
-            session_csv.append_anchors_global(datetime.now().isoformat(), {
-                aid: apply_transform(p) for aid, p in anchors.items()
-            })
+        _save_anchors_json()
+        write_anchors_to_session()
         log(f"Saved {len(anchors)} anchor(s) to {ANCHORS_FILE}")
     except Exception as e:
         log(f"Failed to save anchors: {e}")
@@ -531,8 +561,11 @@ def reset_transform():
         transform["pairs"].clear()
 
 
-def start_qr_collection(qr_code):
-    """Start collecting UWB ranges for a QR-scanned point (trny or arbitrary)."""
+def start_qr_collection(qr_code, trigger="cam"):
+    """Start collecting UWB ranges for a QR-scanned point (trny or arbitrary).
+
+    trigger: "cam" for ESP32-CAM scan, "snap" for manual trigger, etc.
+    """
     point = None
     point_id = None
     for pid, p in trny.items():
@@ -554,6 +587,7 @@ def start_qr_collection(qr_code):
         "active": True,
         "scan_id": scan_id,
         "qr_code": qr_code,
+        "trigger": trigger,
         "point_id": point_id,
         "point_xyz": point_xyz,
         "tag_id": None,
@@ -632,16 +666,10 @@ def finish_qr_collection(collection):
 
     ts = datetime.now().isoformat()
     ensure_session()
-    # Write every individual range sample to QR_RAW.
-    raw_rows = []
-    for aid, dists in samples.items():
-        for d in dists:
-            raw_rows.append([scan_id, ts, qr_code, tag_id, aid, d])
-    session_csv.append_rows("QR_RAW",
-        ["scan_id", "timestamp", "qr_code", "tag_id", "anchor_id", "range"], raw_rows)
-    session_csv.append_qr_computed(scan_id, ts, qr_code, point_id, point_xyz,
-                                   tag_id, sum(len(v) for v in samples.values()),
-                                   computed_xyz, source, global_xyz)
+    # Write the computed result to the solved CSV.
+    session_csv_solved.append_qr_computed(scan_id, ts, qr_code, point_id, point_xyz,
+                                          tag_id, sum(len(v) for v in samples.values()),
+                                          computed_xyz, source, global_xyz)
 
     log(f"[QR] Saved {qr_code}: ranges={len(median_ranges)}, computed={computed_xyz}, global={global_xyz}")
 
@@ -789,7 +817,8 @@ def solve_sequential_anchor(ranges_to_fixed, fixed):
     # 1 fixed anchor -> place on +X axis relative to it.
     if len(valid) == 1:
         (x0, y0, z0), r = valid[0]
-        return (x0 + r, y0, z0)
+        x = x0 + r
+        return (x, y0, 0.0) if AUTO_CAL_FORCE_COPLANAR else (x, y0, z0)
 
     # 2 fixed anchors -> circle intersection, pick +Y side.
     if len(valid) == 2:
@@ -811,25 +840,25 @@ def solve_sequential_anchor(ranges_to_fixed, fixed):
             ux, uy = 1.0, 0.0
         else:
             ux, uy = ux / ul, uy / ul
-        return (xm + ux * h, ym + uy * h, zm)
+        return (xm + ux * h, ym + uy * h, 0.0 if AUTO_CAL_FORCE_COPLANAR else zm)
 
     # 3+ fixed anchors. Try least-squares 3D if we have 4+ non-coplanar anchors.
     # Use the first valid fixed anchor as the reference for Z fallback.
     (x0, y0, z0), r0 = valid[0]
 
-    if len(valid) >= 4:
+    if len(valid) >= 4 and not AUTO_CAL_FORCE_COPLANAR:
         anchors_dict = {i: p for i, (p, _) in enumerate(valid)}
         ranges_dict = {i: r for i, (_, r) in enumerate(valid)}
         pos3d = trilaterate_3d(ranges_dict, anchors_dict)
         if pos3d:
             return pos3d
 
-    # Either exactly 3 fixed anchors, or 4+ are coplanar and least-squares failed.
+    # Either exactly 3 fixed anchors, force-coplanar, or 4+ are coplanar and least-squares failed.
     # Use explicit 3-sphere intersection for the first three fixed anchors.
     (p0, r0), (p1, r1), (p2, r2) = valid[0], valid[1], valid[2]
     pos3d = trilaterate_3d_3spheres(p0, p1, p2, r0, r1, r2)
     if pos3d:
-        return pos3d
+        return (pos3d[0], pos3d[1], 0.0) if AUTO_CAL_FORCE_COPLANAR else pos3d
 
     # Last resort: 2D fallback.
     anchors_dict = {i: (p[0], p[1]) for i, (p, _) in enumerate(valid[:3])}
@@ -838,12 +867,7 @@ def solve_sequential_anchor(ranges_to_fixed, fixed):
     if not pos2d:
         return None
     x, y = pos2d
-    dx = x - x0
-    dy = y - y0
-    horiz2 = dx*dx + dy*dy
-    h2 = r0*r0 - horiz2
-    z = z0 + (math.sqrt(h2) if h2 > 0.0 else 0.0)
-    return (x, y, z)
+    return (x, y, 0.0) if AUTO_CAL_FORCE_COPLANAR else (x, y, z0)
 
 
 # ---------------------------------------------------------------------------
@@ -851,9 +875,10 @@ def solve_sequential_anchor(ranges_to_fixed, fixed):
 # ---------------------------------------------------------------------------
 
 def handle_rpt(text):
-    if text.startswith("RPT,"):
-        text = text[4:]
-    parsed = parse_at_range_line(text)
+    raw_line = text
+    if raw_line.startswith("RPT,"):
+        raw_line = raw_line[4:]
+    parsed = parse_at_range_line(raw_line)
     if not parsed:
         return
     tid, ranges = parsed
@@ -876,13 +901,9 @@ def handle_rpt(text):
     # Add to active calibration window if any.
     if cal3d["active"] and cal3d["tag_id"] == tid:
         pt = cal3d["points"][cal3d["point_idx"]]
-        ts = datetime.now().isoformat()
         for aid, dist in ranges.items():
             if 0 <= aid <= 9:
                 pt["samples"].setdefault(aid, []).append(dist)
-                if session_csv:
-                    session_csv.append_cal3d_raw(
-                        ts, cal3d["point_idx"], pt["x"], pt["y"], pt["z"], aid, dist)
 
     # Add to automatic calibration samples when waiting for / collecting from a temporary tag.
     with auto_cal_lock:
@@ -890,12 +911,9 @@ def handle_rpt(text):
                 auto_cal["current_id"] == tid and
                 auto_cal["phase"] in ("wait_tag", "collecting")):
             auto_cal["packet_count"] += 1
-            ts = datetime.now().isoformat()
             for aid, dist in ranges.items():
                 if 0 <= aid <= 9:
                     auto_cal["samples"].setdefault(aid, []).append(dist)
-                    if session_csv:
-                        session_csv.append_anchor_raw(ts, tid, aid, dist)
             if auto_cal["phase"] == "wait_tag":
                 log(f"[AUTO] First RPT from tag {tid}; starting collection")
                 auto_cal["phase"] = "collecting"
@@ -917,6 +935,28 @@ def handle_rpt(text):
     pos = solve_tag_position(ema)
     if pos:
         tags[tid]["pos"] = pos
+
+    # Log the truly raw incoming packet to the raw CSV.
+    if session_csv_raw:
+        comment = ""
+        if cal3d["active"] and cal3d["tag_id"] == tid:
+            comment = "cal3d"
+        if not comment:
+            with auto_cal_lock:
+                if auto_cal["running"] and auto_cal["current_id"] == tid:
+                    comment = "auto_cal"
+        trigger = ""
+        if not comment:
+            with qr_collect_lock:
+                for coll in qr_active:
+                    if coll.get("tag_id") == tid:
+                        comment = coll.get("qr_code", "")
+                        trigger = coll.get("trigger", "")
+                        break
+        ts_ms = int(now)
+        session_csv_raw.append_rows("RAW_PACKETS",
+            ["timestamp_ms", "tag_id", "raw_line", "qr_code", "trigger"],
+            [[ts_ms, tid, raw_line, comment, trigger]])
 
 
 def qr_listener():
@@ -1217,7 +1257,7 @@ def auto_cal_loop():
                     auto_cal["fixed"][current_id] = pos
                     auto_cal["succeeded"].add(current_id)
                     auto_cal["solved_this_pass"] += 1
-                save_anchors()
+                _save_anchors_json()
                 log(f"[AUTO] Anchor {current_id} fixed at ({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f})")
             else:
                 with auto_cal_lock:
@@ -1277,6 +1317,7 @@ def auto_cal_loop():
             continue
 
         if phase == "wait_next":
+            done_now = False
             with auto_cal_lock:
                 # If pending is empty but blocked anchors remain, unblock them
                 # only if we made progress since the last unblock. Otherwise
@@ -1298,22 +1339,28 @@ def auto_cal_loop():
                         auto_cal["message"] = f"No progress possible; blocked: {sorted(blocked_ids)}"
                         auto_cal["running"] = False
                         log(f"[AUTO] No progress possible. Blocked: {sorted(blocked_ids)}")
-                        return
+                        done_now = True
 
-                if auto_cal["pending"]:
-                    next_id = auto_cal["pending"].pop(0)
-                    auto_cal["current_id"] = next_id
-                    auto_cal["phase"] = "wait_tag"
-                    auto_cal["samples"] = defaultdict(list)
-                    auto_cal["packet_count"] = 0
-                    auto_cal["deadline_ms"] = now_ms + 60000
-                    auto_cal["message"] = f"Switching anchor {next_id} to TAG"
-                else:
-                    auto_cal["phase"] = "done"
-                    auto_cal["message"] = "Auto-calibration complete"
-                    auto_cal["running"] = False
-                    log("[AUTO] Calibration complete")
-                    return
+                if not done_now:
+                    if auto_cal["pending"]:
+                        next_id = auto_cal["pending"].pop(0)
+                        auto_cal["current_id"] = next_id
+                        auto_cal["phase"] = "wait_tag"
+                        auto_cal["samples"] = defaultdict(list)
+                        auto_cal["packet_count"] = 0
+                        auto_cal["deadline_ms"] = now_ms + 60000
+                        auto_cal["message"] = f"Switching anchor {next_id} to TAG"
+                    else:
+                        auto_cal["phase"] = "done"
+                        auto_cal["message"] = "Auto-calibration complete"
+                        auto_cal["running"] = False
+                        log("[AUTO] Calibration complete")
+                        done_now = True
+
+            if done_now:
+                # Write the final, complete anchor set to the solved CSV only once.
+                write_anchors_to_session()
+                return
 
             ip = get_node_ip_by_id(next_id)
             if ip:
@@ -1404,6 +1451,7 @@ HTML_PAGE = r"""
         <p class="dev-link">
             <a href="#" onclick="enterDevMode(); return false;" style="color: #666;">Vývojářský režim</a>
         </p>
+        <p style="font-size:12px; color:#999; margin-top:20px;">Verze: {{ gui_version }}</p>
     </div>
 
     <div id="startChoiceModal" class="modal">
@@ -1630,8 +1678,8 @@ HTML_PAGE = r"""
                 .then(data => {
                     if (data.error) alert(data.error);
                     else {
-                        document.getElementById('sessionPath').textContent = data.session;
-                        alert('New session started: ' + data.session);
+                        document.getElementById('sessionPath').textContent = data.session_solved;
+                        alert('New session started.\nRAW: ' + data.session_raw + '\nSOLVED: ' + data.session_solved);
                     }
                 });
         }
@@ -1969,47 +2017,45 @@ HTML_PAGE = r"""
                 .then(r => r.json())
                 .then(data => {
                     if (!discoveryPollActive) return;
+                    console.log('[UI] discovery_status', data);
                     if (data.running) {
                         setTimeout(pollDiscoveryForAutoCal, 500);
                         return;
                     }
                     const anchors = data.nodes.filter(n => n.role === 1);
+                    console.log('[UI] discovered anchors', anchors.length, anchors);
                     const EXPECTED_ANCHORS = 10;
                     const statusEl = document.getElementById('calModalStatus');
                     const actionsEl = document.getElementById('calResultActions');
-                    if (anchors.length < EXPECTED_ANCHORS) {
-                        stopCalTimer();
-                        const missing = EXPECTED_ANCHORS - anchors.length;
-                        statusEl.textContent = `Připojeno ${anchors.length} z ${EXPECTED_ANCHORS} kotviček. Chybí ${missing}. Čekám na zbývající...`;
+                    stopCalTimer();
+                    statusEl.textContent = `Připojeno ${anchors.length} kotviček. Spouštím kalibraci...`;
+                    actionsEl.style.display = 'none';
+                    if (anchors.length === 0) {
+                        statusEl.textContent = 'Nebyly nalezeny žádné kotvičky. Zkontroluj zapnutí krabiček.';
                         actionsEl.innerHTML =
                             '<button onclick="startSetupFlow()">Zkusit znovu</button>' +
                             '<button onclick="enterDevMode()">Vývojářský režim</button>';
                         actionsEl.style.display = 'block';
-                        playAlarmBeep();
-                        setTimeout(pollDiscoveryForAutoCal, 3000);
                         return;
                     }
-                    stopCalTimer();
-                    statusEl.textContent = `Všechny ${EXPECTED_ANCHORS} kotvičky připojeny.`;
-                    const originId = anchors[0].id;
-                    actionsEl.innerHTML =
-                        `<button onclick="startDiscoveredAutoCal(${originId})">Spustit kalibraci</button>` +
-                        '<button onclick="enterDevMode()">Vývojářský režim</button>';
-                    actionsEl.style.display = 'block';
+                    startDiscoveredAutoCal(anchors[0].id);
                 });
         }
 
         function startDiscoveredAutoCal(originId) {
+            console.log('[UI] startDiscoveredAutoCal called with originId', originId);
             const statusEl = document.getElementById('calModalStatus');
             const actionsEl = document.getElementById('calResultActions');
             statusEl.textContent = 'Spouštím kalibraci...';
             actionsEl.style.display = 'none';
             startCalTimer();
+            console.log('[UI] sending /auto_cal_start fetch');
             fetch('/auto_cal_start', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({origin_id: originId})
-            }).then(r => r.json()).then(data => {
+            }).then(r => { console.log('[UI] /auto_cal_start response status', r.status); if (!r.ok) throw new Error('auto_cal_start ' + r.status); return r.json(); }).then(data => {
+                console.log('[UI] /auto_cal_start data', data);
                 if (data.error) {
                     stopCalTimer();
                     statusEl.textContent = 'Chyba: ' + data.error;
@@ -2019,6 +2065,13 @@ HTML_PAGE = r"""
                     return;
                 }
                 pollAutoCalStatus();
+            }).catch(err => {
+                console.error('[UI] auto_cal_start failed:', err);
+                stopCalTimer();
+                statusEl.textContent = 'Chyba při startu kalibrace: ' + err.message;
+                actionsEl.innerHTML =
+                    '<button onclick="startSetupFlow()">Zkusit znovu</button>';
+                actionsEl.style.display = 'block';
             });
         }
 
@@ -2181,7 +2234,7 @@ HTML_PAGE = r"""
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({origin_id: origin})
-            }).then(r => r.json()).then(data => {
+            }).then(r => { if (!r.ok) throw new Error('auto_cal_start ' + r.status); return r.json(); }).then(data => {
                 if (data.error) {
                     stopCalTimer();
                     document.getElementById('calModalStatus').textContent = 'Chyba: ' + data.error;
@@ -2191,6 +2244,12 @@ HTML_PAGE = r"""
                     return;
                 }
                 pollAutoCalStatus();
+            }).catch(err => {
+                stopCalTimer();
+                document.getElementById('calModalStatus').textContent = 'Chyba při startu kalibrace: ' + err.message;
+                document.getElementById('calResultActions').innerHTML =
+                    '<button onclick="enterDevMode()">Vývojářský režim</button>';
+                document.getElementById('calResultActions').style.display = 'block';
             });
         }
 
@@ -2258,12 +2317,10 @@ HTML_PAGE = r"""
                 if (succeeded.length > 0) {
                     resultHtml += `<button onclick="continueToTrny()" style="margin-right:10px">Pokračovat k trnám</button>`;
                 }
-                if (failed.length > 0 && failed.length <= 2) {
+                if (failed.length > 0) {
                     resultHtml += `<button onclick="retryFailedFromCal()" style="margin-right:10px">Zkusit znovu selhané</button>`;
                 }
-                if (failed.length > 0) {
-                    resultHtml += `<button onclick="startFullAutoCalFromCal()">Nová plná kalibrace</button>`;
-                }
+                resultHtml += `<button onclick="startFullAutoCalFromCal()">Nová plná kalibrace</button>`;
                 resultActions.innerHTML = resultHtml;
                 resultActions.style.display = 'block';
 
@@ -2303,8 +2360,8 @@ HTML_PAGE = r"""
 
         function pollAutoCalStatus() {
             Promise.all([
-                fetch('/auto_cal_status').then(r => r.json()),
-                fetch('/state').then(r => r.json())
+                fetch('/auto_cal_status').then(r => { if (!r.ok) throw new Error('auto_cal_status ' + r.status); return r.json(); }),
+                fetch('/state').then(r => { if (!r.ok) throw new Error('state ' + r.status); return r.json(); })
             ]).then(([data, stateData]) => {
                 renderCalStatus(data, stateData.log || []);
                 if (data.running) {
@@ -2313,6 +2370,11 @@ HTML_PAGE = r"""
                     document.getElementById('autoCalStartBtn').disabled = false;
                 }
                 refreshState();
+            }).catch(err => {
+                stopCalTimer();
+                const statusEl = document.getElementById('calModalStatus');
+                if (statusEl) statusEl.textContent = 'Chyba při sledování kalibrace: ' + err.message;
+                document.getElementById('autoCalStartBtn').disabled = false;
             });
         }
 
@@ -2675,8 +2737,9 @@ HTML_PAGE = r"""
                 })
                 .then(data => {
                     const spEl = document.getElementById('sessionPath');
-                    if (spEl && data.session_path) {
-                        spEl.textContent = data.session_path;
+                    if (spEl && data.session_path_solved) {
+                        spEl.textContent = data.session_path_solved;
+                        spEl.title = 'RAW: ' + (data.session_path_raw || '-') + '\nSOLVED: ' + data.session_path_solved;
                     }
                     checkNodeDisconnections(data.nodes);
                     renderNodes(data.nodes);
@@ -2808,14 +2871,37 @@ HTML_PAGE = r"""
 """
 
 
+def _gui_version():
+    """Return a short version string based on this file's mtime."""
+    try:
+        mtime = os.path.getmtime(__file__)
+        return datetime.fromtimestamp(mtime).strftime("%Y%m%d_%H%M%S")
+    except Exception:
+        return "unknown"
+
+
 @app.route("/")
 def index():
-    return render_template_string(HTML_PAGE, pc_ip=get_pc_ip())
+    response = make_response(render_template_string(HTML_PAGE, pc_ip=get_pc_ip(), gui_version=_gui_version()))
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
+
+
+@app.after_request
+def set_no_cache(response):
+    """Prevent browsers from caching API responses and the page."""
+    if "Cache-Control" not in response.headers:
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
 
 
 @app.route("/new_session", methods=["POST"])
 def new_session_route():
-    """Explicitly start a new session CSV (e.g. before manual calibration)."""
+    """Explicitly start a new session CSV pair (e.g. before manual calibration)."""
     data = request.get_json(silent=True) or {}
     origin_id = data.get("origin_id")
     if origin_id is not None:
@@ -2824,7 +2910,11 @@ def new_session_route():
         except Exception:
             return jsonify({"error": "Bad origin_id"}), 400
     new_session(origin_id)
-    return jsonify({"ok": True, "session": session_csv.filepath})
+    return jsonify({
+        "ok": True,
+        "session_raw": session_csv_raw.filepath,
+        "session_solved": session_csv_solved.filepath,
+    })
 
 
 @app.route("/discover", methods=["POST"])
@@ -3010,7 +3100,7 @@ def cal_clear():
 
 @app.route("/auto_cal_start", methods=["POST"])
 def auto_cal_start():
-    global auto_cal, session_csv
+    global auto_cal, session_csv_raw, session_csv_solved
     data = request.get_json(silent=True) or {}
 
     # origin_id is optional; if omitted the first discovered anchor is used.
@@ -3021,24 +3111,33 @@ def auto_cal_start():
         except Exception:
             return jsonify({"error": "Bad origin_id"}), 400
 
+    # Build list of discovered anchor IDs (role == 1).
+    anchor_ids = {info["id"] for info in registry.values() if info.get("role") == 1}
+
+    if origin_id is None:
+        if not anchor_ids:
+            return jsonify({"error": "No anchors discovered"}), 400
+        origin_id = min(anchor_ids)
+
+    if origin_id not in anchor_ids:
+        return jsonify({"error": f"Origin ID {origin_id} not found among discovered anchors"}), 400
+
+    anchor_ids.discard(origin_id)
+    if not anchor_ids:
+        return jsonify({"error": "Need at least 2 anchors for auto-calibration"}), 400
+
     with auto_cal_lock:
         if auto_cal["running"]:
             return jsonify({"error": "Auto-calibration already running"}), 429
 
-        # Build list of discovered anchor IDs (role == 1).
-        anchor_ids = {info["id"] for info in registry.values() if info.get("role") == 1}
+    # Start a fresh session CSV pair OUTSIDE auto_cal_lock so the heavy file I/O
+    # does not block the UDP listener thread while it holds the lock.
+    new_session(origin_id)
+    session_csv_solved.append_anchors_resolved(datetime.now().isoformat(), {origin_id: (0.0, 0.0, 0.0)})
 
-        if origin_id is None:
-            if not anchor_ids:
-                return jsonify({"error": "No anchors discovered"}), 400
-            origin_id = min(anchor_ids)
-
-        if origin_id not in anchor_ids:
-            return jsonify({"error": f"Origin ID {origin_id} not found among discovered anchors"}), 400
-
-        anchor_ids.discard(origin_id)
-        if not anchor_ids:
-            return jsonify({"error": "Need at least 2 anchors for auto-calibration"}), 400
+    with auto_cal_lock:
+        if auto_cal["running"]:
+            return jsonify({"error": "Auto-calibration already running"}), 429
 
         auto_cal["running"] = True
         auto_cal["origin_id"] = origin_id
@@ -3056,10 +3155,6 @@ def auto_cal_start():
         auto_cal["failed"].clear()
         auto_cal["auto_retried"] = False
         _clear_auto_cal_retry_keys()
-
-        # Start a fresh session CSV for this calibration run.
-        new_session(origin_id)
-        session_csv.append_anchors_resolved(datetime.now().isoformat(), {origin_id: (0.0, 0.0, 0.0)})
 
     log(f"[AUTO] Starting calibration. Origin={origin_id}, pending={auto_cal['pending']}")
     threading.Thread(target=auto_cal_loop, daemon=True).start()
@@ -3130,7 +3225,7 @@ def manual_qr():
     qr_code = str(data.get("qr", "")).strip()
     if not qr_code:
         return jsonify({"error": "Missing qr"}), 400
-    ok = start_qr_collection(qr_code)
+    ok = start_qr_collection(qr_code, trigger="snap")
     return jsonify({"ok": ok})
 
 
@@ -3208,10 +3303,10 @@ def compute_transform():
     log(f"[TRANSFORM] scale={result['scale']:.4f}, theta={math.degrees(result['theta']):.2f}°, "
         f"offset=({result['tx']:.2f}, {result['ty']:.2f}, {result['tz']:.2f})")
     save_transform()
-    if session_csv:
+    if session_csv_solved:
         ts = datetime.now().isoformat()
-        session_csv.append_transform(ts, result)
-        session_csv.append_anchors_global(ts, {
+        session_csv_solved.append_transform(ts, result)
+        session_csv_solved.append_anchors_global(ts, {
             aid: apply_transform(p) for aid, p in anchors.items()
         })
     return jsonify({"ok": True, "transform": result})
@@ -3276,14 +3371,20 @@ def state():
             }
     with transform_lock:
         transform_active = transform["active"]
+        anchors_global = {aid: list(apply_transform(p)) for aid, p in anchors.items()}
+        tag_state_global = {}
+        for tid, t in tag_state.items():
+            tag_state_global[tid] = dict(t)
+            tag_state_global[tid]["global_pos"] = list(apply_transform(t["pos"])) if t["pos"] else None
     return jsonify({
         "nodes": nodes,
         "anchors": {aid: list(p) for aid, p in anchors.items()},
-        "anchors_global": {aid: list(apply_transform(p)) for aid, p in anchors.items()},
-        "tags": tag_state,
+        "anchors_global": anchors_global,
+        "tags": tag_state_global,
         "transform_active": transform_active,
         "log": log_lines,
-        "session_path": session_csv.filepath if session_csv else None,
+        "session_path_raw": session_csv_raw.filepath if session_csv_raw else None,
+        "session_path_solved": session_csv_solved.filepath if session_csv_solved else None,
     })
 
 
