@@ -50,12 +50,12 @@ if exist "scripts\open_camera.py" (
     echo WARNING: scripts\open_camera.py not found. Camera page will not open automatically.
 )
 
-REM Launch the session CSV backup/sync tool.
-if exist "scripts\session_sync.py" (
-    start "Session Sync" "%VENV_DIR%\Scripts\python.exe" scripts\session_sync.py
-) else (
-    echo WARNING: scripts\session_sync.py not found. Session sync will not start.
-)
+@REM REM Launch the session CSV backup/sync tool.
+@REM if exist "scripts\session_sync.py" (
+@REM     start "Session Sync" "%VENV_DIR%\Scripts\python.exe" scripts\session_sync.py
+@REM ) else (
+@REM     echo WARNING: scripts\session_sync.py not found. Session sync will not start.
+@REM )
 
 echo.
 echo Services are running in their own windows.
