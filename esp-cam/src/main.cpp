@@ -13,8 +13,6 @@
 void startCameraServer();
 void setupLedFlash();
 
-#define STATUS_LED_PIN 33  // built-in red LED on ESP32-CAM (active-low)
-
 void setup() {
   Serial.begin(115200);
   Serial.setDebugOutput(true);
@@ -106,10 +104,6 @@ void setup() {
   setupLedFlash();
 #endif
 
-  // Status LED so we can see the board is alive without serial.
-  pinMode(STATUS_LED_PIN, OUTPUT);
-  digitalWrite(STATUS_LED_PIN, HIGH);  // off
-
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   WiFi.setSleep(false);
 
@@ -129,9 +123,6 @@ void setup() {
 }
 
 void loop() {
-  // Blink status LED so the board is visible on a breadboard without serial.
-  digitalWrite(STATUS_LED_PIN, LOW);   // on
-  delay(200);
-  digitalWrite(STATUS_LED_PIN, HIGH);  // off
-  delay(800);
+  // Do nothing. Everything is done in another task by the web server
+  delay(10000);
 }
