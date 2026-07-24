@@ -35,3 +35,6 @@ anchors.json
 transform.json
 data/
 sessions/
+
+# Antenna delay measurement CSVs (kept locally, not in git)
+data/antenna_delays/
