@@ -30,7 +30,7 @@ import time
 
 ANL_IP = "192.168.4.1"
 UDP_PORT = 50000
-CAL3D_COLLECT_MS = 15000  # must match the ANL's CAL3D_COLLECT_MS
+CAL3D_COLLECT_MS = 20000  # must match the ANL's CAL3D_COLLECT_MS
 
 
 def send_cmd(ip, port, cmd, timeout=2.5):

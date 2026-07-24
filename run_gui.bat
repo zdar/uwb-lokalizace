@@ -43,6 +43,13 @@ if exist "esp-cam\qr_scanner.py" (
     echo WARNING: esp-cam\qr_scanner.py not found. The QR scanner will not start.
 )
 
+REM Open the camera web page once PC ANL discovers it.
+if exist "scripts\open_camera.py" (
+    start "Open ESP32-CAM page" "%VENV_DIR%\Scripts\python.exe" scripts\open_camera.py
+) else (
+    echo WARNING: scripts\open_camera.py not found. Camera page will not open automatically.
+)
+
 REM Launch the session CSV backup/sync tool.
 if exist "scripts\session_sync.py" (
     start "Session Sync" "%VENV_DIR%\Scripts\python.exe" scripts\session_sync.py

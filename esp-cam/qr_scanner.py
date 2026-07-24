@@ -73,15 +73,79 @@ def discover_esp32_cam_url(fallback="http://192.168.0.111/capture"):
 
 
 # --- KONFIGURACE -----------------------------------------------------------
-ESP32_CAM_URL = discover_esp32_cam_url()
 PC_ANL_URL = "http://localhost:5000/state"
 RAW_RPT_PORT = 50001
 QR_EVENT_HOST = "127.0.0.1"
 QR_EVENT_PORT = 50002                         # musi odpovidat pc_anl.py
 TAG_ID = None                                 # None = prvni aktivni tag; jinak cislo
 
-# Cooldown po potvrzenem QR scanu (ms) - musi pokryt 5s UWB sběr v pc_anl.py.
+# Camera discovery via PC ANL heartbeats (same logic as UWB nodes).
+CAMERA_DISCOVERY_INTERVAL_S = 5
+CAMERA_STALE_MS = 10000
+
+_esp32_cam_url_lock = threading.Lock()
+_esp32_cam_url = None
+
+
+def get_esp32_cam_url():
+    """Return current ESP32-CAM capture URL, discovering one if needed."""
+    global _esp32_cam_url
+    with _esp32_cam_url_lock:
+        if _esp32_cam_url:
+            return _esp32_cam_url
+    # First call: discover and cache.
+    url = _discover_esp32_cam_url()
+    set_esp32_cam_url(url)
+    return url
+
+
+def set_esp32_cam_url(url):
+    global _esp32_cam_url
+    with _esp32_cam_url_lock:
+        if _esp32_cam_url != url:
+            _esp32_cam_url = url
+            print(f"[KAMERA] pouzivam URL: {url}")
+
+
+def _discover_from_anl():
+    """Ask pc_anl.py for the camera IP advertised by HB,CAM heartbeats."""
+    try:
+        r = requests.get(PC_ANL_URL, timeout=2)
+        data = r.json()
+        ip = data.get("esp32_cam_ip")
+        age = data.get("esp32_cam_age_ms")
+        if ip and age is not None and age < CAMERA_STALE_MS:
+            return f"http://{ip}/capture"
+    except Exception:
+        pass
+    return None
+
+
+def _discover_esp32_cam_url():
+    """Prefer PC ANL heartbeat registry, fall back to subnet scan."""
+    env_url = os.environ.get("ESP32_CAM_URL")
+    if env_url:
+        return env_url
+    anl_url = _discover_from_anl()
+    if anl_url:
+        print(f"[KAMERA] nalezena pres PC ANL: {anl_url}")
+        return anl_url
+    return discover_esp32_cam_url()
+
+
+def discovery_thread():
+    """Periodically refresh ESP32-CAM URL from PC ANL heartbeats."""
+    while state.running:
+        url = _discover_from_anl()
+        if url:
+            set_esp32_cam_url(url)
+        time.sleep(CAMERA_DISCOVERY_INTERVAL_S)
+
+
+# Cooldown po potvrzenem QR scanu (ms) - musi pokryt QR_COLLECT_MS v pc_anl.py.
 QR_COOLDOWN_MS = int(os.environ.get("QR_COOLDOWN_MS", 6000))
+# Délka UWB sběru v pc_anl.py (ms) - pipnuti naplánujeme na konec tohoto okna.
+QR_COLLECT_MS = int(os.environ.get("QR_COLLECT_MS", 5000))
 # Jak dlouho sbirame detekce pro potvrzeni QR (ms).
 QR_CONFIRM_MS = int(os.environ.get("QR_CONFIRM_MS", 200))
 # Kolik detekci v okne potrebujeme pro potvrzeni (majorita).
@@ -225,11 +289,13 @@ def rpt_listener_thread():
 
 # --- KAMERA ----------------------------------------------------------------
 def capture_thread():
-    print(f"[KAMERA] stahuji snimky z {ESP32_CAM_URL} (QVGA, kazdych {CAPTURE_INTERVAL_S*1000:.0f} ms)")
+    url = get_esp32_cam_url()
+    print(f"[KAMERA] stahuji snimky z {url} (QVGA, kazdych {CAPTURE_INTERVAL_S*1000:.0f} ms)")
     consecutive_errors = 0
     while state.running:
+        url = get_esp32_cam_url()
         try:
-            response = requests.get(ESP32_CAM_URL, timeout=CAMERA_REQUEST_TIMEOUT_S)
+            response = requests.get(url, timeout=CAMERA_REQUEST_TIMEOUT_S)
             if response.status_code == 200:
                 img_array = np.frombuffer(response.content, dtype=np.uint8)
                 frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
@@ -374,9 +440,9 @@ def qr_scan_thread():
         with state.lock:
             state.last_qr_info = (stable_qr, now_ms)
 
-        # Lockout long enough to cover pc_anl.py's 5s UWB collection.
+        # Lockout long enough to cover pc_anl.py's UWB collection.
         cooldown_until = now_ms + QR_COOLDOWN_MS
-        pending_beep_end = cooldown_until
+        pending_beep_end = now_ms + QR_COLLECT_MS
 
 
 # --- KOMUNIKACE S PC ANL ---------------------------------------------------
@@ -416,13 +482,14 @@ def qr_heartbeat_thread():
 # --- MAIN ------------------------------------------------------------------
 def main():
     print("\n--- QR SKENER (ESP32-CAM + UWB) ---")
-    print(f"Kamera: {ESP32_CAM_URL}")
+    print(f"Kamera: {get_esp32_cam_url()}")
     print(f"UWB:    {PC_ANL_URL}")
     print(f"RPT:    UDP {RAW_RPT_PORT}")
     print("Data se ukladaji do session CSV pres PC ANL.")
     print("[Ctrl+C] - Ukoncit program\n")
 
     threads = [
+        threading.Thread(target=discovery_thread, daemon=True),
         threading.Thread(target=capture_thread, daemon=True),
         threading.Thread(target=rpt_listener_thread, daemon=True),
         threading.Thread(target=uwb_poller_thread, daemon=True),

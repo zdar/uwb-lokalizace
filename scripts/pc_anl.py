@@ -73,8 +73,8 @@ def forward_rpt_packet(tid, ranges):
     except Exception:
         pass
 QR_HEARTBEAT_TIMEOUT_MS = 10000
-CAL3D_COLLECT_MS = 15000
-# Musi odpovidat SAMPLE_WINDOW_MS v esp-cam/qr_scanner.py.
+CAL3D_COLLECT_MS = 20000
+# QR_COLLECT_MS must be <= QR_COOLDOWN_MS in esp-cam/qr_scanner.py.
 QR_COLLECT_MS = 5000
 
 # Exponential moving average smoothing factor for UWB ranges (0 = no smoothing, 1 = instant).
@@ -82,7 +82,7 @@ RANGE_SMOOTHING_ALPHA = 0.25
 
 # Auto-calibration (Mode A) timing.
 AUTO_CAL_ROLE_SWITCH_WAIT_S = 40   # time for the UWB module to reconfigure after ROLE change
-AUTO_CAL_COLLECT_S = 20            # how long to gather ranges per anchor
+AUTO_CAL_COLLECT_S = 60            # safety cap only; collection stops on packet count
 AUTO_CAL_FORCE_COPLANAR = True     # force solved anchor Z coordinate to 0 (deployment is on one plane)
 
 app = Flask(__name__)
@@ -118,7 +118,7 @@ auto_cal = {
     "deadline_ms": 0,         # fallback safety timeout
     "samples": defaultdict(list),  # fixed_anchor_id -> [distances]
     "packet_count": 0,        # RPT packets received in current window
-    "packets_needed": 15,     # stop collecting after this many packets
+    "packets_needed": 100,    # target ~10 s at ~10 RPT/s; falls back to 60 s safety cap
     "message": "",
     "succeeded": set(),       # ids calibrated successfully in this run
     "failed": set(),          # ids that could not be calibrated
@@ -348,6 +348,8 @@ def ensure_session():
     return new_session()
 qr_last_seen_ms = None        # last QR event timestamp from ESP32-CAM
 qr_detected_ms = None         # timestamp of the last actual QR code scan
+esp32_cam_ip = None           # discovered ESP32-CAM IP from HB,CAM heartbeats
+esp32_cam_last_seen_ms = 0    # last HB,CAM timestamp
 
 
 def load_trny():
@@ -917,7 +919,7 @@ def handle_rpt(text):
             if auto_cal["phase"] == "wait_tag":
                 log(f"[AUTO] First RPT from tag {tid}; starting collection")
                 auto_cal["phase"] = "collecting"
-                auto_cal["deadline_ms"] = time.time() * 1000 + 30000  # max 30s collection
+                auto_cal["deadline_ms"] = time.time() * 1000 + AUTO_CAL_COLLECT_S * 1000
 
     # Add to active QR-triggered measurement windows if any.
     with qr_collect_lock:
@@ -960,8 +962,8 @@ def handle_rpt(text):
 
 
 def qr_listener():
-    """Listen for QR scan events from ESP32-CAM."""
-    global qr_last_seen_ms
+    """Listen for QR scan events and camera heartbeats from ESP32-CAM."""
+    global qr_last_seen_ms, esp32_cam_ip, esp32_cam_last_seen_ms
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
@@ -970,7 +972,7 @@ def qr_listener():
         log(f"FATAL: cannot bind QR event port {QR_EVENT_PORT}: {e}")
         return
     sock.settimeout(1.0)
-    log(f"Listening for QR events on port {QR_EVENT_PORT}")
+    log(f"Listening for QR events / camera heartbeats on port {QR_EVENT_PORT}")
 
     while True:
         try:
@@ -986,6 +988,10 @@ def qr_listener():
             qr_code = text[3:].strip()
             if qr_code:
                 start_qr_collection(qr_code)
+        elif text == "HB,CAM":
+            esp32_cam_ip = addr[0]
+            esp32_cam_last_seen_ms = time.time() * 1000
+            log(f"[CAM] discovered ESP32-CAM at {esp32_cam_ip}")
 
 
 def prune_registry_and_tags():
@@ -1596,7 +1602,7 @@ HTML_PAGE = r"""
             X: <input type="number" id="calX" style="width:80px">
             Y: <input type="number" id="calY" style="width:80px">
             Z: <input type="number" id="calZ" style="width:80px">
-            <button id="calPointBtn" onclick="addCalPoint()">Start 15s collection</button>
+            <button id="calPointBtn" onclick="addCalPoint()">Start 20s collection</button>
         </div>
         <div id="calStatus"></div>
         <button onclick="solveCal()">Solve anchors</button>
@@ -2553,9 +2559,6 @@ HTML_PAGE = r"""
                     computeBtn.disabled = data.pairs.length < 3;
 
                     if (data.qr_detected_ms !== null) {
-                        if (lastQrDetectedMs !== null && data.qr_detected_ms !== lastQrDetectedMs) {
-                            playScanSuccessSound();
-                        }
                         lastQrDetectedMs = data.qr_detected_ms;
                     }
 
@@ -3385,6 +3388,8 @@ def state():
         "log": log_lines,
         "session_path_raw": session_csv_raw.filepath if session_csv_raw else None,
         "session_path_solved": session_csv_solved.filepath if session_csv_solved else None,
+        "esp32_cam_ip": esp32_cam_ip,
+        "esp32_cam_age_ms": now - esp32_cam_last_seen_ms if esp32_cam_last_seen_ms else None,
     })
 
 
