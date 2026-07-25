@@ -83,7 +83,7 @@ RANGE_SMOOTHING_ALPHA = 0.25
 # Auto-calibration (Mode A) timing.
 AUTO_CAL_ROLE_SWITCH_WAIT_S = 40   # time for the UWB module to reconfigure after ROLE change
 AUTO_CAL_COLLECT_S = 60            # safety cap only; collection stops on packet count
-AUTO_CAL_FORCE_COPLANAR = True     # force solved anchor Z coordinate to 0 (deployment is on one plane)
+AUTO_CAL_FORCE_COPLANAR = False     # force solved anchor Z coordinate to 0 (deployment is on one plane)
 
 app = Flask(__name__)
 
@@ -1818,9 +1818,9 @@ HTML_PAGE = r"""
             ]).then(([scanData, stateData]) => {
                 const camEl = document.getElementById('measureCameraStatus');
                 if (scanData.qr_connected) {
-                    camEl.innerHTML = '<span style="color:green">ESP32-CAM připojena</span>';
+                    camEl.innerHTML = '<span style="color:green">Kamera připojena</span>';
                 } else {
-                    camEl.innerHTML = '<span style="color:red">ESP32-CAM není připojena</span> - zkontroluj napájení a síť';
+                    camEl.innerHTML = '<span style="color:red">Kamera není připojena</span> - zkontroluj napájení a síť';
                 }
 
                 const infoEl = document.getElementById('measureTransformInfo');
@@ -2535,9 +2535,9 @@ HTML_PAGE = r"""
                     const computeBtn = document.getElementById('trnyComputeBtn');
 
                     if (data.qr_connected) {
-                        connEl.innerHTML = '<span style="color:green">ESP32-CAM připojena</span>';
+                        connEl.innerHTML = '<span style="color:green">Kamera připojena</span>';
                     } else {
-                        connEl.innerHTML = '<span style="color:red">ESP32-CAM není připojena</span> - zkontroluj napájení a síť';
+                        connEl.innerHTML = '<span style="color:red">Kamera není připojena</span> - zkontroluj napájení a síť';
                     }
 
                     const scannedIds = new Set(data.pairs.map(p => p.point_id));
