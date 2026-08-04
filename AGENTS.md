@@ -37,6 +37,8 @@ This means:
 
 It also supports fully automatic anchor calibration (Mode A), which temporarily switches each anchor to TAG, collects ranges, solves its position, and switches it back. The ESP32 ANL firmware has the same capability (`autoCalibrateLoop()` / `CALAUTO,<id>`), so you can use whichever ANL you prefer.
 
+Two web listeners serve the same Flask app: HTTP on **TCP 5000** (main PC; `http://127.0.0.1:5000` counts as a browser secure context so the webcam works there) and HTTPS on **TCP 50001** (`https://<PC-IP>:50001` for remote devices, whose browsers block `getUserMedia` on plain-HTTP remote origins). The HTTPS listener serves a self-signed cert generated on first run into `certs/` (SANs: localhost, hostname, 127.0.0.1, current LAN IPs); remote devices must accept the browser warning once. Cert generation needs the `cryptography` package (in requirements.txt); without it the app runs HTTP-only. Note TCP 50001 (HTTPS) and UDP 50001 (raw RPT forward to qr_scanner.py) are different protocols and do not conflict.
+
 ## Common gotchas
 
 - An ESP32 configured as ANL will ignore `ROLE,` switch commands; only NODEs accept them. This is fine for PC-as-ANL development where every ESP is a NODE, but confusing if a mixed deployment is discovered by the GUI.

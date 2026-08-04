@@ -38,3 +38,6 @@ sessions/
 
 # Antenna delay measurement CSVs (kept locally, not in git)
 data/antenna_delays/
+
+# Self-signed HTTPS certificate + private key (generated on first run)
+certs/
