@@ -1686,8 +1686,9 @@ HTML_PAGE = r"""
                 <div id="measureCameraStatus" class="status">Webkamera se připojuje...</div>
                 <button id="webcamStartBtn" onclick="startWebcamScanning()">Zapnout kameru</button>
                 <button id="webcamStopBtn" onclick="stopWebcamScanning()" disabled>Vypnout kameru</button>
+                <select id="webcamCameraSelect" onchange="onWebcamCameraChange()" style="display:none; margin-left:8px;"></select>
                 <div class="webcam-container" id="webcamContainer" style="display:none;">
-                    <video id="webcamVideo" autoplay playsinline></video>
+                    <video id="webcamVideo" autoplay playsinline muted></video>
                     <canvas id="webcamOverlay"></canvas>
                 </div>
                 <div id="webcamQrDetected" style="font-size:18px; font-weight:bold; color:#333; min-height:28px; margin-top:8px;">Naskenujte QR kód webkamerou</div>
@@ -2028,25 +2029,48 @@ HTML_PAGE = r"""
         let webcamPreviousCode = null;
         const WEBCAM_REPEAT_MS = 2000;
 
-        async function startWebcamScanning() {
+        async function startWebcamScanning(deviceId) {
             const video = document.getElementById('webcamVideo');
             const container = document.getElementById('webcamContainer');
             const canvas = document.getElementById('webcamOverlay');
             const startBtn = document.getElementById('webcamStartBtn');
             const stopBtn = document.getElementById('webcamStopBtn');
             const statusEl = document.getElementById('measureCameraStatus');
+            const selectEl = document.getElementById('webcamCameraSelect');
 
             if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-                const msg = 'Prohlížeč nepodporuje přístup ke kameře na této adrese. Na hlavním PC použij http://127.0.0.1:5000, z jiného zařízení použij HTTPS adresu https://<IP-hlavního-PC>:50001 (potvrď varování o certifikátu).';
+                const msg = 'Prohlížeč nepodporuje přístup ke kameře na této adrese. '
+                    + 'Na hlavním PC použij http://127.0.0.1:5000, z jiného zařízení '
+                    + 'použij HTTPS adresu https://<IP-hlavního-PC>:50001 '
+                    + '(potvrď varování o certifikátu).';
                 statusEl.innerHTML = '<span style="color:red">' + msg + '</span>';
                 alert(msg);
                 return;
             }
 
+            // Respect the camera chosen in the dropdown (if any) when starting.
+            if (!deviceId && selectEl.value) {
+                deviceId = selectEl.value;
+            }
+
             try {
-                statusEl.innerHTML = '<span style="color:orange">Zapínání webkamery...</span>';
+                statusEl.innerHTML = '<span style="color:orange">Zapínání kamery...</span>';
+
+                // Stop the previous stream when switching cameras mid-session.
+                if (webcamStream) {
+                    webcamStream.getTracks().forEach(track => track.stop());
+                    webcamStream = null;
+                }
+
+                const videoConstraints = { width: { ideal: 640 }, height: { ideal: 480 } };
+                if (deviceId) {
+                    videoConstraints.deviceId = { exact: deviceId };
+                } else {
+                    // Prefer the back camera on phones.
+                    videoConstraints.facingMode = { ideal: 'environment' };
+                }
                 webcamStream = await navigator.mediaDevices.getUserMedia({
-                    video: { width: { ideal: 640 }, height: { ideal: 480 } },
+                    video: videoConstraints,
                     audio: false
                 });
                 video.srcObject = webcamStream;
@@ -2061,13 +2085,53 @@ HTML_PAGE = r"""
                     canvas.height = video.videoHeight;
                 };
 
-                // Scan a few frames per second.
-                webcamScanInterval = setInterval(processWebcamFrame, 200);
+                // Scan a few frames per second (kept running when switching cameras).
+                if (!webcamScanInterval) {
+                    webcamScanInterval = setInterval(processWebcamFrame, 200);
+                }
+
+                // Offer a camera picker once permission is granted (labels need it).
+                populateWebcamCameras();
             } catch (err) {
-                statusEl.innerHTML = '<span style="color:red">Nepodařilo se zapnout webkameru: ' + err.message + '</span>';
-                alert('Nepodařilo se zapnout webkameru: ' + err.message);
+                // The selected camera may have been unplugged: fall back to the default.
+                if (deviceId) {
+                    console.warn('Selected camera failed, falling back to default:', err);
+                    startWebcamScanning();
+                    return;
+                }
+                statusEl.innerHTML = '<span style="color:red">Nepodařilo se zapnout kameru: ' + err.message + '</span>';
+                alert('Nepodařilo se zapnout kameru: ' + err.message);
                 console.error(err);
             }
+        }
+
+        async function populateWebcamCameras() {
+            const selectEl = document.getElementById('webcamCameraSelect');
+            let videoInputs;
+            try {
+                videoInputs = (await navigator.mediaDevices.enumerateDevices())
+                    .filter(d => d.kind === 'videoinput');
+            } catch (err) {
+                console.warn('enumerateDevices failed:', err);
+                return;
+            }
+            selectEl.innerHTML = '';
+            videoInputs.forEach((d, idx) => {
+                const opt = document.createElement('option');
+                opt.value = d.deviceId;
+                opt.text = d.label || ('Kamera ' + (idx + 1));
+                selectEl.appendChild(opt);
+            });
+            const track = webcamStream ? webcamStream.getVideoTracks()[0] : null;
+            const activeId = track && track.getSettings ? track.getSettings().deviceId : null;
+            if (activeId) selectEl.value = activeId;
+            // The picker only makes sense with more than one camera.
+            selectEl.style.display = videoInputs.length > 1 ? 'inline-block' : 'none';
+        }
+
+        function onWebcamCameraChange() {
+            const selectEl = document.getElementById('webcamCameraSelect');
+            if (selectEl.value) startWebcamScanning(selectEl.value);
         }
 
         function stopWebcamScanning() {
